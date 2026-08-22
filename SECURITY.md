@@ -42,9 +42,18 @@ SLA.
 - Probleme in der nativen Menüleisten-App (`macapp/`), insbesondere beim
   Aufruf des Python-CLI-Subprozesses oder der Login-Item-Registrierung
 
+## Abhängigkeiten
+
+Bekannte Sicherheitslücken in `defusedxml` oder `keyring` selbst
+(gegenüber der in [pyproject.toml](pyproject.toml) gepinnten Version)
+werden nicht nur über externe Meldungen bekannt - GitHubs
+Dependabot-Sicherheitswarnungen sind für dieses Repo aktiviert und melden
+automatisch, wenn eine gepinnte Version eine bekannte Lücke
+(GitHub Advisory Database) betrifft. Ein direktes Issue hier ist trotzdem
+willkommen, falls eine Lücke schneller bekannt wird, als Dependabot sie
+meldet.
+
 ## Nicht relevant
 
 - Angriffe, die bereits physischen oder administrativen Zugriff auf einen
   kompromittierten Rechner voraussetzen
-- Probleme in Abhängigkeiten (`defusedxml`, `keyring`) - bitte direkt beim
-  jeweiligen Projekt melden
