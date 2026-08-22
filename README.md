@@ -117,7 +117,7 @@ kommt aus `generate_icon.swift` - nur bei Bedarf neu auszuführen, falls
 sich das Icon mal ändern soll (siehe Kommentar im Skript). Erfordert
 macOS 13 (Ventura) oder neuer.
 
-Drei Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
+Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
 
 - **Einstellungen…** öffnet ein natives Formular für IMAP-Server/Login/
   Passwort/Ordner, eigene Domain(s), eigene Sende-Netze und die Uhrzeit des
@@ -148,13 +148,17 @@ Drei Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   verlässt dein Gerät"), ruft erst nach Bestätigung `dmarcwatch inspect
   <ip> --whois` auf. Entspricht einem manuellen Terminal-Befehl, nur
   bequemer erreichbar - siehe Einschränkung direkt darunter.
+- **DNS prüfen…** öffnet nach Bestätigung im Dialog ein Fenster mit dem
+  Ergebnis von `dmarcwatch verify-dns --json` für alle konfigurierten
+  `own_domains` - DMARC/SPF/DKIM-Gültigkeit und Fehlkonfigurationen, siehe
+  [`verify-dns`](#befehle) unten. Reine Diagnose, verändert nichts.
 
-Abgesehen von **"WHOIS abrufen…"** und **"Aus SPF ermitteln…"** macht die
-App selbst **keine** Netzwerkanfrage von sich aus - alles andere liest
-ausschließlich aus der lokalen SQLite-Datenbank, die `fetch` befüllt. Das
-sind die einzigen zwei Stellen, an denen ein Klick tatsächlich nach außen
-geht (RDAP bzw. DNS), und beide immer erst nach expliziter Bestätigung im
-Dialog, nie automatisch im Hintergrund.
+Abgesehen von **"WHOIS abrufen…"**, **"Aus SPF ermitteln…"** und
+**"DNS prüfen…"** macht die App selbst **keine** Netzwerkanfrage von sich
+aus - alles andere liest ausschließlich aus der lokalen SQLite-Datenbank,
+die `fetch` befüllt. Das sind die einzigen drei Stellen, an denen ein Klick
+tatsächlich nach außen geht (RDAP bzw. DNS), und alle drei immer erst nach
+expliziter Bestätigung im Dialog, nie automatisch im Hintergrund.
 
 Wichtig: dmarcwatch darf **nicht** unter `~/Desktop`, `~/Documents` oder
 `~/Downloads` liegen. Diese Ordner sind unter macOS durch TCC geschützt -
@@ -299,7 +303,9 @@ LaunchAgents zu verlassen.
   RSA- und Ed25519-Schlüssel, folgt CNAME-Delegation (viele Anbieter,
   z. B. mailbox.org, verweisen den DKIM-Eintrag per CNAME auf sich
   selbst, damit Kund:innen bei einer Schlüsselrotation nichts ändern
-  müssen). Verlässt das Gerät (DNS).
+  müssen). Verlässt das Gerät (DNS). `--json` gibt strukturierte Ausgabe
+  statt der Tabelle aus - für das "DNS prüfen…"-Fenster in der
+  Menüleisten-App gedacht, funktioniert aber genauso von Hand im Terminal.
 
 Logs: `~/Library/Application Support/dmarcwatch/dmarcwatch.log` (0600,
 keine Zugangsdaten, keine vollständigen Mailadressen).

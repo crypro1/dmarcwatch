@@ -138,6 +138,35 @@ enum DmarcwatchCLI {
         }
     }
 
+    /// Nutzerausgeloeste DNS-Pruefung (DMARC/SPF/DKIM der eigenen
+    /// own_domains) - erst nach Bestaetigung im Dialog (siehe
+    /// DNSVerifyWindowController.swift/StatusBarController.lookupDNS).
+    /// Reine Diagnose, veraendert nichts an Konfiguration oder
+    /// Auffaelligkeits-Einstufung.
+    static func runVerifyDNS(completion: @escaping (Result<[DomainVerificationResponse], Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try run(arguments: ["verify-dns", "--json"])
+                guard result.exitCode == 0 else {
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.processFailed(result.exitCode, result.stderr)))
+                    }
+                    return
+                }
+                guard let data = result.stdout.data(using: .utf8) else {
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.decodingFailed("Ausgabe war kein gültiges UTF-8")))
+                    }
+                    return
+                }
+                let decoded = try JSONDecoder().decode([DomainVerificationResponse].self, from: data)
+                DispatchQueue.main.async { completion(.success(decoded)) }
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+
     /// Nutzerausgeloeste SPF-Aufloesung fuer den "Aus SPF ermitteln"-Knopf im
     /// Setup-Fenster - erst nach Bestaetigung im Dialog (siehe
     /// SetupView.swift). Loest jede Domain einzeln auf und vereinigt die

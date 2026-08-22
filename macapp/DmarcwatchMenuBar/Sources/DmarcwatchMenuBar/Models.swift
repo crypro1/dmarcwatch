@@ -84,6 +84,62 @@ struct SPFResolveResponse: Decodable {
     let error: String?
 }
 
+/// Spiegelt _verification_to_dict() aus cli.py
+/// (`dmarcwatch verify-dns --json`) - für das DNS-Prüfen-Fenster
+/// (DNSVerifyView.swift).
+
+struct DomainVerificationResponse: Decodable {
+    let domain: String
+    let dmarc: DMARCCheck
+    let spf: SPFCheck
+    let dkim: [DKIMCheck]
+}
+
+struct DMARCCheck: Decodable {
+    let exists: Bool
+    let record: String?
+    let policy: String?
+    let subdomainPolicy: String?
+    let pct: Int?
+    let rua: String?
+    let ruf: String?
+    let adkim: String?
+    let aspf: String?
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case exists, record, policy, pct, rua, ruf, adkim, aspf, warnings
+        case subdomainPolicy = "subdomain_policy"
+    }
+}
+
+struct SPFCheck: Decodable {
+    let exists: Bool
+    let record: String?
+    let lookupCount: Int
+    let lookupLimitOk: Bool
+    let warnings: [String]
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case exists, record, warnings, error
+        case lookupCount = "lookup_count"
+        case lookupLimitOk = "lookup_limit_ok"
+    }
+}
+
+struct DKIMCheck: Decodable {
+    let selector: String
+    let exists: Bool
+    let keyType: String?
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case selector, exists, warnings
+        case keyType = "key_type"
+    }
+}
+
 enum ConfigStore {
     /// Liest config.json direkt (kein Passwort enthalten, daher unbedenklich
     /// ohne Umweg über den Python-CLI-Subprozess) - für das einmalige
