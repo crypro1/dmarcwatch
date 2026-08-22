@@ -21,6 +21,7 @@ from .config import (
     write_default_config_if_missing,
     write_last_fetch_date,
 )
+from .dns_verify import DomainVerification, verify_domain
 from .fetch import FetchError, connect_imap, fetch_and_ingest
 from .logging_setup import setup_logging
 from .report import collect_rows, day_range_to_ts, format_table, has_findings, to_json_dict
@@ -420,6 +421,78 @@ def cmd_resolve_spf(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_verify_result(result: DomainVerification) -> None:
+    print("=" * 60)
+    print(f"Domain: {result.domain}")
+    print()
+
+    print("DMARC (_dmarc." + result.domain + ")")
+    if not result.dmarc.exists:
+        print("  Kein Eintrag gefunden.")
+    else:
+        print(f"  Policy (p):        {result.dmarc.policy}")
+        if result.dmarc.subdomain_policy:
+            print(f"  Subdomain (sp):    {result.dmarc.subdomain_policy}")
+        if result.dmarc.pct is not None:
+            print(f"  Prozent (pct):     {result.dmarc.pct}")
+        print(f"  rua:               {result.dmarc.rua or '(nicht gesetzt)'}")
+        print(f"  ruf:               {result.dmarc.ruf or '(nicht gesetzt)'}")
+        print(f"  Alignment (adkim/aspf): {result.dmarc.adkim}/{result.dmarc.aspf}")
+    for warning in result.dmarc.warnings:
+        print(f"  ⚠ {warning}")
+
+    print()
+    print("SPF")
+    if not result.spf.exists:
+        print("  Kein Eintrag gefunden." if result.spf.error is None else f"  Fehler: {result.spf.error}")
+    else:
+        print(f"  Eintrag:           {result.spf.record}")
+        print(f"  DNS-Lookups:       {result.spf.lookup_count}/10")
+    for warning in result.spf.warnings:
+        print(f"  ⚠ {warning}")
+
+    print()
+    print("DKIM")
+    if not result.dkim:
+        print(
+            "  Keine bekannten Selektoren - werden aus bereits abgerufenen Reports gelernt "
+            "(siehe `dmarcwatch fetch`), noch keine vorhanden für diese Domain."
+        )
+    for dkim_result in result.dkim:
+        status = "gefunden" if dkim_result.exists else "NICHT gefunden"
+        key_info = f", Typ: {dkim_result.key_type}" if dkim_result.key_type else ""
+        print(f"  Selektor {dkim_result.selector!r}: {status}{key_info}")
+        for warning in dkim_result.warnings:
+            print(f"    ⚠ {warning}")
+    print("=" * 60)
+
+
+def cmd_verify_dns(args: argparse.Namespace) -> int:
+    """Prüft die eigenen DMARC/SPF/DKIM-DNS-Einträge auf Gültigkeit und
+    häufige Fehlkonfigurationen (siehe dns_verify.py) - verlässt das Gerät
+    (DNS), deshalb ein expliziter Befehl, nie automatisch während `fetch`."""
+    if args.domain:
+        domains = [args.domain]
+    else:
+        config = load_config()
+        domains = list(config.own_domains)
+        if not domains:
+            print(
+                "Fehler: keine own_domains konfiguriert und keine Domain angegeben.",
+                file=sys.stderr,
+            )
+            return 2
+
+    db_conn = connect(db_path())
+    try:
+        for domain in domains:
+            result = verify_domain(db_conn, domain)
+            _print_verify_result(result)
+    finally:
+        db_conn.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dmarcwatch", description="Lokaler DMARC-Monitor für macOS")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -506,6 +579,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_resolve_spf.add_argument("domain")
     p_resolve_spf.set_defaults(func=cmd_resolve_spf)
+
+    p_verify_dns = sub.add_parser(
+        "verify-dns",
+        help=(
+            "Eigenen DMARC/SPF/DKIM-DNS-Eintrag auf Gültigkeit und häufige "
+            "Fehlkonfigurationen prüfen - verlässt das Gerät (DNS)"
+        ),
+    )
+    p_verify_dns.add_argument(
+        "domain", nargs="?", default=None,
+        help="Zu prüfende Domain (Default: alle own_domains aus der Konfiguration)",
+    )
+    p_verify_dns.set_defaults(func=cmd_verify_dns)
 
     return parser
 

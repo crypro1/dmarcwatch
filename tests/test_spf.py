@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from dmarcwatch.spf import SPFResolutionError, resolve_own_ip_networks
+from dmarcwatch.spf import SPFResolutionError, resolve_own_ip_networks, validate_spf
 
 
 def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -190,3 +190,61 @@ def test_never_uses_shell_true():
 
     assert captured["shell"] is False
     assert isinstance(captured["cmd"], list)
+
+
+# --- validate_spf() für `dmarcwatch verify-dns` ---
+
+
+def test_validate_spf_reports_missing_record():
+    with patch("dmarcwatch.spf.subprocess.run", return_value=_dig_result("")):
+        result = validate_spf("example.com")
+    assert result.exists is False
+    assert any("Kein SPF-Eintrag" in w for w in result.warnings)
+
+
+def test_validate_spf_valid_record_no_warnings():
+    with patch("dmarcwatch.spf.subprocess.run", return_value=_txt("v=spf1 ip4:203.0.113.0/24 -all")):
+        result = validate_spf("example.com")
+    assert result.exists is True
+    assert result.warnings == []
+    assert result.lookup_limit_ok is True
+    assert result.lookup_count == 1
+
+
+def test_validate_spf_flags_multiple_records():
+    combined = _dig_result('"v=spf1 ip4:203.0.113.0/24 -all"\n"v=spf1 ip4:198.51.100.0/24 -all"\n')
+    with patch("dmarcwatch.spf.subprocess.run", return_value=combined):
+        result = validate_spf("example.com")
+    assert any("2 SPF-Einträge" in w for w in result.warnings)
+
+
+def test_validate_spf_flags_missing_all_mechanism():
+    with patch("dmarcwatch.spf.subprocess.run", return_value=_txt("v=spf1 ip4:203.0.113.0/24")):
+        result = validate_spf("example.com")
+    assert any("Kein 'all'-Mechanismus" in w for w in result.warnings)
+
+
+def test_validate_spf_flags_permissive_plus_all():
+    with patch("dmarcwatch.spf.subprocess.run", return_value=_txt("v=spf1 ip4:203.0.113.0/24 +all")):
+        result = validate_spf("example.com")
+    assert any("erlaubt praktisch jedem Server" in w for w in result.warnings)
+
+
+def test_validate_spf_counts_lookups_and_flags_limit_exceeded():
+    responses = {}
+    for i in range(15):
+        domain = f"level{i}.example.com"
+        next_domain = f"level{i + 1}.example.com"
+        responses[("TXT", domain)] = _txt(f"v=spf1 include:{next_domain} ~all")
+    responses[("TXT", "level15.example.com")] = _txt("v=spf1 ip4:203.0.113.0/24 ~all")
+
+    def fake_run(cmd, **kwargs):
+        record_type, name = cmd[-2], cmd[-1]
+        return responses[(record_type, name)]
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        result = validate_spf("level0.example.com")
+
+    assert result.exists is True  # der Top-Level-Eintrag selbst existiert ja
+    assert result.lookup_limit_ok is False
+    assert any("Zu viele verschachtelte SPF-Lookups" in w for w in result.warnings)

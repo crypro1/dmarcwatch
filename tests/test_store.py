@@ -2,7 +2,7 @@ from pathlib import Path
 
 from dmarcwatch.config import Config
 from dmarcwatch.parser import parse_aggregate_report
-from dmarcwatch.store import IngestStatus, connect, ingest_report, query_records
+from dmarcwatch.store import IngestStatus, connect, get_known_dkim_selectors, ingest_report, query_records
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MAX_SIZE = 10 * 1024 * 1024
@@ -77,6 +77,25 @@ def test_unknown_ip_is_flagged(tmp_path):
 
     rows = query_records(conn, since_ts=0, until_ts=2_000_000_000, only_flagged=True)
     assert rows[0]["flag_reasons"] == "unknown_ip"
+
+
+def test_get_known_dkim_selectors_reads_real_selectors_from_reports(tmp_path):
+    """Für `dmarcwatch verify-dns` (dns_verify.py): Selektoren werden aus
+    bereits abgerufenen, echten Reports gelesen statt geraten."""
+    conn = connect(tmp_path / "dmarc.sqlite")
+    config = _config()
+    ingest_report(conn, _load("microsoft_two_records.xml"), config)
+
+    selectors = get_known_dkim_selectors(conn, "example.com")
+    assert selectors == ["default"]
+
+
+def test_get_known_dkim_selectors_empty_for_unknown_domain(tmp_path):
+    conn = connect(tmp_path / "dmarc.sqlite")
+    config = _config()
+    ingest_report(conn, _load("microsoft_two_records.xml"), config)
+
+    assert get_known_dkim_selectors(conn, "never-seen.example") == []
 
 
 def test_injection_field_stored_verbatim_and_flagged(tmp_path):
