@@ -26,6 +26,7 @@ from .logging_setup import setup_logging
 from .report import collect_rows, day_range_to_ts, format_table, has_findings, to_json_dict
 from .menubar import render_swiftbar
 from .sanitize import sanitize_field
+from .spf import SPFResolutionError, resolve_own_ip_networks
 from .store import connect, get_all_cached_whois, query_records, set_cached_whois
 from .whois import WhoisLookupError, lookup_ip_organization
 
@@ -401,6 +402,24 @@ def cmd_menubar_json(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resolve_spf(args: argparse.Namespace) -> int:
+    """JSON-Ausgabe für den "Aus SPF ermitteln"-Knopf im Setup-Fenster der
+    Menüleisten-App (SetupViewModel.swift) - nicht für den interaktiven
+    Gebrauch gedacht. Löst den SPF-Eintrag der übergebenen Domain per DNS
+    auf (siehe spf.py) und liefert einen Vorschlag für own_ip_networks;
+    die GUI trägt das Ergebnis nur zur Kontrolle/Bearbeitung ins Formular
+    ein, speichert es nie automatisch ungesehen."""
+    try:
+        networks = resolve_own_ip_networks(args.domain)
+    except SPFResolutionError as exc:
+        json.dump({"error": str(exc)}, sys.stdout)
+        sys.stdout.write("\n")
+        return 1
+    json.dump({"domain": args.domain, "networks": networks}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dmarcwatch", description="Lokaler DMARC-Monitor für macOS")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -477,6 +496,16 @@ def build_parser() -> argparse.ArgumentParser:
         "menubar-json", help="Strukturierte JSON-Ausgabe für native Konsumenten (z. B. die Swift-App)"
     )
     p_menubar_json.set_defaults(func=cmd_menubar_json)
+
+    p_resolve_spf = sub.add_parser(
+        "resolve-spf",
+        help=(
+            "SPF-Eintrag einer Domain per DNS auflösen (include:/redirect=/a/mx), JSON-Ausgabe "
+            "für den 'Aus SPF ermitteln'-Knopf in der Setup-GUI - verlässt das Gerät (DNS)"
+        ),
+    )
+    p_resolve_spf.add_argument("domain")
+    p_resolve_spf.set_defaults(func=cmd_resolve_spf)
 
     return parser
 

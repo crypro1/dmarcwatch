@@ -138,6 +138,45 @@ enum DmarcwatchCLI {
         }
     }
 
+    /// Nutzerausgeloeste SPF-Aufloesung fuer den "Aus SPF ermitteln"-Knopf im
+    /// Setup-Fenster - erst nach Bestaetigung im Dialog (siehe
+    /// SetupView.swift). Loest jede Domain einzeln auf und vereinigt die
+    /// gefundenen Netze; schlaegt eine Domain fehl (z. B. kein SPF-Eintrag),
+    /// werden die anderen trotzdem verwendet - nur wenn ALLE fehlschlagen,
+    /// wird ein Fehler gemeldet.
+    static func runResolveSpf(domains: [String], completion: @escaping (Result<[String], Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var merged = Set<String>()
+            var firstErrorMessage: String?
+
+            for domain in domains {
+                do {
+                    let result = try run(arguments: ["resolve-spf", domain])
+                    guard let data = result.stdout.data(using: .utf8),
+                          let decoded = try? JSONDecoder().decode(SPFResolveResponse.self, from: data) else {
+                        firstErrorMessage = firstErrorMessage ?? "\(domain): Antwort konnte nicht gelesen werden"
+                        continue
+                    }
+                    if let networks = decoded.networks {
+                        merged.formUnion(networks)
+                    } else if let error = decoded.error {
+                        firstErrorMessage = firstErrorMessage ?? "\(domain): \(error)"
+                    }
+                } catch {
+                    firstErrorMessage = firstErrorMessage ?? "\(domain): \(error)"
+                }
+            }
+
+            DispatchQueue.main.async {
+                if merged.isEmpty {
+                    completion(.failure(CLIError.processFailed(1, firstErrorMessage ?? "Keine SPF-Netze gefunden.")))
+                } else {
+                    completion(.success(merged.sorted()))
+                }
+            }
+        }
+    }
+
     /// `fetch` verbindet sich per IMAP und kann mehrere Sekunden dauern -
     /// laeuft deshalb im Hintergrund, die Menuleiste blockiert nicht.
     ///

@@ -120,14 +120,20 @@ macOS 13 (Ventura) oder neuer.
 Drei Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
 
 - **Einstellungen…** öffnet ein natives Formular für IMAP-Server/Login/
-  Passwort/Ordner, eigene Domain(s) und die Uhrzeit des täglichen Abrufs -
-  eine Alternative zu `dmarcwatch setup` für alle, die lieber keine
-  Terminal-Eingabe machen wollen. Speichert intern trotzdem über denselben
-  Python-Code (`dmarcwatch setup --from-stdin-json`, Konfiguration und
-  Passwort als ein JSON-Objekt über stdin, nie als Kommandozeilenargument)
-  - keine doppelte, potenziell abweichende Implementierung der
-  sicherheitsrelevanten Schreibzugriffe (config.json, Schlüsselbund,
-  LaunchAgent).
+  Passwort/Ordner, eigene Domain(s), eigene Sende-Netze und die Uhrzeit des
+  täglichen Abrufs - eine Alternative zu `dmarcwatch setup` für alle, die
+  lieber keine Terminal-Eingabe machen wollen. Speichert intern trotzdem
+  über denselben Python-Code (`dmarcwatch setup --from-stdin-json`,
+  Konfiguration und Passwort als ein JSON-Objekt über stdin, nie als
+  Kommandozeilenargument) - keine doppelte, potenziell abweichende
+  Implementierung der sicherheitsrelevanten Schreibzugriffe (config.json,
+  Schlüsselbund, LaunchAgent). Der Knopf **"Aus SPF ermitteln…"** neben dem
+  Sende-Netze-Feld fragt (nach Bestätigung im Dialog) den SPF-DNS-Eintrag
+  der eingetragenen Domain(s) ab und schlägt die daraus gefundenen
+  CIDR-Bereiche vor - inklusive `include:`/`redirect=`/`a`/`mx`-Auflösung,
+  mit dem RFC-7208-Lookup-Limit von 10 gegen kaputte oder böswillig
+  verschachtelte Records abgesichert (siehe `spf.py`). Der Vorschlag landet
+  nur im Textfeld, nichts wird ungesehen gespeichert.
 - **Bei Anmeldung starten** registriert die App selbst als Login-Item über
   `SMAppService` (`LoginItemManager.swift`), statt wie früher über eine von
   `dmarcwatch setup` installierte LaunchAgent-plist. Vorteil: System
@@ -143,12 +149,12 @@ Drei Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   <ip> --whois` auf. Entspricht einem manuellen Terminal-Befehl, nur
   bequemer erreichbar - siehe Einschränkung direkt darunter.
 
-Ausgenommen von "**WHOIS abrufen…**" macht die App selbst **keine**
-Netzwerkanfrage von sich aus - alles andere liest ausschließlich aus der
-lokalen SQLite-Datenbank, die `fetch` befüllt. Der WHOIS-Klick ist die
-einzige Stelle, an der ein Menüklick tatsächlich nach außen geht, und das
-immer erst nach expliziter Bestätigung im Dialog, nie automatisch im
-Hintergrund.
+Abgesehen von **"WHOIS abrufen…"** und **"Aus SPF ermitteln…"** macht die
+App selbst **keine** Netzwerkanfrage von sich aus - alles andere liest
+ausschließlich aus der lokalen SQLite-Datenbank, die `fetch` befüllt. Das
+sind die einzigen zwei Stellen, an denen ein Klick tatsächlich nach außen
+geht (RDAP bzw. DNS), und beide immer erst nach expliziter Bestätigung im
+Dialog, nie automatisch im Hintergrund.
 
 Wichtig: dmarcwatch darf **nicht** unter `~/Desktop`, `~/Documents` oder
 `~/Downloads` liegen. Diese Ordner sind unter macOS durch TCC geschützt -
@@ -217,8 +223,10 @@ Fehlermeldung die tatsächlichen Ordnernamen.
 geprüft, nicht per Zeichenkette. **Kein Default und keine interaktive
 Abfrage** - die eigenen Sende-Netze kennt man i. d. R. erst nach den ersten
 echten Reports (`source_ip` bei sauberen Einträgen) oder aus dem eigenen
-SPF-DNS-Eintrag. Leer = jede IP gilt zunächst als unbekannt und wird
-markiert - sicherer, sichtbarer Zustand statt eines stillen Falsch-negativs.
+SPF-DNS-Eintrag (der "Aus SPF ermitteln…"-Knopf in der Setup-GUI macht
+genau das automatisch, siehe oben). Leer = jede IP gilt zunächst als
+unbekannt und wird markiert - sicherer, sichtbarer Zustand statt eines
+stillen Falsch-negativs.
 <br>
 <sup>5</sup> 10 MB ist laut IETF-Draft zur DMARC-Aggregate-Reporting-
 Spezifikation "far larger than any real aggregate report".
@@ -259,6 +267,13 @@ LaunchAgents zu verlassen.
   Strukturierte JSON-Ausgabe für die native Menüleisten-App (`macapp/`),
   inklusive gecachter WHOIS-Ergebnisse. Ebenfalls nicht für den
   interaktiven Gebrauch gedacht.
+- `dmarcwatch resolve-spf <domain>`
+  Löst den SPF-DNS-Eintrag einer Domain auf (`include:`/`redirect=`/`a`/`mx`,
+  RFC-7208-Lookup-Limit von 10 gegen kaputte/böswillig verschachtelte
+  Records) und gibt die gefundenen CIDR-Bereiche als JSON zurück - ein
+  Vorschlag für `own_ip_networks`. Verlässt das Gerät (DNS). Für den "Aus
+  SPF ermitteln…"-Knopf in der Setup-GUI gedacht, funktioniert aber genauso
+  von Hand im Terminal.
 
 Logs: `~/Library/Application Support/dmarcwatch/dmarcwatch.log` (0600,
 keine Zugangsdaten, keine vollständigen Mailadressen).
@@ -326,7 +341,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-101 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+115 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
@@ -471,17 +486,21 @@ nicht als vertrauenswürdige Eingabe:
 - **Kein zusätzlicher Netzverkehr im automatischen Betrieb**: `fetch` (der
   tägliche LaunchAgent) verbindet sich ausschließlich zum konfigurierten
   IMAP-Host. Keine Telemetrie, keine Update-Prüfung, keine automatischen
-  Reverse-DNS-/Geo-/WHOIS-Lookups. Die einzige Ausnahme ist `dmarcwatch
-  inspect --whois` ([whois.py](src/dmarcwatch/whois.py)) - eine RDAP-Abfrage
-  an rdap.org, nur wenn explizit mit diesem Flag angefordert (auch über den
-  Bestätigungsdialog "WHOIS abrufen…" in der Menüleisten-App erreichbar,
-  siehe oben - ruft denselben Befehl auf), nie im Hintergrundlauf. Bewusst
-  rein informativ: das Ergebnis fließt nirgends in
-  `own_ip_networks` oder die Auffälligkeits-Einstufung ein, auch nicht als
-  automatische Ausnahme für "bekannte" Anbieter - Google und Microsoft
-  betreiben auch riesige, für jeden mietbare Cloud-Bereiche, ein
-  WHOIS-Treffer auf einen großen Namen ist kein Nachweis für legitime
-  Weiterleitung und darf die Erkennung nicht aufweichen.
+  Reverse-DNS-/Geo-/WHOIS-Lookups. Zwei Ausnahmen, beide nur auf
+  ausdrückliche Anfrage, nie im Hintergrundlauf:
+  - `dmarcwatch inspect --whois` ([whois.py](src/dmarcwatch/whois.py)) -
+    eine RDAP-Abfrage an rdap.org (auch über den Bestätigungsdialog "WHOIS
+    abrufen…" in der Menüleisten-App erreichbar, ruft denselben Befehl
+    auf). Bewusst rein informativ: das Ergebnis fließt nirgends in
+    `own_ip_networks` oder die Auffälligkeits-Einstufung ein, auch nicht
+    als automatische Ausnahme für "bekannte" Anbieter - Google und
+    Microsoft betreiben auch riesige, für jeden mietbare Cloud-Bereiche,
+    ein WHOIS-Treffer auf einen großen Namen ist kein Nachweis für
+    legitime Weiterleitung und darf die Erkennung nicht aufweichen.
+  - `dmarcwatch resolve-spf` ([spf.py](src/dmarcwatch/spf.py)) - eine
+    DNS-Abfrage zur SPF-Auflösung (auch über "Aus SPF ermitteln…" in der
+    Setup-GUI erreichbar). Nur ein Vorschlag fürs Formularfeld, wird nie
+    ungesehen übernommen oder automatisch gespeichert.
 - **Gepinnte, minimale Abhängigkeiten**: `defusedxml` und `keyring`, sonst
   Standardbibliothek. Beide sind sicherheitsrelevant (nicht kosmetisch) und
   in `pyproject.toml` auf exakte Versionen gepinnt.

@@ -11,6 +11,13 @@ final class SetupViewModel: ObservableObject {
     @Published var imapUser = ""
     @Published var imapFolder = "INBOX/DMARC"
     @Published var ownDomains = ""
+    // Optional, bewusst ohne Default und ohne Pflichtfeld-Validierung (siehe
+    // config.py DEFAULT_CONFIG-Kommentar zu own_ip_networks): leer = jede IP
+    // gilt als unbekannt, ein sicherer, sichtbarer Zustand statt eines
+    // stillen Falsch-negativs. CIDR-Validierung passiert serverseitig in
+    // Config.__post_init__ (cli.py fängt ValueError ab und zeigt den Fehler
+    // hier an) - keine doppelte ipaddress-Validierung in Swift.
+    @Published var ownIpNetworks = ""
     @Published var password = ""
     // Uhrzeit als Date statt zweier String-Felder: ein DatePicker mit
     // .hourAndMinute ist die native macOS-Kontrolle dafür und vermeidet die
@@ -20,6 +27,7 @@ final class SetupViewModel: ObservableObject {
     // Werte selbst leer erscheinen.)
     @Published var scheduleTime: Date = SetupViewModel.defaultScheduleTime
     @Published var isSaving = false
+    @Published var isResolvingSpf = false
     @Published var errorMessage: String?
 
     var onSaved: (() -> Void)?
@@ -46,9 +54,44 @@ final class SetupViewModel: ObservableObject {
             if let domains = cfg.ownDomains, !domains.isEmpty {
                 ownDomains = domains.joined(separator: ", ")
             }
+            if let networks = cfg.ownIpNetworks, !networks.isEmpty {
+                ownIpNetworks = networks.joined(separator: ", ")
+            }
         }
         password = ""
         errorMessage = nil
+    }
+
+    private func currentDomains() -> [String] {
+        ownDomains
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Löst SPF für alle aktuell im Domain-Feld eingetragenen Domains auf
+    /// und trägt das Ergebnis als Vorschlag ins Netz-Feld ein (ersetzt den
+    /// bisherigen Inhalt - der Nutzer sieht das Ergebnis vor dem Speichern
+    /// und kann es noch anpassen, nichts wird ungesehen übernommen).
+    func resolveFromSPF() {
+        errorMessage = nil
+        let domains = currentDomains()
+        guard !domains.isEmpty else {
+            errorMessage = "Erst eine eigene Domain eintragen, dann SPF auflösen."
+            return
+        }
+
+        isResolvingSpf = true
+        DmarcwatchCLI.runResolveSpf(domains: domains) { [weak self] result in
+            guard let self = self else { return }
+            self.isResolvingSpf = false
+            switch result {
+            case .success(let networks):
+                self.ownIpNetworks = networks.joined(separator: ", ")
+            case .failure(let error):
+                self.errorMessage = Self.describe(error)
+            }
+        }
     }
 
     func save() {
@@ -70,14 +113,18 @@ final class SetupViewModel: ObservableObject {
             errorMessage = "IMAP-Server, -Login und -Ordner sind erforderlich."
             return
         }
-        let domains = ownDomains
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        let domains = currentDomains()
         guard !domains.isEmpty else {
             errorMessage = "Mindestens eine eigene Domain angeben."
             return
         }
+        // Leer ist ein gültiger, bewusst sicherer Zustand (siehe
+        // own_ip_networks-Kommentar oben) - anders als bei own_domains hier
+        // keine Pflichtfeld-Prüfung.
+        let networks = ownIpNetworks
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
 
         var payload: [String: Any] = [
             "imap_host": host,
@@ -85,6 +132,7 @@ final class SetupViewModel: ObservableObject {
             "imap_user": user,
             "imap_folder": folder,
             "own_domains": domains,
+            "own_ip_networks": networks,
         ]
         // Leeres Feld = Passwort unverändert lassen (bereits im
         // Schlüsselbund gespeichert) statt versehentlich zu löschen.
