@@ -189,18 +189,18 @@ mit Defaults angelegt, Verzeichnis `0700`, Datei `0600`):
 
 | Feld | Bedeutung | Default |
 |---|---|---|
-| `imap_host` | IMAP-Server | `imap.mailbox.org` |
-| `imap_port` | IMAP-Port | `993` |
-| `imap_user` | IMAP-Login / Schlüsselbund-Account¹ | z. B. `mail@example.com` |
-| `imap_folder` | Ordner mit den Reports² | `INBOX/DMARC` |
+| `imap_host` | IMAP-Server¹ | kein Default |
+| `imap_port` | IMAP-Port (anbieterunabhängiger IMAPS-Standard) | `993` |
+| `imap_user` | IMAP-Login / Schlüsselbund-Account² | z. B. `mail@example.com` |
+| `imap_folder` | Ordner mit den Reports³ | `INBOX/DMARC` |
 | `move_to_processed_folder` | Nachrichten nach Verarbeitung verschieben statt nur als gelesen zu markieren | `false` |
 | `processed_folder` | Zielordner, falls obiges aktiv ist | `INBOX/DMARC/verarbeitet` |
-| `own_domains` | Eigene Domains, alles andere wird verworfen³ | z. B. `["example.com"]` |
-| `own_ip_networks` | Eigene Sende-Netze als CIDR⁴ | z. B. `["192.0.2.0/24", "2001:db8:1::/48"]` |
+| `own_domains` | Eigene Domains, alles andere wird verworfen⁴ | z. B. `["example.com"]` |
+| `own_ip_networks` | Eigene Sende-Netze als CIDR⁵ | z. B. `["192.0.2.0/24", "2001:db8:1::/48"]` |
 | `max_attachment_size_mb` | Obergrenze für Anhänge | `5` |
-| `max_xml_size_mb` | Obergrenze für entpacktes XML⁵ | `10` |
-| `max_message_size_mb` | Obergrenze für die gesamte Nachricht⁶ | `8` |
-| `max_records_per_report` | Obergrenze für `<record>`-Elemente pro Report⁷ | `10000` |
+| `max_xml_size_mb` | Obergrenze für entpacktes XML⁶ | `10` |
+| `max_message_size_mb` | Obergrenze für die gesamte Nachricht⁷ | `8` |
+| `max_records_per_report` | Obergrenze für `<record>`-Elemente pro Report⁸ | `10000` |
 | `notify_on_new_findings` | macOS-Notification bei neuen Auffälligkeiten | `true` |
 | `enable_reverse_dns_lookup` | Reverse-DNS für Quell-IPs (verlässt das Gerät!) - aktuell nicht implementiert, Platzhalter für künftige, ausdrücklich einzuschaltende Erweiterung | `false` |
 | `menubar_days` | Zeitfenster für die Menüleisten-Anzeige | `7` |
@@ -208,18 +208,26 @@ mit Defaults angelegt, Verzeichnis `0700`, Datei `0600`):
 Das IMAP-Passwort steht **nicht** in dieser Datei, sondern ausschließlich im
 Schlüsselbund (Dienst `dmarcwatch`, Account = `imap_user`).
 
-<sup>1</sup> Das echte Postfach, **nicht** die rua-Alias-Adresse aus dem
+<sup>1</sup> Bewusst kein Default trotz Namensähnlichkeit zum primär
+getesteten Anbieter (mailbox.org, `imap.mailbox.org`) - dmarcwatch ist ein
+öffentliches, anbieterunabhängiges Projekt, und ein vorbelegter fremder
+Hostname würde bei zu schnellem Enter zu einem verwirrenden
+Verbindungsfehler gegen den falschen Server führen statt offensichtlich
+das eigene Postfach zu sein. Wird bei `dmarcwatch setup` genauso zwingend
+abgefragt wie `imap_user`/`own_domains`.
+<br>
+<sup>2</sup> Das echte Postfach, **nicht** die rua-Alias-Adresse aus dem
 DMARC-DNS-Eintrag (Aliase sind bei mailbox.org meist kein eigener
 IMAP-Login). Wird bei `dmarcwatch setup` interaktiv abgefragt, kein Default.
 <br>
-<sup>2</sup> Bei mailbox.org liegen per Filterregel angelegte Ordner meist
+<sup>3</sup> Bei mailbox.org liegen per Filterregel angelegte Ordner meist
 unter `INBOX` ("Eingang" in der Weboberfläche), nicht als eigener
 Top-Level-Ordner - `dmarcwatch fetch` mit falschem Namen listet in der
 Fehlermeldung die tatsächlichen Ordnernamen.
 <br>
-<sup>3</sup> Wird bei `dmarcwatch setup` interaktiv abgefragt, kein Default.
+<sup>4</sup> Wird bei `dmarcwatch setup` interaktiv abgefragt, kein Default.
 <br>
-<sup>4</sup> IPv4 und IPv6, Zugehörigkeit über `ipaddress`-Netzvergleich
+<sup>5</sup> IPv4 und IPv6, Zugehörigkeit über `ipaddress`-Netzvergleich
 geprüft, nicht per Zeichenkette. **Kein Default und keine interaktive
 Abfrage** - die eigenen Sende-Netze kennt man i. d. R. erst nach den ersten
 echten Reports (`source_ip` bei sauberen Einträgen) oder aus dem eigenen
@@ -228,15 +236,15 @@ genau das automatisch, siehe oben). Leer = jede IP gilt zunächst als
 unbekannt und wird markiert - sicherer, sichtbarer Zustand statt eines
 stillen Falsch-negativs.
 <br>
-<sup>5</sup> 10 MB ist laut IETF-Draft zur DMARC-Aggregate-Reporting-
+<sup>6</sup> 10 MB ist laut IETF-Draft zur DMARC-Aggregate-Reporting-
 Spezifikation "far larger than any real aggregate report".
 <br>
-<sup>6</sup> Header + alle MIME-Teile, base64-kodiert, geprüft per
+<sup>7</sup> Header + alle MIME-Teile, base64-kodiert, geprüft per
 `RFC822.SIZE` **vor** dem eigentlichen IMAP-Abruf des Bodys. Aus
 `max_attachment_size_mb` abgeleitet (base64 bläht ~1.37x auf) plus
 Spielraum.
 <br>
-<sup>7</sup> Belt-and-suspenders zur Größengrenze: ein Report an der
+<sup>8</sup> Belt-and-suspenders zur Größengrenze: ein Report an der
 10-MB-Grenze mit ~42.000 flachen Records kostet empirisch bereits < 1s
 CPU-Zeit, dieses Limit macht das Verhalten bei absichtlicher Datenflut
 zusätzlich deterministisch, statt sich allein auf den CPU-Zeit-Backstop des

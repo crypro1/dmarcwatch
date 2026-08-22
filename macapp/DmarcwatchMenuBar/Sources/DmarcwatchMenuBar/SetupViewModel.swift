@@ -6,7 +6,11 @@ import Foundation
 /// Schlüsselbund, LaunchAgent) passieren dort in der Python-Implementierung,
 /// nicht hier.
 final class SetupViewModel: ObservableObject {
-    @Published var imapHost = "imap.mailbox.org"
+    // Kein Default: dmarcwatch ist ein öffentliches Projekt für beliebige
+    // IMAP-Anbieter, nicht nur mailbox.org (siehe DEFAULT_CONFIG-Kommentar
+    // in config.py) - ein vorbelegter fremder Hostname würde ohne genaues
+    // Lesen zu einem verwirrenden Verbindungsfehler führen.
+    @Published var imapHost = ""
     @Published var imapPort = "993"
     @Published var imapUser = ""
     @Published var imapFolder = "INBOX/DMARC"
