@@ -15,11 +15,16 @@ from pathlib import Path
 APP_NAME = "dmarcwatch"
 
 DEFAULT_CONFIG = {
-    # imap_host/imap_port sind als Vorschlag für mailbox.org vorbelegt (das
-    # ist der primär getestete Anbieter), werden aber bei `dmarcwatch setup`
-    # trotzdem interaktiv abgefragt (Enter übernimmt den Vorschlag) - kein
-    # Wert hier ist eine bestimmte Person oder Domain zugeschnitten.
-    "imap_host": "imap.mailbox.org",
+    # Kein Default: dmarcwatch ist ein öffentliches Projekt, nicht nur für
+    # mailbox.org-Postfächer (auch wenn das der primär getestete Anbieter
+    # ist) - ein vorbelegter mailbox.org-Hostname würde bei Enter ohne
+    # genaues Lesen zu einem verwirrenden Verbindungsfehler gegen den
+    # falschen Server führen, statt offensichtlich das eigene Postfach zu
+    # sein. `dmarcwatch setup` fragt das deshalb genauso zwingend ab wie
+    # imap_user/own_domains weiter unten.
+    "imap_host": "",
+    # imap_port bleibt vorbelegt: 993 (IMAPS/implizites TLS) ist
+    # anbieterunabhängig der Standardport, kein mailbox.org-Spezifikum.
     "imap_port": 993,
     # Kein Default: der IMAP-Login ist das echte Postfach, nicht die
     # rua-Alias-Adresse aus dem DMARC-DNS-Eintrag - bei mailbox.org sind
