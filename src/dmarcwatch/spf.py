@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import subprocess
+from dataclasses import dataclass, field
 
 DIG_TIMEOUT_SECONDS = 5.0
 MAX_DNS_LOOKUPS = 10
@@ -91,6 +92,10 @@ class _LookupBudget:
                 f"Zu viele verschachtelte SPF-Lookups (> {self._limit}) - Abfrage bei "
                 f"{context!r} abgebrochen (RFC-7208-Limit)."
             )
+
+    @property
+    def used(self) -> int:
+        return self._used
 
 
 def _resolve(domain: str, budget: _LookupBudget, seen: set[str]) -> set[str]:
@@ -163,3 +168,69 @@ def resolve_own_ip_networks(domain: str) -> list[str]:
         except ValueError:
             continue  # seltene/unparsebare Mechanismus-Syntax überspringen
     return sorted(validated)
+
+
+@dataclass
+class SPFCheckResult:
+    """Ergebnis von validate_spf() für `dmarcwatch verify-dns`
+    (dns_verify.py) - ein Diagnosebericht, keine Exception bei Problemen:
+    das Ziel ist, Fehlkonfigurationen aufzulisten, nicht abzubrechen."""
+
+    exists: bool
+    record: str | None = None
+    lookup_count: int = 0
+    lookup_limit_ok: bool = True
+    warnings: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
+def validate_spf(domain: str) -> SPFCheckResult:
+    """Prüft den SPF-Eintrag von `domain` auf Gültigkeit und häufige
+    Fehlkonfigurationen: mehrere SPF-Einträge (laut RFC 7208 ein PermError -
+    es darf nur genau einer sein), fehlender oder zu offener
+    `all`-Mechanismus, und die tatsächliche Anzahl verbrauchter
+    DNS-Lookups gegenüber dem RFC-7208-Limit von 10."""
+    try:
+        top_level_records = [r for r in _txt_records(domain) if r.lower().startswith("v=spf1")]
+    except SPFResolutionError as exc:
+        return SPFCheckResult(exists=False, error=str(exc))
+
+    if not top_level_records:
+        return SPFCheckResult(exists=False, warnings=["Kein SPF-Eintrag (v=spf1) gefunden."])
+
+    warnings: list[str] = []
+    if len(top_level_records) > 1:
+        warnings.append(
+            f"{len(top_level_records)} SPF-Einträge gefunden - laut RFC 7208 ungültig "
+            "(PermError), es darf nur genau einer sein."
+        )
+
+    record = top_level_records[0]
+    tokens = record.split()
+    all_mechanism = next((t for t in tokens if t.lower().lstrip("+-~?") == "all"), None)
+    if all_mechanism is None:
+        warnings.append(
+            "Kein 'all'-Mechanismus am Ende - uneindeutiges Verhalten für nicht "
+            "explizit genannte Absender."
+        )
+    elif all_mechanism.lower() in ("all", "+all"):
+        warnings.append(
+            "'+all' (bzw. unqualifiziertes 'all') erlaubt praktisch jedem Server, im "
+            "Namen dieser Domain zu senden - macht SPF wirkungslos."
+        )
+
+    budget = _LookupBudget()
+    lookup_limit_ok = True
+    try:
+        _resolve(domain, budget, set())
+    except SPFResolutionError as exc:
+        lookup_limit_ok = False
+        warnings.append(str(exc))
+
+    return SPFCheckResult(
+        exists=True,
+        record=record,
+        lookup_count=budget.used,
+        lookup_limit_ok=lookup_limit_ok,
+        warnings=warnings,
+    )

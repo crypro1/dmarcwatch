@@ -282,6 +282,24 @@ LaunchAgents zu verlassen.
   Vorschlag für `own_ip_networks`. Verlässt das Gerät (DNS). Für den "Aus
   SPF ermitteln…"-Knopf in der Setup-GUI gedacht, funktioniert aber genauso
   von Hand im Terminal.
+- `dmarcwatch verify-dns [domain]`
+  Prüft die eigenen DMARC-/SPF-/DKIM-DNS-Einträge auf Gültigkeit und
+  häufige Fehlkonfigurationen (ohne Domain: alle konfigurierten
+  `own_domains`) - Diagnose der eigenen Einrichtung, nicht Auswertung
+  eingehender Reports. **DMARC**: Pflicht-Tags vorhanden, gültige
+  Policy, mehrere Einträge (laut RFC 7489 macht das den ganzen Eintrag
+  ungültig), fehlendes `rua` (keine Reports möglich), `p=none`
+  (noch keine Durchsetzung), `pct` < 100. **SPF**: siehe
+  `resolve-spf` oben, zusätzlich tatsächlich verbrauchte Lookups
+  gegenüber dem RFC-7208-Limit, fehlender/zu offener `all`-Mechanismus
+  (`+all`). **DKIM**: prüft Selektoren, die in bereits abgerufenen,
+  echten Reports beobachtet wurden ([store.py](src/dmarcwatch/store.py)
+  `get_known_dkim_selectors`) - bewusst nicht gegen eine geratene Liste
+  "üblicher" Namen, das bleibt zwangsläufig unvollständig. Unterstützt
+  RSA- und Ed25519-Schlüssel, folgt CNAME-Delegation (viele Anbieter,
+  z. B. mailbox.org, verweisen den DKIM-Eintrag per CNAME auf sich
+  selbst, damit Kund:innen bei einer Schlüsselrotation nichts ändern
+  müssen). Verlässt das Gerät (DNS).
 
 Logs: `~/Library/Application Support/dmarcwatch/dmarcwatch.log` (0600,
 keine Zugangsdaten, keine vollständigen Mailadressen).
@@ -349,7 +367,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-115 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+137 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
@@ -494,7 +512,7 @@ nicht als vertrauenswürdige Eingabe:
 - **Kein zusätzlicher Netzverkehr im automatischen Betrieb**: `fetch` (der
   tägliche LaunchAgent) verbindet sich ausschließlich zum konfigurierten
   IMAP-Host. Keine Telemetrie, keine Update-Prüfung, keine automatischen
-  Reverse-DNS-/Geo-/WHOIS-Lookups. Zwei Ausnahmen, beide nur auf
+  Reverse-DNS-/Geo-/WHOIS-Lookups. Drei Ausnahmen, alle nur auf
   ausdrückliche Anfrage, nie im Hintergrundlauf:
   - `dmarcwatch inspect --whois` ([whois.py](src/dmarcwatch/whois.py)) -
     eine RDAP-Abfrage an rdap.org (auch über den Bestätigungsdialog "WHOIS
@@ -509,6 +527,10 @@ nicht als vertrauenswürdige Eingabe:
     DNS-Abfrage zur SPF-Auflösung (auch über "Aus SPF ermitteln…" in der
     Setup-GUI erreichbar). Nur ein Vorschlag fürs Formularfeld, wird nie
     ungesehen übernommen oder automatisch gespeichert.
+  - `dmarcwatch verify-dns` ([dns_verify.py](src/dmarcwatch/dns_verify.py)) -
+    DNS-Abfragen zur Prüfung der eigenen DMARC/SPF/DKIM-Einträge. Reine
+    Diagnose, verändert nichts an der Konfiguration oder Auffälligkeits-
+    Einstufung.
 - **Gepinnte, minimale Abhängigkeiten**: `defusedxml` und `keyring`, sonst
   Standardbibliothek. Beide sind sicherheitsrelevant (nicht kosmetisch) und
   in `pyproject.toml` auf exakte Versionen gepinnt.

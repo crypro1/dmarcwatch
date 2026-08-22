@@ -120,6 +120,45 @@ def get_all_cached_whois(conn: sqlite3.Connection) -> dict[str, str]:
     return {row[0]: row[1] for row in rows}
 
 
+def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]:
+    """DKIM-Selektoren, die in echten, bereits abgerufenen Reports für
+    `domain` tatsächlich beobachtet wurden - für `dmarcwatch verify-dns`
+    (dns_verify.py). Reines Lesen aus der lokalen DB, kein Netzzugriff.
+
+    Bewusst nicht gegen eine feste Liste "üblicher" Selektor-Namen raten
+    (was andere Tools i. d. R. tun) - reale, aus eigenen Reports bekannte
+    Selektoren sind zuverlässiger als eine geratene, zwangsläufig
+    unvollständige Liste."""
+    rows = conn.execute(
+        """
+        SELECT records.auth_results_json
+        FROM records
+        JOIN reports ON reports.id = records.report_id
+        WHERE reports.domain = ?
+        """,
+        (domain,),
+    ).fetchall()
+
+    domain_lower = domain.strip().lower()
+    selectors: set[str] = set()
+    for (auth_results_raw,) in rows:
+        try:
+            auth_results = json.loads(auth_results_raw)
+        except (TypeError, ValueError):
+            continue
+        for dkim_entry in auth_results.get("dkim", []):
+            # Ein Record kann mehrere <dkim>-Einträge haben (z. B. bei
+            # Weiterleitung über eine andere Domain) - nur Selektoren
+            # übernehmen, deren DKIM-Signatur tatsächlich für `domain`
+            # selbst war, nicht für eine fremde Domain im selben Record.
+            if dkim_entry.get("domain", "").strip().lower() != domain_lower:
+                continue
+            selector = dkim_entry.get("selector", "")
+            if selector:
+                selectors.add(selector)
+    return sorted(selectors)
+
+
 def _ensure_secure_file(path: Path) -> None:
     if path.exists():
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
