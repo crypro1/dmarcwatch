@@ -65,6 +65,7 @@ struct LocalConfig: Decodable {
     let imapUser: String?
     let imapFolder: String?
     let ownDomains: [String]?
+    let ownIpNetworks: [String]?
 
     enum CodingKeys: String, CodingKey {
         case imapHost = "imap_host"
@@ -72,7 +73,15 @@ struct LocalConfig: Decodable {
         case imapUser = "imap_user"
         case imapFolder = "imap_folder"
         case ownDomains = "own_domains"
+        case ownIpNetworks = "own_ip_networks"
     }
+}
+
+/// Antwort von `dmarcwatch resolve-spf <domain>` (siehe DmarcwatchCLI.runResolveSpf).
+struct SPFResolveResponse: Decodable {
+    let domain: String?
+    let networks: [String]?
+    let error: String?
 }
 
 enum ConfigStore {
