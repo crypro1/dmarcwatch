@@ -467,6 +467,44 @@ def _print_verify_result(result: DomainVerification) -> None:
     print("=" * 60)
 
 
+def _verification_to_dict(result: DomainVerification) -> dict:
+    """JSON-Repräsentation für den `--json`-Modus - von der Menüleisten-App
+    genutzt (DNSVerifyView.swift), um das Ergebnis nativ darzustellen statt
+    die menschenlesbare Textausgabe zu parsen."""
+    return {
+        "domain": result.domain,
+        "dmarc": {
+            "exists": result.dmarc.exists,
+            "record": result.dmarc.record,
+            "policy": result.dmarc.policy,
+            "subdomain_policy": result.dmarc.subdomain_policy,
+            "pct": result.dmarc.pct,
+            "rua": result.dmarc.rua,
+            "ruf": result.dmarc.ruf,
+            "adkim": result.dmarc.adkim,
+            "aspf": result.dmarc.aspf,
+            "warnings": result.dmarc.warnings,
+        },
+        "spf": {
+            "exists": result.spf.exists,
+            "record": result.spf.record,
+            "lookup_count": result.spf.lookup_count,
+            "lookup_limit_ok": result.spf.lookup_limit_ok,
+            "warnings": result.spf.warnings,
+            "error": result.spf.error,
+        },
+        "dkim": [
+            {
+                "selector": d.selector,
+                "exists": d.exists,
+                "key_type": d.key_type,
+                "warnings": d.warnings,
+            }
+            for d in result.dkim
+        ],
+    }
+
+
 def cmd_verify_dns(args: argparse.Namespace) -> int:
     """Prüft die eigenen DMARC/SPF/DKIM-DNS-Einträge auf Gültigkeit und
     häufige Fehlkonfigurationen (siehe dns_verify.py) - verlässt das Gerät
@@ -485,11 +523,16 @@ def cmd_verify_dns(args: argparse.Namespace) -> int:
 
     db_conn = connect(db_path())
     try:
-        for domain in domains:
-            result = verify_domain(db_conn, domain)
-            _print_verify_result(result)
+        results = [verify_domain(db_conn, domain) for domain in domains]
     finally:
         db_conn.close()
+
+    if args.json:
+        json.dump([_verification_to_dict(r) for r in results], sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        for result in results:
+            _print_verify_result(result)
     return 0
 
 
@@ -590,6 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify_dns.add_argument(
         "domain", nargs="?", default=None,
         help="Zu prüfende Domain (Default: alle own_domains aus der Konfiguration)",
+    )
+    p_verify_dns.add_argument(
+        "--json", action="store_true",
+        help="JSON statt menschenlesbarem Text ausgeben (für die Menüleisten-App)",
     )
     p_verify_dns.set_defaults(func=cmd_verify_dns)
 

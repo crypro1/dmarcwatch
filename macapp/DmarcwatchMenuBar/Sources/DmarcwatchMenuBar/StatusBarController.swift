@@ -53,6 +53,22 @@ final class StatusBarController: NSObject {
         }
     }
 
+    @objc private func verifyDNS(_ sender: Any?) {
+        let confirm = NSAlert()
+        confirm.alertStyle = .informational
+        confirm.messageText = "Eigene DNS-Einträge prüfen?"
+        confirm.informativeText = """
+        Fragt DMARC-, SPF- und DKIM-DNS-Einträge der eigenen Domain(s) ab - das \
+        verlässt dein Gerät. Reine Diagnose, ändert nichts an Konfiguration oder \
+        Auffälligkeits-Einstufung.
+        """
+        confirm.addButton(withTitle: "Prüfen")
+        confirm.addButton(withTitle: "Abbrechen")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        DNSVerifyWindowController.shared.show()
+    }
+
     @objc private func toggleLoginItem(_ sender: Any?) {
         do {
             try LoginItemManager.setEnabled(!LoginItemManager.isEnabled)
@@ -173,6 +189,13 @@ final class StatusBarController: NSObject {
         setupItem.image = Self.symbol("gearshape")
         setupItem.target = self
         menu.addItem(setupItem)
+
+        let verifyDNSItem = NSMenuItem(
+            title: "DNS prüfen…", action: #selector(verifyDNS(_:)), keyEquivalent: ""
+        )
+        verifyDNSItem.image = Self.symbol("checkmark.seal")
+        verifyDNSItem.target = self
+        menu.addItem(verifyDNSItem)
 
         let loginItem = NSMenuItem(
             title: "Bei Anmeldung starten", action: #selector(toggleLoginItem(_:)), keyEquivalent: ""
