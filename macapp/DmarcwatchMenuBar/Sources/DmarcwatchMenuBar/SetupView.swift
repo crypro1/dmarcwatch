@@ -39,7 +39,7 @@ struct SetupView: View {
                     LabeledContent("Sende-Netze") {
                         VStack(alignment: .leading, spacing: 6) {
                             TextField("", text: $viewModel.ownIpNetworks)
-                            hint("CIDR, kommagetrennt - z. B. 80.241.56.0/21")
+                            hint("CIDR, kommagetrennt - z. B. 192.0.2.0/24")
                             Button(viewModel.isResolvingSpf ? "Fragt SPF ab…" : "Aus SPF ermitteln…") {
                                 showSPFConfirmation = true
                             }
@@ -89,7 +89,7 @@ struct SetupView: View {
 
     /// Erklärtext unter einem Feld statt in dessen Titel - der TextField-Titel
     /// wird in einem macOS-Form zur linken Beschriftungsspalte, ein langer
-    /// String dort (z. B. "CIDR, kommagetrennt - z. B. 80.241.56.0/21")
+    /// String dort (z. B. "CIDR, kommagetrennt - z. B. 192.0.2.0/24")
     /// sprengt die Spaltenbreite und lässt das ganze Fenster (inklusive
     /// Titelleiste) abgeschnitten wirken. Wird zusammen mit dem Feld in ein
     /// LabeledContent + VStack gepackt (siehe oben), statt als eigene
