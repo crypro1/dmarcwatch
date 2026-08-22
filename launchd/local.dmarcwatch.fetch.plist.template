@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Vorlage für den launchd LaunchAgent von dmarcwatch.
+
+  Diese Datei wird normalerweise NICHT von Hand bearbeitet und installiert.
+  Stattdessen erzeugt und installiert `dmarcwatch setup --install-agent`
+  automatisch eine passende Version unter
+  ~/Library/LaunchAgents/local.dmarcwatch.fetch.plist (mit dem korrekten
+  Python-Interpreter-Pfad aus deiner venv).
+
+  Diese Vorlage dient nur als Referenz / für manuelle Installation.
+  Ersetze __PYTHON_EXECUTABLE__, __LOG_DIR__, __HOUR__ und __MINUTE__.
+
+  Enthält bewusst keine Zugangsdaten - das IMAP-Passwort kommt zur
+  Laufzeit ausschließlich aus dem macOS-Schlüsselbund.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.dmarcwatch.fetch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_EXECUTABLE__</string>
+        <string>-m</string>
+        <string>dmarcwatch</string>
+        <string>fetch</string>
+        <string>--skip-if-already-run-today</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>__HOUR__</integer>
+        <key>Minute</key>
+        <integer>__MINUTE__</integer>
+    </dict>
+
+    <!-- Bewusst KEIN RunAtLoad: das würde als "python3, unbekannter
+         Entwickler" in Systemeinstellungen > Anmeldeobjekte auftauchen,
+         ohne App-Zuordnung. Stattdessen stößt die Menüleisten-App bei
+         jedem eigenen Start `fetch --skip-if-already-run-today` an, um
+         einen wegen ausgeschaltetem Mac verpassten
+         StartCalendarInterval-Termin nachzuholen (siehe main.swift). -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>CPU</key>
+        <integer>1</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/launchd.err.log</string>
+</dict>
+</plist>

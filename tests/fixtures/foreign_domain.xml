@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feedback>
+  <report_metadata>
+    <org_name>google.com</org_name>
+    <email>noreply-dmarc-support@google.com</email>
+    <report_id>google-report-0004</report_id>
+    <date_range>
+      <begin>1700300000</begin>
+      <end>1700386399</end>
+    </date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>example.org</domain>
+    <adkim>r</adkim>
+    <aspf>r</aspf>
+    <p>none</p>
+    <sp>none</sp>
+    <pct>100</pct>
+  </policy_published>
+  <record>
+    <row>
+      <source_ip>198.51.100.7</source_ip>
+      <count>1</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.org</header_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.org</domain>
+        <selector>default</selector>
+        <result>pass</result>
+      </dkim>
+      <spf>
+        <domain>example.org</domain>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+</feedback>

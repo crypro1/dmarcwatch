@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+*.sqlite
+*.sqlite-journal
+.DS_Store
+
+# Swift-Build-Artefakte: jederzeit über build_app.sh neu erzeugbar (siehe
+# macapp/DmarcwatchMenuBar/README bzw. das Hauptprojekt-README).
+macapp/*/.build/
+macapp/*/*.app/
+# Nur die Zwischenablage aus generate_icon.swift, nicht das fertige
+# AppIcon.icns (das bleibt getrackt - build_app.sh erzeugt es nicht neu,
+# nur `swift generate_icon.swift && iconutil ...` tut das, siehe Skript).
+macapp/*/AppIcon.iconset/

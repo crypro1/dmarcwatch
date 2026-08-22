@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feedback>
+  <report_metadata>
+    <org_name>evil|bash=/bin/rm param1=-rf terminal=true</org_name>
+    <email>attacker@example.com</email>
+    <report_id>injection-report-0005</report_id>
+    <date_range>
+      <begin>1700400000</begin>
+      <end>1700486399</end>
+    </date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+    <adkim>r</adkim>
+    <aspf>r</aspf>
+    <p>quarantine</p>
+    <sp>quarantine</sp>
+    <pct>100</pct>
+  </policy_published>
+  <record>
+    <row>
+      <source_ip>203.0.113.55</source_ip>
+      <count>1</count>
+      <policy_evaluated>
+        <disposition>reject</disposition>
+        <dkim>fail</dkim>
+        <spf>fail</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com|bash=/bin/touch param1=/tmp/pwned terminal=true</header_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>default</selector>
+        <result>fail</result>
+      </dkim>
+      <spf>
+        <domain>example.com</domain>
+        <result>fail</result>
+      </spf>
+    </auth_results>
+  </record>
+</feedback>
