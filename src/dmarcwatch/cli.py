@@ -422,7 +422,6 @@ def cmd_resolve_spf(args: argparse.Namespace) -> int:
 
 
 def _print_verify_result(result: DomainVerification) -> None:
-    print("=" * 60)
     print(f"Domain: {result.domain}")
     print()
 
@@ -464,7 +463,6 @@ def _print_verify_result(result: DomainVerification) -> None:
         print(f"  Selektor {dkim_result.selector!r}: {status}{key_info}")
         for warning in dkim_result.warnings:
             print(f"    ⚠ {warning}")
-    print("=" * 60)
 
 
 def _verification_to_dict(result: DomainVerification) -> dict:
@@ -531,8 +529,14 @@ def cmd_verify_dns(args: argparse.Namespace) -> int:
         json.dump([_verification_to_dict(r) for r in results], sys.stdout)
         sys.stdout.write("\n")
     else:
+        # Genau eine "="-Trennlinie vor jeder Domain (dient gleichzeitig als
+        # Trenner zur vorherigen) statt einer schließenden pro Domain in
+        # _print_verify_result selbst - sonst stehen bei mehreren Domains
+        # zwei Trennlinien direkt hintereinander.
         for result in results:
+            print("=" * 60)
             _print_verify_result(result)
+        print("=" * 60)
     return 0
 
 
