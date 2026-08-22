@@ -30,8 +30,14 @@ struct DNSVerifyView: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
-                            ForEach(viewModel.results, id: \.domain) { result in
+                            // Trennlinie nur ZWISCHEN Domains, nicht nach der
+                            // letzten (sonst hängt sie vor dem
+                            // "Schließen"-Knopf frei in der Luft).
+                            ForEach(Array(viewModel.results.enumerated()), id: \.element.domain) { index, result in
                                 domainSection(result)
+                                if index < viewModel.results.count - 1 {
+                                    Divider()
+                                }
                             }
                         }
                         .padding(.trailing, 4)
@@ -103,8 +109,6 @@ struct DNSVerifyView: View {
                     }
                 }
             }
-
-            Divider()
         }
     }
 
