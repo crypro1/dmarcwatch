@@ -1,5 +1,14 @@
 import SwiftUI
 
+// Bewusst KEIN Form/Section/LabeledContent: macOS' automatische
+// Form-Beschriftungsspalte hat hier zweimal zu Layout-Bugs geführt (Uhrzeit-
+// Felder, die leer wirkten; ein zu langer Feld-Titel, der das ganze Fenster
+// inklusive Titelleiste abschnitt) - beide Male, weil Form intern Annahmen
+// über Spaltenbreite/Beschriftung trifft, die sich nicht vorhersagbar
+// verhalten, sobald Zusatztext (Hinweise, Knöpfe) neben einem Feld steht.
+// Stattdessen: ein einfacher, selbst gebauter Aufbau mit Label über Feld -
+// jede Zeile ist ein VStack(alignment: .leading), alle also garantiert
+// bündig am selben linken Rand, ohne verstecktes Spalten-Layout.
 struct SetupView: View {
     @ObservedObject var viewModel: SetupViewModel
     @State private var showSPFConfirmation = false
@@ -9,49 +18,45 @@ struct SetupView: View {
             Text("dmarcwatch einrichten")
                 .font(.headline)
 
-            Form {
-                Section("IMAP") {
-                    TextField("Server", text: $viewModel.imapHost)
-                    TextField("Port", text: $viewModel.imapPort)
-                    LabeledContent("Login") {
-                        VStack(alignment: .leading, spacing: 2) {
-                            TextField("", text: $viewModel.imapUser)
-                            hint("Echtes Postfach, nicht die rua-Alias-Adresse aus dem DMARC-DNS-Eintrag.")
-                        }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    group("IMAP") {
+                        field("Server", text: $viewModel.imapHost)
+                        field("Port", text: $viewModel.imapPort)
+                        field(
+                            "Login", text: $viewModel.imapUser,
+                            hint: "Echtes Postfach, nicht die rua-Alias-Adresse aus dem DMARC-DNS-Eintrag."
+                        )
+                        secureField(
+                            "Passwort", text: $viewModel.password,
+                            hint: "Leer lassen, um das gespeicherte Passwort zu behalten."
+                        )
+                        field("Ordner", text: $viewModel.imapFolder)
                     }
-                    LabeledContent("Passwort") {
-                        VStack(alignment: .leading, spacing: 2) {
-                            SecureField("", text: $viewModel.password)
-                            hint("Leer lassen, um das gespeicherte Passwort zu behalten.")
+
+                    group("Domain & Sende-Netze") {
+                        field(
+                            "Eigene Domain(s)", text: $viewModel.ownDomains,
+                            hint: "Kommagetrennt, z. B. example.com, example.org"
+                        )
+                        field(
+                            "Eigene Sende-Netze (optional)", text: $viewModel.ownIpNetworks,
+                            hint: "CIDR, kommagetrennt - z. B. 192.0.2.0/24"
+                        )
+                        Button(viewModel.isResolvingSpf ? "Fragt SPF ab…" : "Aus SPF ermitteln…") {
+                            showSPFConfirmation = true
                         }
+                        .disabled(viewModel.isResolvingSpf)
                     }
-                    TextField("Ordner", text: $viewModel.imapFolder)
-                }
-                Section("Eigene Domain(s)") {
-                    LabeledContent("Domain(s)") {
-                        VStack(alignment: .leading, spacing: 2) {
-                            TextField("", text: $viewModel.ownDomains)
-                            hint("Kommagetrennt, z. B. example.com, example.org")
-                        }
-                    }
-                }
-                Section("Eigene Sende-Netze (optional)") {
-                    LabeledContent("Sende-Netze") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            TextField("", text: $viewModel.ownIpNetworks)
-                            hint("CIDR, kommagetrennt - z. B. 192.0.2.0/24")
-                            Button(viewModel.isResolvingSpf ? "Fragt SPF ab…" : "Aus SPF ermitteln…") {
-                                showSPFConfirmation = true
-                            }
-                            .disabled(viewModel.isResolvingSpf)
-                        }
+
+                    group("Täglicher Abruf") {
+                        DatePicker(
+                            "Uhrzeit", selection: $viewModel.scheduleTime,
+                            displayedComponents: .hourAndMinute
+                        )
                     }
                 }
-                Section("Täglicher Abruf") {
-                    DatePicker(
-                        "Uhrzeit", selection: $viewModel.scheduleTime, displayedComponents: .hourAndMinute
-                    )
-                }
+                .padding(.trailing, 4)  // Platz für die Scrollbar, nichts wird davon verdeckt
             }
 
             if let error = viewModel.errorMessage {
@@ -71,7 +76,7 @@ struct SetupView: View {
             }
         }
         .padding(20)
-        .frame(width: 480)
+        .frame(width: 480, height: 560)
         // Wie beim WHOIS-Knopf im Menü: DNS-Abfrage geht wirklich nach
         // außen, deshalb erst nach expliziter Bestätigung, nie automatisch
         // beim Eintippen der Domain.
@@ -87,17 +92,46 @@ struct SetupView: View {
         }
     }
 
-    /// Erklärtext unter einem Feld statt in dessen Titel - der TextField-Titel
-    /// wird in einem macOS-Form zur linken Beschriftungsspalte, ein langer
-    /// String dort (z. B. "CIDR, kommagetrennt - z. B. 192.0.2.0/24")
-    /// sprengt die Spaltenbreite und lässt das ganze Fenster (inklusive
-    /// Titelleiste) abgeschnitten wirken. Wird zusammen mit dem Feld in ein
-    /// LabeledContent + VStack gepackt (siehe oben), statt als eigene
-    /// Form-Zeile - sonst würde die Zeile bündig am linken Fensterrand
-    /// beginnen statt unter dem Feld, das sie erklärt.
-    private func hint(_ text: String) -> some View {
-        Text(text)
-            .font(.caption)
-            .foregroundStyle(.secondary)
+    /// Eine Gruppe von Feldern mit gemeinsamer Überschrift - rein visuell,
+    /// kein Form-Section mit eigener Spaltenlogik.
+    @ViewBuilder
+    private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.subheadline.bold())
+                .foregroundStyle(.secondary)
+            content()
+        }
+    }
+
+    /// Label über dem Feld statt daneben - vermeidet jede Spaltenbreiten-
+    /// Berechnung komplett. `.fixedSize` auf dem Hinweistext erzwingt
+    /// Zeilenumbruch statt Abschneiden mit "…" bei längeren Erklärungen.
+    private func field(_ label: String, text: Binding<String>, hint: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.callout)
+            TextField("", text: text)
+                .textFieldStyle(.roundedBorder)
+            if let hint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func secureField(_ label: String, text: Binding<String>, hint: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.callout)
+            SecureField("", text: text)
+                .textFieldStyle(.roundedBorder)
+            if let hint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
