@@ -13,19 +13,39 @@ struct SetupView: View {
                 Section("IMAP") {
                     TextField("Server", text: $viewModel.imapHost)
                     TextField("Port", text: $viewModel.imapPort)
-                    TextField("Login (echtes Postfach)", text: $viewModel.imapUser)
-                    SecureField("App-Passwort (leer = unverändert)", text: $viewModel.password)
+                    LabeledContent("Login") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            TextField("", text: $viewModel.imapUser)
+                            hint("Echtes Postfach, nicht die rua-Alias-Adresse aus dem DMARC-DNS-Eintrag.")
+                        }
+                    }
+                    LabeledContent("Passwort") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            SecureField("", text: $viewModel.password)
+                            hint("Leer lassen, um das gespeicherte Passwort zu behalten.")
+                        }
+                    }
                     TextField("Ordner", text: $viewModel.imapFolder)
                 }
                 Section("Eigene Domain(s)") {
-                    TextField("kommagetrennt", text: $viewModel.ownDomains)
+                    LabeledContent("Domain(s)") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            TextField("", text: $viewModel.ownDomains)
+                            hint("Kommagetrennt, z. B. example.com, example.org")
+                        }
+                    }
                 }
                 Section("Eigene Sende-Netze (optional)") {
-                    TextField("CIDR, kommagetrennt - z. B. 80.241.56.0/21", text: $viewModel.ownIpNetworks)
-                    Button(viewModel.isResolvingSpf ? "Fragt SPF ab…" : "Aus SPF ermitteln…") {
-                        showSPFConfirmation = true
+                    LabeledContent("Sende-Netze") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            TextField("", text: $viewModel.ownIpNetworks)
+                            hint("CIDR, kommagetrennt - z. B. 80.241.56.0/21")
+                            Button(viewModel.isResolvingSpf ? "Fragt SPF ab…" : "Aus SPF ermitteln…") {
+                                showSPFConfirmation = true
+                            }
+                            .disabled(viewModel.isResolvingSpf)
+                        }
                     }
-                    .disabled(viewModel.isResolvingSpf)
                 }
                 Section("Täglicher Abruf") {
                     DatePicker(
@@ -51,7 +71,7 @@ struct SetupView: View {
             }
         }
         .padding(20)
-        .frame(width: 440)
+        .frame(width: 480)
         // Wie beim WHOIS-Knopf im Menü: DNS-Abfrage geht wirklich nach
         // außen, deshalb erst nach expliziter Bestätigung, nie automatisch
         // beim Eintippen der Domain.
@@ -65,5 +85,19 @@ struct SetupView: View {
                 "Speichern noch anpassen."
             )
         }
+    }
+
+    /// Erklärtext unter einem Feld statt in dessen Titel - der TextField-Titel
+    /// wird in einem macOS-Form zur linken Beschriftungsspalte, ein langer
+    /// String dort (z. B. "CIDR, kommagetrennt - z. B. 80.241.56.0/21")
+    /// sprengt die Spaltenbreite und lässt das ganze Fenster (inklusive
+    /// Titelleiste) abgeschnitten wirken. Wird zusammen mit dem Feld in ein
+    /// LabeledContent + VStack gepackt (siehe oben), statt als eigene
+    /// Form-Zeile - sonst würde die Zeile bündig am linken Fensterrand
+    /// beginnen statt unter dem Feld, das sie erklärt.
+    private func hint(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 }
