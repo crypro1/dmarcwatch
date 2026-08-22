@@ -22,14 +22,19 @@ echo
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "Fehler: python3 wurde nicht gefunden." >&2
-    echo "Bitte Python 3.9 oder neuer installieren (System oder Homebrew)." >&2
+    echo "Bitte Python 3.10 oder neuer installieren, z. B. über Homebrew:" >&2
+    echo "  brew install python@3.13" >&2
     exit 1
 fi
 
 PY_VERSION="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-PY_OK="$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')"
+PY_OK="$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 10) else 0)')"
 if [ "$PY_OK" != "1" ]; then
-    echo "Fehler: Python $PY_VERSION gefunden, dmarcwatch braucht mindestens 3.9." >&2
+    echo "Fehler: Python $PY_VERSION gefunden (python3 -> $(command -v python3)), dmarcwatch braucht mindestens 3.10." >&2
+    echo "Das von Apple mitgelieferte System-Python reicht dafür meist nicht - über Homebrew" >&2
+    echo "installieren und danach 'brew --prefix python@3.13'/bin/python3 statt python3 nutzen," >&2
+    echo "oder PATH entsprechend anpassen:" >&2
+    echo "  brew install python@3.13" >&2
     exit 1
 fi
 echo "Python $PY_VERSION gefunden."

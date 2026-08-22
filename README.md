@@ -27,8 +27,9 @@ nur auf ausdrücklichen Klick/Flag hin, eine einzelne WHOIS-Abfrage - siehe
 ## Voraussetzungen
 
 - macOS (Apple Silicon)
-- Python 3.9 oder neuer (System-Python unter `/usr/bin/python3` oder
-  Homebrew-Python funktionieren beide)
+- Python 3.10 oder neuer - das von Apple mitgelieferte System-Python unter
+  `/usr/bin/python3` reicht dafür meist nicht (oft noch 3.9), Homebrew-Python
+  (`brew install python@3.13`) funktioniert
 - Ein IMAP-Postfach, in dem DMARC-Aggregate-Reports bereits per Filterregel
   landen (hier: mailbox.org, Ordner `DMARC`)
 - Ein **anwendungsspezifisches Passwort** für dieses Postfach (nicht das
@@ -69,11 +70,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-Das Upgrade von pip ist nötig, weil das mit dem System-Python 3.9
-ausgelieferte pip (getestet: 21.2.4) `pip install -e .` aus einem reinen
-`pyproject.toml` ohne `setup.py` nicht unterstützt. Nur `pip install .`
-(ohne `-e`) funktioniert auch mit der alten pip-Version, `-e` ist für die
-Entwicklung gedacht (siehe [Tests](#tests)).
+Das Upgrade von pip schadet nie und stellt sicher, dass `pip install -e .`
+(editierbare Installation aus einem reinen `pyproject.toml` ohne
+`setup.py`) zuverlässig funktioniert - `-e` ist für die Entwicklung
+gedacht (siehe [Tests](#tests)), für die normale Nutzung reicht
+`pip install .` ohne `-e`.
 
 Einrichtung (Konfiguration + Schlüsselbund-Passwort + optional LaunchAgent):
 
