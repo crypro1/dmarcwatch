@@ -18,6 +18,7 @@ from dmarcwatch.dns_verify import (
     DMARCCheckResult,
     DomainVerification,
     MTASTSCheckResult,
+    MXBlacklistCheckResult,
     TLSRPTDNSCheckResult,
     WildcardSPFCheckResult,
 )
@@ -34,6 +35,7 @@ def _clean_dns_result(domain: str) -> DomainVerification:
         mta_sts=MTASTSCheckResult(configured=False),
         tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
         wildcard_spf=WildcardSPFCheckResult(configured=False),
+        mx_blacklist=MXBlacklistCheckResult(checked=False),
     )
 
 

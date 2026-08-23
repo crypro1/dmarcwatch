@@ -40,10 +40,18 @@ from .report import (
     to_json_dict,
     to_tls_json_dict,
 )
+from .blacklist import BlacklistCheckError, check_ip_blacklist
 from .menubar import render_swiftbar
 from .sanitize import sanitize_field
 from .spf import SPFResolutionError, resolve_own_ip_networks
-from .store import connect, get_all_cached_whois, query_records, set_cached_whois
+from .store import (
+    connect,
+    get_all_cached_blacklist,
+    get_all_cached_whois,
+    query_records,
+    set_cached_blacklist,
+    set_cached_whois,
+)
 from .whois import WhoisLookupError, lookup_ip_organization
 
 def _prompt(question: str, default: str = "") -> str:
@@ -426,6 +434,15 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     # Pro eindeutiger IP nur einmal nachschlagen, auch wenn mehrere
     # Treffer dieselbe IP haben (mehrere Reports/Tage).
     whois_cache: dict[str, str] = {}
+    blacklist_cache: dict[str, str] = {}
+    # Signalisiert der Menüleisten-App per Exit-Code (siehe return unten),
+    # dass mindestens eine --whois/--blacklist-Abfrage fehlgeschlagen ist -
+    # unabhängig vom bewusst weiter fehlenden Caching dieser Fehlschläge
+    # (siehe Kommentare an den except-Zweigen unten). Ohne dieses Signal
+    # bliebe der Exit-Code bei einem Fehlschlag 0 (wie ein voller Erfolg),
+    # die Menüleisten-App müsste sonst deutschen Ausgabetext nach
+    # "Abfrage fehlgeschlagen" durchsuchen, um das zu erkennen.
+    inline_lookup_failed = False
 
     for r in matches:
         reasons = [x for x in (r["flag_reasons"] or "").split(",") if x]
@@ -467,11 +484,38 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                     # Ergebnis hängen bleiben, ein späterer Versuch soll es
                     # erneut probieren.
                     whois_cache[ip] = f"Abfrage fehlgeschlagen ({exc})"
+                    inline_lookup_failed = True
+                    print(f"WHOIS-Abfrage fehlgeschlagen: {exc}", file=sys.stderr)
             print(f"WHOIS-Organisation (nur Hinweis, keine Einstufung): {whois_cache[ip]}")
+        if args.blacklist:
+            ip = r["source_ip"]
+            if ip not in blacklist_cache:
+                try:
+                    result = check_ip_blacklist(ip)
+                    if result.listed:
+                        blacklist_cache[ip] = "gelistet - " + "; ".join(result.reasons)
+                    else:
+                        blacklist_cache[ip] = "nicht gelistet"
+                    # In der lokalen DB ablegen, damit die Menüleisten-App
+                    # das später nur lesen kann, ohne selbst Spamhaus
+                    # anzufragen - siehe get_all_cached_blacklist().
+                    set_cached_blacklist(db_conn, ip, result.listed, result.reasons)
+                except BlacklistCheckError as exc:
+                    # Fehlschläge werden bewusst NICHT gecacht - siehe
+                    # WHOIS-Kommentar oben, gleicher Grund.
+                    blacklist_cache[ip] = f"Abfrage fehlgeschlagen ({exc})"
+                    inline_lookup_failed = True
+                    print(f"Spamhaus-Abfrage fehlgeschlagen: {exc}", file=sys.stderr)
+            print(f"Spamhaus ZEN (nur Hinweis, keine Einstufung): {blacklist_cache[ip]}")
     db_conn.close()
     print("=" * 60)
     print(f"{len(matches)} Treffer für {args.query!r} in den letzten {args.days} Tagen.")
-    return 0
+    # Exit-Code 3: Treffer wurden gefunden und angezeigt, aber mindestens
+    # eine angeforderte --whois/--blacklist-Abfrage ist fehlgeschlagen (ohne
+    # Caching, siehe oben) - eigener Code statt 0 (voller Erfolg) oder 1
+    # (keine Treffer), damit Aufrufer wie die Menüleisten-App das ohne
+    # Textabgleich unterscheiden können (siehe StatusBarController.swift).
+    return 3 if inline_lookup_failed else 0
 
 
 def cmd_menubar(args: argparse.Namespace) -> int:
@@ -496,10 +540,14 @@ def cmd_menubar_json(args: argparse.Namespace) -> int:
     since_ts, until_ts = day_range_to_ts(config.menubar_days)
     rows = collect_rows(db_conn, since_ts, until_ts)
     whois_by_ip = get_all_cached_whois(db_conn)
+    blacklist_by_ip = get_all_cached_blacklist(db_conn)
     db_conn.close()
     skipped_items = read_skipped_items()
     dns_check = read_dns_check_result()
-    json.dump(to_json_dict(rows, config.menubar_days, whois_by_ip, skipped_items, dns_check), sys.stdout)
+    json.dump(
+        to_json_dict(rows, config.menubar_days, whois_by_ip, skipped_items, dns_check, blacklist_by_ip),
+        sys.stdout,
+    )
     sys.stdout.write("\n")
     return 0
 
@@ -593,6 +641,15 @@ def _print_verify_result(result: DomainVerification) -> None:
         for warning in result.wildcard_spf.warnings:
             print(f"  ⚠ {warning}")
 
+    if result.mx_blacklist.checked:
+        print()
+        print("Mailserver-Blacklist (Spamhaus ZEN)")
+        print(f"  MX-Server:         {', '.join(result.mx_blacklist.mx_hosts)}")
+        status = "gelistet" if result.mx_blacklist.listed else "sauber"
+        print(f"  Status:            {status}")
+        for warning in result.mx_blacklist.warnings:
+            print(f"  ⚠ {warning}")
+
 
 def _verification_to_dict(result: DomainVerification) -> dict:
     """JSON-Repräsentation für den `--json`-Modus - von der Menüleisten-App
@@ -645,6 +702,12 @@ def _verification_to_dict(result: DomainVerification) -> dict:
             "configured": result.wildcard_spf.configured,
             "record": result.wildcard_spf.record,
             "warnings": result.wildcard_spf.warnings,
+        },
+        "mx_blacklist": {
+            "checked": result.mx_blacklist.checked,
+            "mx_hosts": result.mx_blacklist.mx_hosts,
+            "listed": result.mx_blacklist.listed,
+            "warnings": result.mx_blacklist.warnings,
         },
     }
 
@@ -781,6 +844,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--whois", action="store_true",
         help="Zusätzlich WHOIS/RDAP-Organisation der IP abfragen (verlässt das Gerät; "
         "rein informativ, ändert nie die Auffälligkeits-Einstufung)"
+    )
+    p_inspect.add_argument(
+        "--blacklist", action="store_true",
+        help="Zusätzlich gegen Spamhaus ZEN prüfen (verlässt das Gerät; "
+        "rein informativ, ändert nie die Auffälligkeits-Einstufung, nur IPv4)"
     )
     p_inspect.set_defaults(func=cmd_inspect)
 

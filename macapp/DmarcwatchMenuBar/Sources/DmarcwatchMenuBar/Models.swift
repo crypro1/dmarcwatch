@@ -63,6 +63,7 @@ struct DNSCheckDomainResult: Decodable {
     let mtaSts: MTASTSCheck
     let tlsrptDns: TLSRPTDNSCheck
     let wildcardSpf: WildcardSPFCheck
+    let mxBlacklist: MXBlacklistCheck
     let hasWarnings: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -70,7 +71,47 @@ struct DNSCheckDomainResult: Decodable {
         case mtaSts = "mta_sts"
         case tlsrptDns = "tlsrpt_dns"
         case wildcardSpf = "wildcard_spf"
+        case mxBlacklist = "mx_blacklist"
         case hasWarnings = "has_warnings"
+    }
+
+    // decodeIfPresent für mxBlacklist statt synthetisierter Konformität:
+    // last_dns_check.json ist ein von einem FRÜHEREN `verify-dns`-Lauf
+    // persistierter, roher Dict-Schnappschuss (siehe config.py
+    // read_dns_check_result) - eine bereits vorhandene Datei aus der Zeit
+    // vor diesem Feld hätte sonst beim nächsten App-Start/Hover die
+    // komplette Dekodierung von MenubarReport zum Scheitern gebracht (nicht
+    // nur dieses eine Feld leer gelassen), bis der nächste verify-dns-Lauf
+    // die Datei überschreibt. Gleiche Begründung wie bei
+    // MenubarReport.skippedItems/dnsCheck oben.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        domain = try container.decode(String.self, forKey: .domain)
+        dmarc = try container.decode(DMARCCheck.self, forKey: .dmarc)
+        spf = try container.decode(SPFCheck.self, forKey: .spf)
+        dkim = try container.decode([DKIMCheck].self, forKey: .dkim)
+        mtaSts = try container.decode(MTASTSCheck.self, forKey: .mtaSts)
+        tlsrptDns = try container.decode(TLSRPTDNSCheck.self, forKey: .tlsrptDns)
+        wildcardSpf = try container.decode(WildcardSPFCheck.self, forKey: .wildcardSpf)
+        mxBlacklist = try container.decodeIfPresent(MXBlacklistCheck.self, forKey: .mxBlacklist)
+            ?? MXBlacklistCheck(checked: false, mxHosts: [], listed: [], warnings: [])
+        hasWarnings = try container.decode(Bool.self, forKey: .hasWarnings)
+    }
+}
+
+/// Spamhaus-ZEN-Prüfung der eigenen MX-Server-IP(s) (siehe blacklist.py) -
+/// checked ist false, wenn kein MX gefunden wurde oder die Abfrage
+/// fehlschlug, dann gibt es nichts anzuzeigen (kein MX heißt meist einfach,
+/// dass die Domain selbst keine Mail empfängt).
+struct MXBlacklistCheck: Decodable {
+    let checked: Bool
+    let mxHosts: [String]
+    let listed: [String]
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case checked, warnings, listed
+        case mxHosts = "mx_hosts"
     }
 }
 
@@ -134,6 +175,10 @@ struct ReportRecord: Codable {
     // nachgeschlagen und lokal gecacht - die App fragt selbst nie bei
     // rdap.org an. Rein informativ, keine Sicherheitseinstufung.
     let whoisOrganization: String?
+    // Analog zu whoisOrganization, nur per `inspect --blacklist` gegen
+    // Spamhaus ZEN statt RDAP. nil, solange nie geprüft.
+    let blacklistListed: Bool?
+    let blacklistReasons: [String]
 
     enum CodingKeys: String, CodingKey {
         case orgName = "org_name"
@@ -143,6 +188,8 @@ struct ReportRecord: Codable {
         case isFlagged = "is_flagged"
         case flagLabels = "flag_labels"
         case whoisOrganization = "whois_organization"
+        case blacklistListed = "blacklist_listed"
+        case blacklistReasons = "blacklist_reasons"
     }
 }
 
@@ -194,12 +241,14 @@ struct DomainVerificationResponse: Decodable {
     let mtaSts: MTASTSCheck
     let tlsrptDns: TLSRPTDNSCheck
     let wildcardSpf: WildcardSPFCheck
+    let mxBlacklist: MXBlacklistCheck
 
     enum CodingKeys: String, CodingKey {
         case domain, dmarc, spf, dkim
         case mtaSts = "mta_sts"
         case tlsrptDns = "tlsrpt_dns"
         case wildcardSpf = "wildcard_spf"
+        case mxBlacklist = "mx_blacklist"
     }
 }
 

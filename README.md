@@ -150,6 +150,10 @@ Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   verlässt dein Gerät"), ruft erst nach Bestätigung `dmarcwatch inspect
   <ip> --whois` auf. Entspricht einem manuellen Terminal-Befehl, nur
   bequemer erreichbar - siehe Einschränkung direkt darunter.
+- **Blacklist abrufen…** erscheint daneben im selben Untermenü, gleiches
+  Muster wie WHOIS oben, nur gegen Spamhaus ZEN statt RDAP (`dmarcwatch
+  inspect <ip> --blacklist`) - siehe [Konfiguration](#konfiguration) unten
+  zur Wahl gerade dieser einen Liste.
 - **DNS prüfen…** öffnet nach Bestätigung im Dialog ein Fenster mit dem
   Ergebnis von `dmarcwatch verify-dns --json` für alle konfigurierten
   `own_domains` - DMARC/SPF/DKIM/MTA-STS/TLS-RPT-DNS/Wildcard-SPF-Gültigkeit
@@ -183,13 +187,14 @@ Größengrenze oder eine erkannte Dekompressionsbombe, siehe
 [Sicherheitsentscheidungen](#sicherheitsentscheidungen)) - keine dauerhaft
 leere Sektion nur zur Vollständigkeit.
 
-Abgesehen von **"WHOIS abrufen…"**, **"Aus SPF ermitteln…"** und
-**"DNS prüfen…"** macht die App selbst **keine** Netzwerkanfrage von sich
-aus - alles andere (inklusive **"TLS-RPT-Bericht…"**) liest ausschließlich
-aus der lokalen SQLite-Datenbank, die `fetch` befüllt. Das sind die
-einzigen drei Stellen, an denen ein Klick tatsächlich nach außen geht (RDAP
-bzw. DNS), und alle drei immer erst nach expliziter Bestätigung im Dialog,
-nie automatisch im Hintergrund.
+Abgesehen von **"WHOIS abrufen…"**, **"Blacklist abrufen…"**, **"Aus SPF
+ermitteln…"** und **"DNS prüfen…"** macht die App selbst **keine**
+Netzwerkanfrage von sich aus - alles andere (inklusive
+**"TLS-RPT-Bericht…"**) liest ausschließlich aus der lokalen
+SQLite-Datenbank, die `fetch` befüllt. Das sind die einzigen vier Stellen,
+an denen ein Klick tatsächlich nach außen geht (RDAP bzw. DNS), und alle
+vier immer erst nach expliziter Bestätigung im Dialog, nie automatisch im
+Hintergrund.
 
 Wichtig: dmarcwatch darf **nicht** unter `~/Desktop`, `~/Documents` oder
 `~/Downloads` liegen. Diese Ordner sind unter macOS durch TCC geschützt -
@@ -387,14 +392,18 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   aber genauso von Hand im Terminal. Nur aussagekräftig, wenn
   `enable_tls_rpt` aktiv ist und `fetch` schon mindestens einmal danach
   gelaufen ist.
-- `dmarcwatch inspect <ip-oder-cidr> [--days N] [--whois]`
+- `dmarcwatch inspect <ip-oder-cidr> [--days N] [--whois] [--blacklist]`
   Vollständige Details zu einer IP oder einem Netz (z. B. `2a01:111::/32`),
   ohne von Hand SQL gegen die Datenbank zu schreiben. `--whois` fragt
   zusätzlich die Organisation hinter der IP per RDAP ab (rein informativ,
   keine Sicherheitseinstufung - Details und Begründung unter
   [Sicherheitsentscheidungen](#sicherheitsentscheidungen)) und legt das
   Ergebnis in `whois_cache` ab, damit die Menüleisten-App es anzeigen kann,
-  ohne selbst je eine Netzwerkanfrage zu machen.
+  ohne selbst je eine Netzwerkanfrage zu machen. `--blacklist` prüft
+  gleichermaßen gegen Spamhaus ZEN (`blacklist_cache`, siehe
+  [`blacklist.py`](src/dmarcwatch/blacklist.py) zur Wahl gerade dieser
+  einen Liste) - ebenfalls rein informativ, ändert nie die
+  Auffälligkeits-Einstufung.
 - `dmarcwatch menubar`
   Erzeugt die SwiftBar-Textausgabe (wird von `swiftbar/dmarcwatch.10m.sh`
   aufgerufen, nicht für den interaktiven Gebrauch gedacht).
@@ -438,9 +447,22 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   prüft den `_smtp._tls.<domain>`-TXT-Eintrag (`v=TLSRPTv1; rua=...`), der
   ankündigt, wohin TLS-RPT-Reports gehen sollen. **Wildcard-SPF** prüft einen
   `*.<domain>`-TXT-Eintrag als Schutz vor Phishing über nicht existierende
-  Subdomains. `--json` gibt strukturierte Ausgabe statt der Tabelle aus -
-  für das "DNS prüfen…"-Fenster in der Menüleisten-App gedacht, funktioniert
-  aber genauso von Hand im Terminal.
+  Subdomains. Zusätzlich, unabhängig von den drei optionalen Checks oben:
+  **Mailserver-Blacklist** löst die eigenen MX-Einträge auf und prüft deren
+  IP(s) gegen **Spamhaus ZEN** - ein gelisteter eigener Mailserver ist ein
+  ernstzunehmendes Problem (viele Empfänger lehnen Mail von dort direkt ab).
+  Kein MX oder eine fehlgeschlagene DNS-Abfrage ergibt keine Warnung (die
+  Domain empfängt dann vermutlich selbst keine Mail), nicht die üblichen
+  "großen sechs" öffentlichen Listen (Barracuda, SpamCop, UCEProtect,
+  SpamRATS, PSBL, Invaluement): eine Whois-Prüfung der jeweiligen
+  Nameserver-IPs ergab, dass nur Spamhaus tatsächlich in der EU gehostete
+  Infrastruktur hat (u. a. ein Nameserver in einem Hetzner/
+  Deutschland-Adressbereich) - die anderen fünf liegen alle in den USA.
+  Spamhaus gilt davon unabhängig ohnehin als die fachlich angesehenste
+  einzelne Liste; Invaluement ist ohne kostenpflichtigen Abfrage-Key gar
+  nicht frei nutzbar. `--json` gibt strukturierte Ausgabe statt der Tabelle
+  aus - für das "DNS prüfen…"-Fenster in der Menüleisten-App gedacht,
+  funktioniert aber genauso von Hand im Terminal.
 
 Logs: `~/Library/Application Support/dmarcwatch/dmarcwatch.log` (0600,
 keine Zugangsdaten, keine vollständigen Mailadressen).
@@ -508,7 +530,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-212 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+234 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
@@ -668,7 +690,7 @@ nicht als vertrauenswürdige Eingabe:
 - **Kein zusätzlicher Netzverkehr im automatischen Betrieb**: `fetch` (der
   tägliche LaunchAgent) verbindet sich ausschließlich zum konfigurierten
   IMAP-Host. Keine Telemetrie, keine Update-Prüfung, keine automatischen
-  Reverse-DNS-/Geo-/WHOIS-Lookups. Drei Ausnahmen, alle nur auf
+  Reverse-DNS-/Geo-/WHOIS-Lookups. Vier Ausnahmen, alle nur auf
   ausdrückliche Anfrage, nie im Hintergrundlauf:
   - `dmarcwatch inspect --whois` ([whois.py](src/dmarcwatch/whois.py)) -
     eine RDAP-Abfrage an rdap.org (auch über den Bestätigungsdialog "WHOIS
@@ -679,14 +701,19 @@ nicht als vertrauenswürdige Eingabe:
     Microsoft betreiben auch riesige, für jeden mietbare Cloud-Bereiche,
     ein WHOIS-Treffer auf einen großen Namen ist kein Nachweis für
     legitime Weiterleitung und darf die Erkennung nicht aufweichen.
+  - `dmarcwatch inspect --blacklist` ([blacklist.py](src/dmarcwatch/blacklist.py)) -
+    eine DNS-Abfrage gegen Spamhaus ZEN (auch über "Blacklist abrufen…" in
+    der Menüleisten-App erreichbar). Ebenfalls rein informativ, gleiche
+    Begründung wie bei WHOIS oben - ein Listing ist ein Hinweis für die
+    eigene Einschätzung, keine automatische Einstufung.
   - `dmarcwatch resolve-spf` ([spf.py](src/dmarcwatch/spf.py)) - eine
     DNS-Abfrage zur SPF-Auflösung (auch über "Aus SPF ermitteln…" in der
     Setup-GUI erreichbar). Nur ein Vorschlag fürs Formularfeld, wird nie
     ungesehen übernommen oder automatisch gespeichert.
   - `dmarcwatch verify-dns` ([dns_verify.py](src/dmarcwatch/dns_verify.py)) -
-    DNS-Abfragen zur Prüfung der eigenen DMARC/SPF/DKIM-Einträge. Reine
-    Diagnose, verändert nichts an der Konfiguration oder Auffälligkeits-
-    Einstufung.
+    DNS-Abfragen zur Prüfung der eigenen DMARC/SPF/DKIM-Einträge sowie der
+    eigenen MX-Server gegen Spamhaus ZEN. Reine Diagnose, verändert nichts
+    an der Konfiguration oder Auffälligkeits-Einstufung.
 - **Gepinnte, minimale Abhängigkeiten**: `defusedxml` und `keyring`, sonst
   Standardbibliothek. Beide sind sicherheitsrelevant (nicht kosmetisch) und
   in `pyproject.toml` auf exakte Versionen gepinnt.
