@@ -4,18 +4,108 @@ import Foundation
 // (dmarcwatch menubar-json). Feldnamen dort sind snake_case, hier
 // camelCase über CodingKeys gemappt.
 
-struct MenubarReport: Codable {
+struct MenubarReport: Decodable {
     let days: Int
     let totalCount: Int
     let flaggedCount: Int
     let daysGrouped: [DayGroup]
+    // Gründe, warum im letzten `fetch`-Lauf Nachrichten/Anhänge übersprungen
+    // wurden (z. B. eine abgelehnte Dekompressionsbombe) - kommt aus
+    // config.read_skipped_items(), bereits serverseitig sanitisiert.
+    let skippedItems: [String]
+    // Ergebnis der letzten verify-dns-Prüfung (Klick auf "DNS prüfen…" oder
+    // periodischer automatischer Check) - nil, wenn noch nie geprüft wurde.
+    let dnsCheck: DNSCheckSummary?
 
     enum CodingKeys: String, CodingKey {
         case days
         case totalCount = "total_count"
         case flaggedCount = "flagged_count"
         case daysGrouped = "days_grouped"
+        case skippedItems = "skipped_items"
+        case dnsCheck = "dns_check"
     }
+
+    // decodeIfPresent statt der automatisch generierten Synthese: eine
+    // synthetisierte Codable-Konformität würde bei fehlendem
+    // "skipped_items"-Schlüssel (z. B. venv und App-Bundle kurzzeitig auf
+    // unterschiedlichem Stand während eines Updates) die komplette
+    // Dekodierung scheitern lassen, nicht nur dieses eine Feld leer lassen.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        days = try container.decode(Int.self, forKey: .days)
+        totalCount = try container.decode(Int.self, forKey: .totalCount)
+        flaggedCount = try container.decode(Int.self, forKey: .flaggedCount)
+        daysGrouped = try container.decode([DayGroup].self, forKey: .daysGrouped)
+        skippedItems = try container.decodeIfPresent([String].self, forKey: .skippedItems) ?? []
+        dnsCheck = try container.decodeIfPresent(DNSCheckSummary.self, forKey: .dnsCheck)
+    }
+}
+
+/// Spiegelt config.read_dns_check_result() aus dem Python-Paket - egal ob
+/// durch Klick auf "DNS prüfen…" oder den periodischen automatischen Check
+/// (enable_auto_dns_check) befüllt.
+struct DNSCheckSummary: Decodable {
+    let checkedAt: String
+    let domains: [DNSCheckDomainResult]
+
+    enum CodingKeys: String, CodingKey {
+        case checkedAt = "checked_at"
+        case domains
+    }
+}
+
+struct DNSCheckDomainResult: Decodable {
+    let domain: String
+    let dmarc: DMARCCheck
+    let spf: SPFCheck
+    let dkim: [DKIMCheck]
+    let mtaSts: MTASTSCheck
+    let tlsrptDns: TLSRPTDNSCheck
+    let wildcardSpf: WildcardSPFCheck
+    let hasWarnings: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case domain, dmarc, spf, dkim
+        case mtaSts = "mta_sts"
+        case tlsrptDns = "tlsrpt_dns"
+        case wildcardSpf = "wildcard_spf"
+        case hasWarnings = "has_warnings"
+    }
+}
+
+/// Optional/fortgeschritten (siehe dns_verify.py-Kommentare) - `configured`
+/// ist false, wenn die Domain das gar nicht nutzt, dann sind `warnings`
+/// immer leer (kein Fehlen-Hinweis, nur ein angefangenes, kaputtes Setup
+/// erzeugt Warnungen).
+struct MTASTSCheck: Decodable {
+    let configured: Bool
+    let cnameTarget: String?
+    let policyTxt: String?
+    // nil, solange kein HTTPS-Abruf versucht wurde (z. B. weil noch nicht
+    // mal der Hostname konfiguriert ist) - sonst das tatsächliche Ergebnis
+    // des Abrufs der eigenen Policy-Datei (anbieterunabhängig).
+    let policyReachable: Bool?
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case configured, warnings
+        case cnameTarget = "cname_target"
+        case policyTxt = "policy_txt"
+        case policyReachable = "policy_reachable"
+    }
+}
+
+struct TLSRPTDNSCheck: Decodable {
+    let configured: Bool
+    let record: String?
+    let warnings: [String]
+}
+
+struct WildcardSPFCheck: Decodable {
+    let configured: Bool
+    let record: String?
+    let warnings: [String]
 }
 
 struct DayGroup: Codable {
@@ -66,6 +156,10 @@ struct LocalConfig: Decodable {
     let imapFolder: String?
     let ownDomains: [String]?
     let ownIpNetworks: [String]?
+    let enableTlsRpt: Bool?
+    let tlsrptImapFolder: String?
+    let enableAutoDnsCheck: Bool?
+    let autoDnsCheckIntervalDays: Int?
 
     enum CodingKeys: String, CodingKey {
         case imapHost = "imap_host"
@@ -74,6 +168,10 @@ struct LocalConfig: Decodable {
         case imapFolder = "imap_folder"
         case ownDomains = "own_domains"
         case ownIpNetworks = "own_ip_networks"
+        case enableTlsRpt = "enable_tls_rpt"
+        case tlsrptImapFolder = "tlsrpt_imap_folder"
+        case enableAutoDnsCheck = "enable_auto_dns_check"
+        case autoDnsCheckIntervalDays = "auto_dns_check_interval_days"
     }
 }
 
@@ -93,6 +191,16 @@ struct DomainVerificationResponse: Decodable {
     let dmarc: DMARCCheck
     let spf: SPFCheck
     let dkim: [DKIMCheck]
+    let mtaSts: MTASTSCheck
+    let tlsrptDns: TLSRPTDNSCheck
+    let wildcardSpf: WildcardSPFCheck
+
+    enum CodingKeys: String, CodingKey {
+        case domain, dmarc, spf, dkim
+        case mtaSts = "mta_sts"
+        case tlsrptDns = "tlsrpt_dns"
+        case wildcardSpf = "wildcard_spf"
+    }
 }
 
 struct DMARCCheck: Decodable {
@@ -137,6 +245,41 @@ struct DKIMCheck: Decodable {
     enum CodingKeys: String, CodingKey {
         case selector, exists, warnings
         case keyType = "key_type"
+    }
+}
+
+/// Spiegelt to_tls_json_dict() aus report.py (`dmarcwatch tls-report --json`)
+/// - für das TLS-RPT-Berichtsfenster (TLSReportView.swift). Rein lesend aus
+/// der lokalen DB, kein Netzzugriff (anders als DNS-Prüfung/WHOIS).
+struct TLSReportResponse: Decodable {
+    let days: Int
+    let totalFailureCount: Int
+    let policies: [TLSPolicyEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case days
+        case totalFailureCount = "total_failure_count"
+        case policies
+    }
+}
+
+struct TLSPolicyEntry: Decodable {
+    let date: String
+    let organizationName: String
+    let policyDomain: String
+    let policyType: String
+    let successfulSessionCount: Int
+    let failureCount: Int
+    let failureResultTypes: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case organizationName = "organization_name"
+        case policyDomain = "policy_domain"
+        case policyType = "policy_type"
+        case successfulSessionCount = "successful_session_count"
+        case failureCount = "failure_count"
+        case failureResultTypes = "failure_result_types"
     }
 }
 

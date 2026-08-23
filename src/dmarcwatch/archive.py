@@ -101,3 +101,37 @@ def extract_report_xml(filename_hint: str, data: bytes, max_attachment_size_byte
         return data
 
     raise ArchiveError(f"Unbekannter Anhangstyp: {filename_hint!r}")
+
+
+def extract_report_json(
+    filename_hint: str, data: bytes, max_attachment_size_bytes: int, max_json_size_bytes: int
+) -> bytes:
+    """Extrahiert die JSON-Nutzdaten eines SMTP-TLS-RPT-Anhangs (RFC 8460).
+
+    Analog zu extract_report_xml, nur für .json statt .xml als Klartext-
+    Endung. TLS-RPT-Reports landen in einem separaten, eigens dafür
+    eingerichteten Postfachordner (siehe fetch.py) statt per
+    Inhalts-Sniffing von DMARC-Anhängen unterschieden zu werden - beide
+    Formate können als .gz vorliegen, die Endung allein ist nicht
+    eindeutig.
+    """
+    if len(data) == 0:
+        raise ArchiveError("Anhang ist leer")
+    if len(data) > max_attachment_size_bytes:
+        raise ArchiveError(
+            f"Anhang ist {len(data)} Bytes groß, über Obergrenze {max_attachment_size_bytes}"
+        )
+
+    name = (filename_hint or "").lower()
+    if name.endswith(".gz"):
+        return _extract_gz(data, max_json_size_bytes)
+    if name.endswith(".zip"):
+        return _extract_zip(data, max_json_size_bytes)
+    if name.endswith(".json"):
+        if len(data) > max_json_size_bytes:
+            raise ArchiveError(
+                f"JSON ist {len(data)} Bytes groß, über Obergrenze {max_json_size_bytes}"
+            )
+        return data
+
+    raise ArchiveError(f"Unbekannter Anhangstyp: {filename_hint!r}")

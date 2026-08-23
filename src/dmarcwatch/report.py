@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .anomaly import REASON_LABELS_DE
 from .sanitize import sanitize_field
-from .store import query_records
+from .store import query_records, query_tls_failure_details, query_tls_policies
 
 _MAX_JSON_FIELD_LEN = 120
 
@@ -94,7 +94,13 @@ def has_findings(rows: list[ReportRow]) -> bool:
     return any(r.is_flagged for r in rows)
 
 
-def to_json_dict(rows: list[ReportRow], days: int, whois_by_ip: dict[str, str] | None = None) -> dict:
+def to_json_dict(
+    rows: list[ReportRow],
+    days: int,
+    whois_by_ip: dict[str, str] | None = None,
+    skipped_items: list[str] | None = None,
+    dns_check: dict | None = None,
+) -> dict:
     """Strukturierte, nach Tag gruppierte Sicht für native Konsumenten
     (z. B. die Swift-Menüleisten-App). Anders als format_table()/render_swiftbar()
     gibt es hier kein Trennzeichen-Format zu schützen - JSON-Encoding
@@ -149,4 +155,118 @@ def to_json_dict(rows: list[ReportRow], days: int, whois_by_ip: dict[str, str] |
         "total_count": len(rows),
         "flagged_count": len(flagged),
         "days_grouped": days_out,
+        # Gründe für Nachrichten/Anhänge, die im letzten `fetch`-Lauf
+        # übersprungen wurden (z. B. eine abgelehnte Dekompressionsbombe) -
+        # kommt bereits sanitisiert aus config.read_skipped_items() (siehe
+        # cmd_fetch), hier zusätzlich erneut durch sanitize_field(), gleiche
+        # defensive Konvention wie bei whois_organization oben.
+        "skipped_items": [sanitize_field(x, max_len=_MAX_JSON_FIELD_LEN) for x in (skipped_items or [])],
+        # Ergebnis der letzten verify-dns-Prüfung (egal ob per Klick auf
+        # "DNS prüfen…" oder durch den periodischen automatischen Check
+        # ausgelöst) - kommt bereits fertig strukturiert aus
+        # config.read_dns_check_result(), hier unverändert durchgereicht
+        # (eigene Domain-DNS-Inhalte, nicht dieselbe Bedrohungsklasse wie
+        # E-Mail-Anhänge, deshalb keine erneute sanitize_field-Behandlung
+        # wie bei skipped_items/whois_organization). None, wenn noch nie
+        # geprüft wurde.
+        "dns_check": dns_check,
+    }
+
+
+@dataclass
+class TLSPolicyRow:
+    tls_policy_id: int
+    date_begin: int
+    org_name: str
+    policy_domain: str
+    policy_type: str
+    successful_session_count: int
+    failure_count: int
+    failure_result_types: list[str]
+
+
+def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list[TLSPolicyRow]:
+    rows = query_tls_policies(conn, since_ts, until_ts)
+    result = []
+    for r in rows:
+        failure_result_types: list[str] = []
+        if r["failure_count"] > 0:
+            failure_result_types = [
+                fd["result_type"] for fd in query_tls_failure_details(conn, r["id"])
+            ]
+        result.append(
+            TLSPolicyRow(
+                tls_policy_id=r["id"],
+                date_begin=r["date_begin"],
+                org_name=r["organization_name"],
+                policy_domain=r["policy_domain"],
+                policy_type=r["policy_type"],
+                successful_session_count=r["successful_session_count"],
+                failure_count=r["failure_count"],
+                failure_result_types=failure_result_types,
+            )
+        )
+    return result
+
+
+def format_tls_table(rows: list[TLSPolicyRow]) -> str:
+    if not rows:
+        return "Keine TLS-RPT-Reports im gewählten Zeitraum."
+
+    headers = ["Datum", "Organisation", "Domain", "Policy", "Erfolge", "Fehlschläge", "Fehlertyp(en)"]
+    lines_data = []
+    for r in rows:
+        # org_name/policy_domain/policy_type/result_types stammen aus dem
+        # geparsten Report (unvertrauenswürdige Eingabe) - vor der
+        # Terminal-Ausgabe bereinigen, analog zu format_table() für DMARC.
+        date_str = time.strftime("%Y-%m-%d", time.gmtime(r.date_begin))
+        org_name = sanitize_field(r.org_name, max_len=30)
+        domain = sanitize_field(r.policy_domain, max_len=30)
+        policy_type = sanitize_field(r.policy_type, max_len=15)
+        failure_types = sanitize_field(", ".join(sorted(set(r.failure_result_types))), max_len=40)
+        lines_data.append(
+            [date_str, org_name, domain, policy_type, str(r.successful_session_count), str(r.failure_count), failure_types]
+        )
+
+    widths = [len(h) for h in headers]
+    for row in lines_data:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells: list[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    out = [fmt_row(headers), fmt_row(["-" * w for w in widths])]
+    out.extend(fmt_row(row) for row in lines_data)
+    return "\n".join(out)
+
+
+def has_tls_failures(rows: list[TLSPolicyRow]) -> bool:
+    return any(r.failure_count > 0 for r in rows)
+
+
+def to_tls_json_dict(rows: list[TLSPolicyRow], days: int) -> dict:
+    """Strukturierte Sicht für native Konsumenten (Menüleisten-App), analog
+    zu to_json_dict() für DMARC. Eine flache Liste statt nach Tagen
+    gruppiert - TLS-RPT-Reports sind bereits Policy-Zusammenfassungen pro
+    Zeitraum, keine Einzel-Records wie bei DMARC."""
+    policies = []
+    for r in rows:
+        policies.append(
+            {
+                "date": time.strftime("%Y-%m-%d", time.gmtime(r.date_begin)),
+                "organization_name": sanitize_field(r.org_name, max_len=_MAX_JSON_FIELD_LEN),
+                "policy_domain": sanitize_field(r.policy_domain, max_len=_MAX_JSON_FIELD_LEN),
+                "policy_type": sanitize_field(r.policy_type, max_len=_MAX_JSON_FIELD_LEN),
+                "successful_session_count": r.successful_session_count,
+                "failure_count": r.failure_count,
+                "failure_result_types": [
+                    sanitize_field(t, max_len=_MAX_JSON_FIELD_LEN) for t in r.failure_result_types
+                ],
+            }
+        )
+    return {
+        "days": days,
+        "total_failure_count": sum(r.failure_count for r in rows),
+        "policies": policies,
     }

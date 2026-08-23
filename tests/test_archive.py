@@ -10,10 +10,11 @@ import zipfile
 
 import pytest
 
-from dmarcwatch.archive import ArchiveError, extract_report_xml
+from dmarcwatch.archive import ArchiveError, extract_report_json, extract_report_xml
 
 MAX_ATTACHMENT = 5 * 1024 * 1024
 MAX_XML = 10 * 1024 * 1024
+MAX_JSON = 2 * 1024 * 1024
 
 
 def test_plain_xml_passthrough():
@@ -100,3 +101,33 @@ def test_bad_zip_rejected():
 def test_bad_gz_rejected():
     with pytest.raises(ArchiveError):
         extract_report_xml("broken.xml.gz", b"not gzip data", MAX_ATTACHMENT, MAX_XML)
+
+
+def test_json_plain_passthrough():
+    data = b'{"organization-name": "x"}'
+    assert extract_report_json("report.json", data, MAX_ATTACHMENT, MAX_JSON) == data
+
+
+def test_json_gz_roundtrip():
+    payload = b'{"organization-name": "x", "policies": []}'
+    compressed = gzip.compress(payload)
+    result = extract_report_json("report.json.gz", compressed, MAX_ATTACHMENT, MAX_JSON)
+    assert result == payload
+
+
+def test_json_gzip_bomb_rejected_at_size_limit():
+    huge = b"\x00" * (50 * 1024 * 1024)
+    compressed = gzip.compress(huge)
+    assert len(compressed) < MAX_ATTACHMENT
+    with pytest.raises(ArchiveError):
+        extract_report_json("bomb.json.gz", compressed, MAX_ATTACHMENT, max_json_size_bytes=2 * 1024 * 1024)
+
+
+def test_json_unknown_extension_rejected():
+    with pytest.raises(ArchiveError):
+        extract_report_json("report.exe", b"whatever", MAX_ATTACHMENT, MAX_JSON)
+
+
+def test_json_empty_attachment_rejected():
+    with pytest.raises(ArchiveError):
+        extract_report_json("empty.json", b"", MAX_ATTACHMENT, MAX_JSON)

@@ -3,7 +3,8 @@ import ServiceManagement
 
 // Kommandozeilen-Kurzpfade für Skripte/Diagnose, ohne Statusleisten-Icon
 // oder Run-Loop aufzubauen - die App selbst nutzt für denselben Zweck den
-// Menüpunkt "Bei Anmeldung starten" (LoginItemManager.swift).
+// Schalter "Automatisch starten" in den Einstellungen (SetupView.swift,
+// LoginItemManager.swift).
 //
 // --unregister-login-item: reiner Aufräum-Pfad für uninstall.sh - die App
 // entfernen, während sie noch als Login-Item registriert ist, würde eine

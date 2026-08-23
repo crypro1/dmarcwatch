@@ -1,15 +1,55 @@
 import AppKit
 
+/// Inhalt für den Info-Alert hinter dem ⓘ-Symbol an DMARC/TLS-RPT-
+/// Überschriften (siehe showInfo(_:)) - als representedObject am jeweiligen
+/// NSMenuItem hinterlegt, da ein Menüpunkt nur eine action, aber beliebige
+/// Nutzdaten tragen kann.
+private struct InfoPopover {
+    let headline: String
+    let text: String
+}
+
 final class StatusBarController: NSObject {
     private let statusItem: NSStatusItem
     private var refreshTimer: Timer?
-    // 10 Minuten, gleiche Konvention wie SwiftBars "10m"-Dateinamenssuffix.
+    // 10 Minuten, gleiche Konvention wie SwiftBars "10m"-Dateinamenssuffix -
+    // die Hauptauffrischung passiert inzwischen beim Hovern übers Icon
+    // (mouseEntered unten), der Timer ist nur noch das Sicherheitsnetz für
+    // "App läuft lange im Hintergrund, ohne dass je gehovert wird".
     private let refreshIntervalSeconds: TimeInterval = 600
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         statusItem.button?.image = Self.symbol("ellipsis.circle")
+        if let button = statusItem.button {
+            // Aktualisiert schon beim Hovern, nicht erst beim Klick - beim
+            // üblichen "kurz drüber, dann klicken" ist der Inhalt dann
+            // schon fertig geladen, wenn das Menü tatsächlich aufklappt.
+            // Sicher, weil render() unten bei jedem Aufruf eine KOMPLETT
+            // NEUE NSMenu-Instanz baut und erst am Ende per
+            // statusItem.menu = menu zuweist - im Unterschied zu einer
+            // früheren Zwischenversion, die stattdessen eine einzige
+            // langlebige NSMenu-Instanz per removeAllItems() in-place neu
+            // befüllt hat. Das hatte, ausgelöst über NSMenuDelegate.
+            // menuWillOpen(_:) direkt vor dem Aufklappen, dazu geführt,
+            // dass praktisch kein Menüpunkt im gesamten Dropdown mehr auf
+            // Klicks reagierte, obwohl der Inhalt weiterhin korrekt
+            // sichtbar war (AppKits interne Klick-Weiterleitung verliert
+            // offenbar den Bezug, wenn genau die Instanz, die gerade zum
+            // Anzeigen/Tracking vorbereitet wird, in-place mutiert wird).
+            // Ein komplett neues Objekt zuzuweisen, während das alte
+            // (falls gerade offen) unangetastet bleibt, hat dieses
+            // Problem nicht - das gilt für jeden refresh()-Aufruf,
+            // egal ob durch Hovern, den Timer oder App-Start ausgelöst.
+            button.addTrackingArea(
+                NSTrackingArea(
+                    rect: button.bounds,
+                    options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                    owner: self, userInfo: nil
+                )
+            )
+        }
         refresh(nil)
         refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshIntervalSeconds, repeats: true) { [weak self] _ in
             self?.refresh(nil)
@@ -20,14 +60,39 @@ final class StatusBarController: NSObject {
         refreshTimer?.invalidate()
     }
 
+    // WICHTIG: @objc(mouseEntered:) explizit angeben, nicht nur @objc.
+    // Swifts automatische Selektor-Erzeugung für eine SELBST GESCHRIEBENE
+    // Methode mit dieser Signatur ergibt "mouseEnteredWith:", nicht
+    // "mouseEntered:" (das "with" fällt nur bei ECHTEN NSResponder-
+    // Overrides weg, per Apple-eigenem Objective-C-Import-Mapping - nicht
+    // bei einer neuen, eigenen Methode gleichen Namens). NSTrackingArea
+    // ruft aber zwingend den wörtlichen Selektor "mouseEntered:" auf.
+    // Ohne die explizite Angabe hier fand AppKit die Methode nie und warf
+    // bei JEDER Mausbewegung übers Icon (rein/raus) eine "unrecognized
+    // selector"-Exception - das hat reihenweise Menüaktionen im gesamten
+    // Dropdown verschluckt, nicht nur die neuen DNS-Einträge. Empirisch
+    // verifiziert mit einem eigenen Testskript (NSStringFromSelector).
+    @objc(mouseEntered:) func mouseEntered(with event: NSEvent) {
+        refresh(nil)
+    }
+
+    @objc(mouseExited:) func mouseExited(with event: NSEvent) {}
+
     // Nicht mehr "private": AppDelegate ruft das nach dem
     // Start-Nachhol-Abruf auf (siehe main.swift).
     @objc func refresh(_ sender: Any?) {
+        // TLS-RPT wird mit abgefragt, auch wenn enable_tls_rpt (noch) aus
+        // ist - tls-report liest nur die schon vorhandene DB, unabhängig
+        // vom Fetch-Flag. `try?` statt eigener Fehlerbehandlung: schlägt
+        // das fehl (z. B. Binary kaputt), zeigt render() einfach keinen
+        // TLS-RPT-Abschnitt an, statt den ganzen DMARC-Bericht mit
+        // durchfallen zu lassen.
+        let tlsReport = try? DmarcwatchCLI.fetchTLSReport()
         do {
             let report = try DmarcwatchCLI.fetchMenubarReport()
-            render(report: report, error: nil)
+            render(report: report, error: nil, tlsReport: tlsReport)
         } catch {
-            render(report: nil, error: error)
+            render(report: nil, error: error, tlsReport: tlsReport)
         }
     }
 
@@ -38,7 +103,7 @@ final class StatusBarController: NSObject {
             case .success:
                 self?.refresh(nil)
             case .failure(let error):
-                self?.render(report: nil, error: error)
+                self?.render(report: nil, error: error, tlsReport: nil)
             }
         }
     }
@@ -53,35 +118,54 @@ final class StatusBarController: NSObject {
         }
     }
 
+    // Reine UI-Präferenz (kein Sicherheits-/Konfigurationswert), deshalb in
+    // UserDefaults statt in config.json - "Nicht mehr fragen" unten setzt
+    // das einmalig, ohne den Python-CLI-Umweg für ein reines Anzeigedetail.
+    private static let skipDNSVerifyConfirmationKey = "skipDNSVerifyConfirmation"
+
     @objc private func verifyDNS(_ sender: Any?) {
-        let confirm = NSAlert()
-        confirm.alertStyle = .informational
-        confirm.messageText = "Eigene DNS-Einträge prüfen?"
-        confirm.informativeText = """
-        Fragt DMARC-, SPF- und DKIM-DNS-Einträge der eigenen Domain(s) ab - das \
-        verlässt dein Gerät. Reine Diagnose, ändert nichts an Konfiguration oder \
-        Auffälligkeits-Einstufung.
-        """
-        confirm.addButton(withTitle: "Prüfen")
-        confirm.addButton(withTitle: "Abbrechen")
-        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        NSApp.activate(ignoringOtherApps: true)
+
+        if !UserDefaults.standard.bool(forKey: Self.skipDNSVerifyConfirmationKey) {
+            let confirm = NSAlert()
+            confirm.alertStyle = .informational
+            confirm.messageText = "Eigene DNS-Einträge prüfen?"
+            confirm.informativeText = """
+            Fragt DMARC-, SPF- und DKIM-DNS-Einträge der eigenen Domain(s) ab - das \
+            verlässt dein Gerät. Reine Diagnose, ändert nichts an Konfiguration oder \
+            Auffälligkeits-Einstufung.
+
+            Symbol und die Fläche oben in der Statusleiste färben sich rot, sobald \
+            mindestens eine Warnung gefunden wurde (z. B. fehlendes DMARC, p=none, \
+            SPF über dem Lookup-Limit) - im Menü erscheint die betroffene Domain dann \
+            als eigene Zeile mit den konkreten Gründen darunter.
+            """
+            confirm.showsSuppressionButton = true
+            confirm.suppressionButton?.title = "Nicht mehr fragen"
+            confirm.addButton(withTitle: "Prüfen")
+            confirm.addButton(withTitle: "Abbrechen")
+            let response = confirm.runModal()
+            if confirm.suppressionButton?.state == .on {
+                UserDefaults.standard.set(true, forKey: Self.skipDNSVerifyConfirmationKey)
+            }
+            guard response == .alertFirstButtonReturn else { return }
+        }
 
         DNSVerifyWindowController.shared.show()
     }
 
-    @objc private func toggleLoginItem(_ sender: Any?) {
-        do {
-            try LoginItemManager.setEnabled(!LoginItemManager.isEnabled)
-        } catch {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Anmeldeobjekt konnte nicht geändert werden"
-            alert.informativeText = "\(error)"
-            alert.runModal()
-        }
-        // Menü neu aufbauen, damit die Checkbox den tatsächlichen Status
-        // zeigt (z. B. falls die Registrierung fehlgeschlagen ist).
-        refresh(nil)
+    /// Reine Info-Anzeige, kein Netzzugriff, keine Bestätigung nötig -
+    /// deshalb ein schlichter Alert mit nur einem Knopf statt der
+    /// Ja/Abbrechen-Bestätigungsdialoge, die tatsächlich etwas auslösen
+    /// (WHOIS/DNS-Prüfung/SPF).
+    @objc private func showInfo(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? InfoPopover else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = info.headline
+        alert.informativeText = info.text
+        alert.addButton(withTitle: "Verstanden")
+        alert.runModal()
     }
 
     @objc private func lookupWhois(_ sender: NSMenuItem) {
@@ -117,8 +201,39 @@ final class StatusBarController: NSObject {
 
     // MARK: - Rendering
 
-    private func render(report: MenubarReport?, error: Error?) {
+    private func render(report: MenubarReport?, error: Error?, tlsReport: TLSReportResponse?) {
         let menu = NSMenu()
+        // Nur anzeigen, wenn TLS-RPT tatsächlich aktiviert UND mindestens
+        // ein Eintrag vorhanden ist. Beide Bedingungen nötig: tls-report
+        // liest unabhängig vom Schalter, was schon in der DB steht (siehe
+        // cmd_tls_report) - ohne die Flag-Prüfung hier würde die Sektion
+        // nach einem "kurz ausprobiert, dann wieder deaktiviert" weiter mit
+        // alten Daten auftauchen, obwohl die Funktion inzwischen aus ist.
+        let tlsRptEnabled = ConfigStore.loadCurrent()?.enableTlsRpt ?? false
+        let hasTLSData = tlsRptEnabled && !(tlsReport?.policies.isEmpty ?? true)
+
+        // Letztes bekanntes verify-dns-Ergebnis (Klick auf "DNS prüfen…"
+        // oder periodischer automatischer Check) - rein lesend aus der
+        // schon vorhandenen menubar-json-Antwort, kein eigener DNS-Aufruf
+        // hier. dnsCheck kann auch dann vorhanden sein, wenn `report`
+        // selbst fehlschlägt (unwahrscheinlich, da beides aus demselben
+        // Prozess kommt), deshalb per optional chaining statt im
+        // `if let report`-Zweig.
+        let dnsCheck = report?.dnsCheck
+        let dnsWarnedDomains = dnsCheck?.domains.filter { $0.hasWarnings } ?? []
+        let dnsHasWarnings = !dnsWarnedDomains.isEmpty
+
+        // Rote, leicht durchsichtige "Pille" hinter den Statusleisten-
+        // Icons, wenn die eigene DNS-Konfiguration Auffälligkeiten hat -
+        // deutlich sichtbar, ohne die Icons selbst einzufärben (die
+        // bleiben bewusst monochrom/Template, siehe iconText-Kommentar).
+        if let button = statusItem.button {
+            button.wantsLayer = true
+            button.layer?.backgroundColor = dnsHasWarnings
+                ? NSColor.systemRed.withAlphaComponent(0.25).cgColor
+                : nil
+            button.layer?.cornerRadius = 9
+        }
 
         if let report = report {
             let isFlagged = report.flaggedCount > 0
@@ -127,35 +242,59 @@ final class StatusBarController: NSObject {
             // im Titeltext - und okCount statt totalCount neben dem
             // Häkchen, sonst ergibt "9 ⚠1" bei 8 sauberen + 1 auffälligem
             // Eintrag keine korrekte Rechnung. In der Statusleiste bleiben
-            // beide Symbole schwarz/Template wie sonst übliche
+            // alle Symbole schwarz/Template wie sonst übliche
             // Menüleisten-Icons (WLAN, Bluetooth, Batterie) - Farbe ist nur
             // im aufgeklappten Menü sinnvoll, dort unverändert orange.
             let okCount = report.totalCount - report.flaggedCount
+            // Referenzhöhe von checkmark.circle - alle Symbole in der
+            // Statusleiste werden auf genau diese Höhe angeglichen (siehe
+            // iconText/symbolMatchingHeight), nicht nur auf denselben
+            // pointSize-Parameter. Verschiedene SF-Symbole haben bei
+            // gleichem pointSize unterschiedliche native Seitenverhältnisse
+            // (key.fill z. B. breiter/diagonal), dadurch wirken sie trotz
+            // identischem pointSize optisch unterschiedlich groß.
+            let iconHeight = Self.symbol("checkmark.circle", pointSize: NSFont.systemFontSize)?.size.height
+                ?? NSFont.systemFontSize
             let title = NSMutableAttributedString()
-            title.append(Self.iconText(symbol: "checkmark.circle", count: okCount))
+            title.append(Self.iconText(symbol: "checkmark.circle", count: okCount, targetHeight: iconHeight))
             if isFlagged {
                 title.append(NSAttributedString(string: "  "))
-                title.append(Self.iconText(symbol: "exclamationmark.triangle.fill", count: report.flaggedCount))
+                title.append(
+                    Self.iconText(
+                        symbol: "exclamationmark.triangle.fill", count: report.flaggedCount, targetHeight: iconHeight
+                    )
+                )
+            }
+            if hasTLSData {
+                title.append(NSAttributedString(string: "  "))
+                title.append(
+                    Self.iconText(
+                        symbol: "key.fill", count: tlsReport?.totalFailureCount ?? 0, targetHeight: iconHeight
+                    )
+                )
             }
             statusItem.button?.image = nil
             statusItem.button?.attributedTitle = title
 
             let header = NSMenuItem(
                 title: "DMARC · letzte \(report.days) Tage",
-                action: nil, keyEquivalent: ""
+                action: #selector(showInfo(_:)), keyEquivalent: ""
             )
-            header.attributedTitle = NSAttributedString(
-                string: header.title,
-                attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)]
+            header.attributedTitle = Self.compactHeaderTitle(
+                header.title, subtitle: "\(report.totalCount) Einträge, \(report.flaggedCount) auffällig",
+                icon: "info.circle"
             )
-            header.isEnabled = false
+            header.target = self
+            header.representedObject = InfoPopover(
+                headline: "DMARC",
+                text: "DMARC (Domain-based Message Authentication, Reporting & Conformance) prüft, ob Mails " +
+                    "von deiner Domain wirklich von autorisierten Servern stammen (SPF/DKIM), und legt fest, " +
+                    "was Empfänger mit nicht-autorisierten Mails tun sollen.\n\n" +
+                    "Diese Liste zeigt die täglichen Sammelreports (rua), die andere Mailanbieter dir " +
+                    "darüber schicken: pro Tag, wie viele Mails geprüft wurden, von welcher Quell-IP, und " +
+                    "ob SPF/DKIM oder die angewendete Disposition (z. B. \"quarantine\"/\"reject\") auffällig waren."
+            )
             menu.addItem(header)
-
-            let summary = disabledItem(
-                "\(report.totalCount) Einträge, \(report.flaggedCount) auffällig",
-                secondary: true
-            )
-            menu.addItem(summary)
             menu.addItem(NSMenuItem.separator())
 
             if report.daysGrouped.isEmpty {
@@ -164,6 +303,69 @@ final class StatusBarController: NSObject {
 
             for day in report.daysGrouped {
                 menu.addItem(dayMenuItem(for: day))
+            }
+
+            // TLS-RPT direkt im selben Dropdown, unterhalb des ältesten
+            // DMARC-Eintrags - gleiches Prinzip wie bei DMARC (Tag ->
+            // Untermenü mit den Einzeleinträgen), kein eigenes Fenster mehr.
+            if let tlsReport = tlsReport, hasTLSData {
+                menu.addItem(NSMenuItem.separator())
+                let tlsHeader = NSMenuItem(
+                    title: "TLS-RPT · letzte \(tlsReport.days) Tage",
+                    action: #selector(showInfo(_:)), keyEquivalent: ""
+                )
+                tlsHeader.attributedTitle = Self.compactHeaderTitle(
+                    tlsHeader.title,
+                    subtitle: "\(tlsReport.policies.count) Eintrag/Einträge, \(tlsReport.totalFailureCount) Fehlschläge",
+                    icon: "info.circle"
+                )
+                tlsHeader.target = self
+                tlsHeader.representedObject = InfoPopover(
+                    headline: "TLS-RPT",
+                    text: "TLS-RPT (SMTP TLS Reporting, RFC 8460) meldet, wenn andere Mailserver beim " +
+                        "Versand an dich keine verschlüsselte Verbindung (TLS) aufbauen konnten - z. B. " +
+                        "wegen eines abgelaufenen Zertifikats oder eines DNS-Konfigurationsfehlers bei " +
+                        "MTA-STS/DANE. Reine Diagnose der Zustellsicherheit, unabhängig von DMARC.\n\n" +
+                        "Diese Liste zeigt pro Tag und Domain, wie viele TLS-Verbindungen erfolgreich " +
+                        "waren und wie viele fehlgeschlagen sind, inklusive der gemeldeten Fehlertypen " +
+                        "(z. B. \"certificate-expired\", \"starttls-not-supported\")."
+                )
+                menu.addItem(tlsHeader)
+                menu.addItem(NSMenuItem.separator())
+
+                for (date, entries) in Self.groupedByDateDescending(tlsReport.policies) {
+                    menu.addItem(tlsDayMenuItem(date: date, entries: entries))
+                }
+            }
+
+            // Nur sichtbar, wenn beim letzten Abruf tatsächlich etwas
+            // übersprungen wurde (z. B. eine abgelehnte Dekompressionsbombe
+            // oder ein zu großer Anhang) - unsichtbar im Normalfall, statt
+            // eine leere Sektion dauerhaft im Menü zu zeigen.
+            if !report.skippedItems.isEmpty {
+                menu.addItem(NSMenuItem.separator())
+                let skippedHeader = NSMenuItem(
+                    title: "Übersprungen · letzter Abruf", action: #selector(showInfo(_:)), keyEquivalent: ""
+                )
+                skippedHeader.attributedTitle = Self.compactHeaderTitle(
+                    skippedHeader.title, subtitle: Self.skippedItemsSummary(report.skippedItems),
+                    icon: "info.circle"
+                )
+                skippedHeader.target = self
+                skippedHeader.representedObject = InfoPopover(
+                    headline: "Übersprungen",
+                    text: "Diese Nachrichten oder Anhänge wurden beim letzten Abruf abgelehnt und nicht " +
+                        "verarbeitet - z. B. weil sie eine Größengrenze überschritten haben oder als " +
+                        "beschädigt/böswillig erkannt wurden (etwa eine Dekompressionsbombe). Ein " +
+                        "einzelner solcher Fund unterbricht den Lauf nicht, alle übrigen Nachrichten " +
+                        "werden trotzdem normal weiterverarbeitet."
+                )
+                menu.addItem(skippedHeader)
+                menu.addItem(NSMenuItem.separator())
+
+                for reason in report.skippedItems {
+                    menu.addItem(skippedItemMenuItem(reason))
+                }
             }
         } else {
             statusItem.button?.image = Self.symbol("questionmark.circle")
@@ -178,31 +380,50 @@ final class StatusBarController: NSObject {
         fetchItem.target = self
         menu.addItem(fetchItem)
 
-        let refreshItem = NSMenuItem(title: "Aktualisieren", action: #selector(refresh(_:)), keyEquivalent: "")
-        refreshItem.image = Self.symbol("arrow.clockwise")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
         menu.addItem(NSMenuItem.separator())
+
+        // Flacher Aufbau wie bei DMARC/TLS-RPT/Übersprungen: Kopfzeile mit
+        // Info-Klick (showInfo) als eigenständiger Menüpunkt, "Jetzt
+        // prüfen…" und die Domain-Ergebnisse als eigene Geschwister-
+        // Einträge direkt darunter - NICHT als Untermenü der Kopfzeile
+        // selbst. Ein NSMenuItem mit eigenem Untermenü kann laut AppKit
+        // beim Klick nur das Untermenü öffnen, nie gleichzeitig eine eigene
+        // action feuern - das hatte "Jetzt prüfen…" als verschachtelten
+        // Untermenüpunkt zuvor unzuverlässig gemacht und hätte hier auch
+        // den Info-Klick auf der Kopfzeile selbst unmöglich gemacht.
+        // Ein einzelner klickbarer Eintrag - klickt man drauf, läuft (nach
+        // Bestätigung) eine frische Prüfung und das Ergebnisfenster öffnet
+        // sich, genau wie vor dem DNS-Status-Feature. Titel + Zusammen-
+        // fassung in einem kompakten, zweizeiligen attributedTitle wie bei
+        // den anderen Kopfzeilen.
+        let dnsItem = NSMenuItem(title: "DNS prüfen…", action: #selector(verifyDNS(_:)), keyEquivalent: "")
+        let dnsSubtitle: String
+        if let dnsCheck = dnsCheck {
+            dnsSubtitle = dnsHasWarnings
+                ? "Zuletzt geprüft: \(dnsCheck.checkedAt) - \(dnsWarnedDomains.count) auffällig"
+                : "Zuletzt geprüft: \(dnsCheck.checkedAt) - keine Auffälligkeiten"
+        } else {
+            dnsSubtitle = "Noch nicht geprüft"
+        }
+        dnsItem.attributedTitle = Self.compactHeaderTitle(dnsItem.title, subtitle: dnsSubtitle, icon: nil)
+        // Nur die Farbe wechselt (rot statt Template-Weiß/Schwarz), nicht
+        // das Symbol selbst (kein .fill) - dieselbe Kontur wie im Normalfall.
+        dnsItem.image = Self.symbol("checkmark.seal", color: dnsHasWarnings ? .systemRed : nil)
+        dnsItem.target = self
+        menu.addItem(dnsItem)
+
+        // Nur auffällige Domains bekommen eine eigene, aufklappbare Zeile -
+        // bei einer sauberen Domain gibt's nichts Zusätzliches zu zeigen,
+        // die Unterzeile an "DNS prüfen…" ("keine Auffälligkeiten") reicht
+        // dafür bereits.
+        for domainResult in dnsWarnedDomains {
+            menu.addItem(dnsDomainMenuItem(domainResult))
+        }
 
         let setupItem = NSMenuItem(title: "Einstellungen…", action: #selector(openSetup(_:)), keyEquivalent: ",")
         setupItem.image = Self.symbol("gearshape")
         setupItem.target = self
         menu.addItem(setupItem)
-
-        let verifyDNSItem = NSMenuItem(
-            title: "DNS prüfen…", action: #selector(verifyDNS(_:)), keyEquivalent: ""
-        )
-        verifyDNSItem.image = Self.symbol("checkmark.seal")
-        verifyDNSItem.target = self
-        menu.addItem(verifyDNSItem)
-
-        let loginItem = NSMenuItem(
-            title: "Bei Anmeldung starten", action: #selector(toggleLoginItem(_:)), keyEquivalent: ""
-        )
-        loginItem.target = self
-        loginItem.state = LoginItemManager.isEnabled ? .on : .off
-        menu.addItem(loginItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -297,6 +518,156 @@ final class StatusBarController: NSObject {
         return item
     }
 
+    /// Gruppiert TLS-RPT-Policy-Einträge nach Datum, neueste zuerst - analog
+    /// zu report.to_json_dict()s days_grouped für DMARC, nur hier auf der
+    /// Swift-Seite gebildet, weil to_tls_json_dict() bewusst eine flache
+    /// Liste liefert (siehe report.py-Kommentar dort).
+    private static func groupedByDateDescending(_ policies: [TLSPolicyEntry]) -> [(String, [TLSPolicyEntry])] {
+        var byDate: [String: [TLSPolicyEntry]] = [:]
+        for entry in policies {
+            byDate[entry.date, default: []].append(entry)
+        }
+        return byDate.keys.sorted(by: >).map { ($0, byDate[$0]!) }
+    }
+
+    /// Ein TLS-RPT-Tag als eigener Menüpunkt mit Untermenü der
+    /// Policy-Einträge - gleiches Muster wie dayMenuItem() für DMARC.
+    private func tlsDayMenuItem(date: String, entries: [TLSPolicyEntry]) -> NSMenuItem {
+        let failureCount = entries.reduce(0) { $0 + $1.failureCount }
+        let dayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let countLabel = entries.count == 1 ? "1 Eintrag" : "\(entries.count) Einträge"
+        dayItem.title = failureCount > 0 ? "\(date) — \(failureCount) Fehlschläge" : "\(date) — \(countLabel)"
+        dayItem.image = Self.symbol(failureCount > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle")
+
+        let submenu = NSMenu()
+        for entry in entries {
+            submenu.addItem(tlsPolicyMenuItem(entry))
+        }
+        dayItem.submenu = submenu
+        return dayItem
+    }
+
+    /// Ein Policy-Eintrag mit den Detailfeldern als eigene Zeilen im
+    /// Untermenü - gleiches Muster wie recordMenuItem() für DMARC.
+    private func tlsPolicyMenuItem(_ entry: TLSPolicyEntry) -> NSMenuItem {
+        let title: String
+        if entry.failureCount > 0 {
+            title = "\(entry.policyDomain) (\(entry.policyType)) — \(entry.failureCount) Fehlschläge"
+        } else {
+            title = "\(entry.policyDomain) (\(entry.policyType))"
+        }
+
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        if entry.failureCount > 0 {
+            item.image = Self.symbol("exclamationmark.triangle.fill")
+            item.attributedTitle = NSAttributedString(
+                string: title,
+                attributes: [.foregroundColor: NSColor.systemOrange]
+            )
+        } else {
+            item.image = Self.symbol("checkmark.circle")
+        }
+
+        let submenu = NSMenu()
+        submenu.addItem(disabledDetailLine("Melder", entry.organizationName))
+        submenu.addItem(disabledDetailLine("Erfolgreiche Sitzungen", "\(entry.successfulSessionCount)"))
+        submenu.addItem(disabledDetailLine("Fehlschläge", "\(entry.failureCount)"))
+        if !entry.failureResultTypes.isEmpty {
+            submenu.addItem(NSMenuItem.separator())
+            submenu.addItem(disabledDetailLine("Fehlertyp(en)", entry.failureResultTypes.joined(separator: ", ")))
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    /// Zerlegt einen Eintrag aus MenubarReport.skippedItems in Quelle
+    /// ("DMARC"/"TLS-RPT") und Grund - fetch.py stellt dem Grund das Tag
+    /// immer als "<Quelle>: " voran (siehe _process_dmarc_folder/
+    /// _process_tlsrpt_folder in fetch.py). Unbekanntes Format (z. B. eine
+    /// ältere CLI-Version ohne das Tag) fällt auf "Unbekannt" zurück, statt
+    /// falsch zu raten.
+    private static func parseSkippedItem(_ raw: String) -> (source: String, detail: String) {
+        for source in ["DMARC", "TLS-RPT"] {
+            let prefix = "\(source): "
+            if raw.hasPrefix(prefix) {
+                return (source, String(raw.dropFirst(prefix.count)))
+            }
+        }
+        return ("Unbekannt", raw)
+    }
+
+    /// "1 DMARC-Eintrag, 2 TLS-RPT-Einträge" statt nur einer Gesamtzahl -
+    /// gleiche Aufschlüsselung wie die separaten DMARC-/TLS-RPT-Sektionen
+    /// selbst, damit direkt erkennbar ist, wo etwas übersprungen wurde.
+    private static func skippedItemsSummary(_ items: [String]) -> String {
+        var counts: [String: Int] = [:]
+        for item in items {
+            let source = Self.parseSkippedItem(item).source
+            counts[source, default: 0] += 1
+        }
+        let parts = ["DMARC", "TLS-RPT", "Unbekannt"].compactMap { source -> String? in
+            guard let count = counts[source], count > 0 else { return nil }
+            return count == 1 ? "1 \(source)-Eintrag" : "\(count) \(source)-Einträge"
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// Ein übersprungener Eintrag mit Quelle+Grund im Untermenü - gleiches
+    /// Muster wie dayMenuItem()/tlsDayMenuItem() statt einer einzelnen,
+    /// potenziell langen Textzeile direkt im Hauptmenü.
+    private func skippedItemMenuItem(_ raw: String) -> NSMenuItem {
+        let (source, detail) = Self.parseSkippedItem(raw)
+        let item = NSMenuItem(title: "\(source) — übersprungen", action: nil, keyEquivalent: "")
+        item.image = Self.symbol("exclamationmark.shield.fill")
+
+        let submenu = NSMenu()
+        submenu.addItem(disabledDetailLine("Quelle", source))
+        submenu.addItem(disabledDetailLine("Grund", detail))
+        item.submenu = submenu
+        return item
+    }
+
+    /// Ein Domain-Ergebnis der letzten DNS-Prüfung mit den konkreten
+    /// DMARC-/SPF-/DKIM-Warnungen im Untermenü - gleiches Muster wie
+    /// skippedItemMenuItem()/tlsPolicyMenuItem().
+    /// Nur für auffällige Domains aufgerufen (siehe Aufrufer, gefiltert auf
+    /// dnsWarnedDomains) - eine saubere Domain bekommt gar keine eigene
+    /// Zeile mehr, die Unterzeile an "DNS prüfen…" reicht dafür.
+    private func dnsDomainMenuItem(_ result: DNSCheckDomainResult) -> NSMenuItem {
+        let item = NSMenuItem(title: result.domain, action: nil, keyEquivalent: "")
+        item.image = Self.symbol("exclamationmark.triangle.fill")
+        item.attributedTitle = NSAttributedString(
+            string: result.domain, attributes: [.foregroundColor: NSColor.systemOrange]
+        )
+
+        let submenu = NSMenu()
+        for warning in result.dmarc.warnings {
+            submenu.addItem(disabledDetailLine("DMARC", warning))
+        }
+        for warning in result.spf.warnings {
+            submenu.addItem(disabledDetailLine("SPF", warning))
+        }
+        if let error = result.spf.error {
+            submenu.addItem(disabledDetailLine("SPF-Fehler", error))
+        }
+        for dkim in result.dkim {
+            for warning in dkim.warnings {
+                submenu.addItem(disabledDetailLine("DKIM (\(dkim.selector))", warning))
+            }
+        }
+        for warning in result.mtaSts.warnings {
+            submenu.addItem(disabledDetailLine("MTA-STS", warning))
+        }
+        for warning in result.tlsrptDns.warnings {
+            submenu.addItem(disabledDetailLine("TLS-RPT-DNS", warning))
+        }
+        for warning in result.wildcardSpf.warnings {
+            submenu.addItem(disabledDetailLine("Wildcard-SPF", warning))
+        }
+        item.submenu = submenu
+        return item
+    }
+
     private func disabledDetailLine(_ label: String, _ value: String) -> NSMenuItem {
         return disabledItem("\(label): \(value)")
     }
@@ -359,9 +730,13 @@ final class StatusBarController: NSObject {
     /// Ausrufezeichen im gefüllten Warndreieck-Symbol verschluckt
     /// (vermutlich ein Rasterisierungsartefakt beim nachträglichen Resize
     /// eines mehrschichtigen SF-Symbols).
-    private static func iconText(symbol name: String, count: Int, color: NSColor? = nil) -> NSAttributedString {
+    private static func iconText(
+        symbol name: String, count: Int, color: NSColor? = nil, targetHeight: CGFloat? = nil
+    ) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        if let image = Self.symbol(name, color: color, pointSize: NSFont.systemFontSize) {
+        let image = targetHeight.map { Self.symbolMatchingHeight(name, color: color, targetHeight: $0) }
+            ?? Self.symbol(name, color: color, pointSize: NSFont.systemFontSize)
+        if let image = image {
             let attachment = NSTextAttachment()
             attachment.image = image
             let size = image.size
@@ -369,6 +744,102 @@ final class StatusBarController: NSObject {
             result.append(NSAttributedString(attachment: attachment))
         }
         result.append(NSAttributedString(string: " \(count)"))
+        return result
+    }
+
+    /// Rendert ein SF-Symbol bei genau der Höhe `targetHeight`, statt sich
+    /// auf einen einheitlichen pointSize-Parameter zu verlassen - dieselbe
+    /// pointSize führt bei unterschiedlichen Symbolen zu unterschiedlichen
+    /// Bildhöhen (key.fill z. B. ist breiter/diagonal, checkmark.circle/das
+    /// Warndreieck eher quadratisch). Erst-Render bei einem Basiswert, dann
+    /// - falls die Höhe erkennbar abweicht - ein zweiter Render-Durchlauf
+    /// mit proportional angepasstem pointSize. Bewusst kein nachträgliches
+    /// Strecken über NSTextAttachment.bounds (das hatte beim gefüllten
+    /// Warndreieck schon einmal das Ausrufezeichen verschluckt, siehe
+    /// iconText-Kommentar) - hier wird stattdessen jedes Mal echt neu bei
+    /// der jeweils passenden pointSize gerendert.
+    private static func symbolMatchingHeight(_ name: String, color: NSColor?, targetHeight: CGFloat) -> NSImage? {
+        let basePointSize = NSFont.systemFontSize
+        guard let baseImage = Self.symbol(name, color: color, pointSize: basePointSize), baseImage.size.height > 0
+        else { return nil }
+
+        let ratio = targetHeight / baseImage.size.height
+        guard abs(ratio - 1) > 0.02 else { return baseImage }  // schon nah genug dran
+
+        return Self.symbol(name, color: color, pointSize: basePointSize * ratio) ?? baseImage
+    }
+
+    /// Fetter Titel + Info-Symbol am Zeilenende + kleine graue Unterzeile
+    /// (Zusammenfassung), alles in EINEM NSMenuItem statt zwei separaten
+    /// Zeilen - jede NSMenuItem-Zeile hat eine feste Mindesthöhe, zwei
+    /// Zeilen für Überschrift+Zusammenfassung nehmen also unnötig viel
+    /// Platz weg. Ein eingebettetes "\n" in einem NSMenuItem-attributedTitle
+    /// erzeugt zuverlässig eine zweite, kompaktere Zeile innerhalb
+    /// derselben Zeilenhöhen-Berechnung.
+    /// Einzeilig, mit einem kleinen Info-Symbol am Zeilenende - zeigt an,
+    /// dass die ganze Zeile anklickbar ist und eine Erklärung öffnet
+    /// (showInfo(_:)). WICHTIG: bewusst einzeilig, kein eingebettetes "\n"
+    /// mehr. Ein früherer Versuch, Überschrift+Zusammenfassung platzsparend
+    /// in EINEM NSMenuItem mit zweizeiligem attributedTitle
+    /// unterzubringen, hat dazu geführt, dass praktisch der gesamte
+    /// Menüpunkt nicht mehr auf Klicks reagierte - sichtbar korrekt
+    /// gerendert, aber nicht mehr klickbar. Reproduziert an mehreren
+    /// unabhängigen Stellen (DMARC-/TLS-RPT-/Übersprungen-Kopfzeile, DNS-
+    /// Prüfen-Zeile), während normale einzeilige Menüpunkte (z. B. "Jetzt
+    /// abrufen", "Einstellungen…") die ganze Zeit zuverlässig funktioniert
+    /// haben - NSMenuItem unterstützt mehrzeilige attributedTitle-Inhalte
+    /// offenbar nur fürs Rendering, nicht fürs Hit-Testing/Klick-Routing.
+    /// Titel+Zusammenfassung stehen deshalb wieder in zwei separaten
+    /// NSMenuItems (siehe Aufrufer), nicht mehr in einem gemeinsamen.
+    private static func titleWithTrailingIcon(_ title: String, symbol name: String) -> NSAttributedString {
+        let result = NSMutableAttributedString(
+            string: title + "  ",
+            attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)]
+        )
+        if let image = Self.symbol(name, pointSize: NSFont.systemFontSize * 0.85) {
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            let size = image.size
+            attachment.bounds = CGRect(
+                x: 0, y: (NSFont.systemFontSize - size.height) / 2 - 1, width: size.width, height: size.height
+            )
+            result.append(NSAttributedString(attachment: attachment))
+        }
+        return result
+    }
+
+    /// Kompakte Variante: Titel (+ optionales Trailing-Symbol) und eine
+    /// kleine graue Unterzeile in EINEM NSMenuItem statt zwei separaten
+    /// Zeilen. War fälschlich als Ursache eines Klick-Bugs verdächtigt
+    /// worden (siehe mouseEntered/mouseExited-Kommentar oben) - der
+    /// eigentliche Fehler lag an einer falschen @objc-Selektor-Erzeugung
+    /// für die Hover-Tracking-Area, nicht an mehrzeiligen attributedTitle-
+    /// Inhalten. Mehrzeilige Titel funktionieren in NSMenuItem einwandfrei,
+    /// sobald Klicks im Rest der App wieder normal ankommen.
+    private static func compactHeaderTitle(_ title: String, subtitle: String, icon: String?) -> NSAttributedString {
+        let result = NSMutableAttributedString(
+            string: title + (icon != nil ? "  " : ""),
+            attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)]
+        )
+        if let icon, let image = Self.symbol(icon, pointSize: NSFont.systemFontSize * 0.85) {
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            let size = image.size
+            attachment.bounds = CGRect(
+                x: 0, y: (NSFont.systemFontSize - size.height) / 2 - 1, width: size.width, height: size.height
+            )
+            result.append(NSAttributedString(attachment: attachment))
+        }
+        result.append(NSAttributedString(string: "\n"))
+        result.append(
+            NSAttributedString(
+                string: subtitle,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+            )
+        )
         return result
     }
 }

@@ -38,6 +38,34 @@ DEFAULT_CONFIG = {
     "imap_folder": "INBOX/DMARC",
     "move_to_processed_folder": False,
     "processed_folder": "INBOX/DMARC/verarbeitet",
+    # TLS-RPT-Berichte (RFC 8460) sind JSON, nicht XML, und werden separat
+    # ausgewertet - deshalb ein eigener Ordner statt Inhalts-Sniffing
+    # innerhalb des DMARC-Ordners. Standardmäßig deaktiviert: ein
+    # bestehendes Setup hätte sonst plötzlich einen fehlschlagenden `fetch`
+    # (Ordner existiert nicht), nur weil ein Update dieses Feld einführt -
+    # erst nach explizitem Anlegen des Ordners (Postfach-Filterregel für die
+    # TLS-RPT-rua-Adresse) und Aktivieren hier wird der Ordner angefasst.
+    "enable_tls_rpt": False,
+    "tlsrpt_imap_folder": "INBOX/TLS-RPT",
+    "tlsrpt_processed_folder": "INBOX/TLS-RPT/verarbeitet",
+    # TLS-RPT-Reports sind laut RFC 8460 typischerweise deutlich kleiner als
+    # DMARC-Aggregate-Reports (keine Pro-Quell-IP-Aufschlüsselung in
+    # vergleichbarem Umfang) - eigener, kleinerer Wert statt
+    # max_xml_size_mb mitzubenutzen.
+    "max_json_size_mb": 2,
+    # Analog zu max_records_per_report bei DMARC, aber bewusst deutlich
+    # enger: ein TLS-RPT-Report hat pro Domain i. d. R. eine Handvoll
+    # policies-Einträge (eigene STS-Policy, ggf. TLSA, "no-policy-found"),
+    # nicht Tausende - anders als DMARC-Records (ein Eintrag pro
+    # Quell-IP, bei großen Absendern potenziell viele). 50 lässt reichlich
+    # Spielraum für mehrere überwachte Domains in einem Bericht, ohne die
+    # Grenze nutzlos weit gegen absichtliche Datenflut zu setzen.
+    "max_tls_policies_per_report": 50,
+    # failure-details fasst laut RFC 8460 bereits nach (result-type,
+    # sendende MTA-IP, empfangender MX-Host) zusammen - auch bei einer
+    # echten Störung realistischerweise eine niedrige zweistellige Zahl
+    # unterschiedlicher Kombinationen pro Policy, nicht Zehntausende.
+    "max_tls_failure_details_per_policy": 200,
     # Kein Default: muss die eigene(n) Domain(s) sein, nicht irgendeine.
     "own_domains": [],
     # CIDR-Netze, keine Zeichenketten-Präfixe: IPv6-Adressen haben mehrere
@@ -71,6 +99,18 @@ DEFAULT_CONFIG = {
     "notify_on_new_findings": True,
     "enable_reverse_dns_lookup": False,
     "menubar_days": 7,
+    # Periodischer automatischer DNS-Check (DMARC/SPF/DKIM der eigenen
+    # own_domains, siehe dns_verify.py) - standardmäßig aus, da jede
+    # DNS-Abfrage laut Sicherheitsentscheidungen bisher ausschließlich auf
+    # ausdrückliche Anfrage passiert ("DNS prüfen…" im Menü). Das Aktivieren
+    # dieser Checkbox in den Einstellungen ist die einmalige Zustimmung
+    # dafür, analog zum Aktivieren des täglichen fetch-Zeitplans - danach
+    # läuft es ohne erneute Bestätigung mit, ausgelöst über den ohnehin
+    # täglichen fetch-Lauf (kein zweiter LaunchAgent).
+    "enable_auto_dns_check": False,
+    # DNS-Einträge ändern sich selten - wöchentlich reicht, um eine neue
+    # Fehlkonfiguration zeitnah zu bemerken, ohne unnötigen DNS-Verkehr.
+    "auto_dns_check_interval_days": 7,
 }
 
 
@@ -119,6 +159,68 @@ def write_last_fetch_date(date_str: str, path: Path | None = None) -> Path:
     return path
 
 
+def skipped_items_marker_path() -> Path:
+    return app_support_dir() / "last_fetch_skipped.json"
+
+
+def read_skipped_items(path: Path | None = None) -> list[str]:
+    """Bereits bereinigte Gründe (sanitize_field, siehe cli.py cmd_fetch),
+    warum im letzten `fetch`-Lauf Nachrichten/Anhänge übersprungen wurden -
+    z. B. eine abgelehnte Dekompressionsbombe oder ein zu großer Anhang.
+    Wird bei jedem Lauf komplett überschrieben (siehe write_skipped_items),
+    kein wachsendes Protokoll - dieselbe Konvention wie last_fetch_success."""
+    path = path or skipped_items_marker_path()
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
+
+
+def write_skipped_items(items: list[str], path: Path | None = None) -> Path:
+    path = path or skipped_items_marker_path()
+    _ensure_dir_secure(path.parent)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False)
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    return path
+
+
+def dns_check_marker_path() -> Path:
+    return app_support_dir() / "last_dns_check.json"
+
+
+def read_dns_check_result(path: Path | None = None) -> dict | None:
+    """Ergebnis der letzten `verify-dns`-Prüfung - egal ob per Klick auf
+    "DNS prüfen…" oder durch den periodischen automatischen Check
+    ausgelöst (siehe cmd_verify_dns/cmd_fetch in cli.py). None, wenn noch
+    nie geprüft wurde. Wird bei jeder Prüfung komplett überschrieben, kein
+    wachsendes Protokoll."""
+    path = path or dns_check_marker_path()
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_dns_check_result(data: dict, path: Path | None = None) -> Path:
+    path = path or dns_check_marker_path()
+    _ensure_dir_secure(path.parent)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    return path
+
+
 def _ensure_dir_secure(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, stat.S_IRWXU)  # 0700
@@ -132,15 +234,23 @@ class Config:
     imap_folder: str
     move_to_processed_folder: bool
     processed_folder: str
+    enable_tls_rpt: bool
+    tlsrpt_imap_folder: str
+    tlsrpt_processed_folder: str
     own_domains: tuple[str, ...]
     own_ip_networks: tuple[str, ...]
     max_attachment_size_mb: int
     max_xml_size_mb: int
+    max_json_size_mb: int
+    max_tls_policies_per_report: int
+    max_tls_failure_details_per_policy: int
     max_message_size_mb: int
     max_records_per_report: int
     notify_on_new_findings: bool
     enable_reverse_dns_lookup: bool
     menubar_days: int
+    enable_auto_dns_check: bool
+    auto_dns_check_interval_days: int
 
     def __post_init__(self) -> None:
         networks = []
@@ -158,6 +268,10 @@ class Config:
     @property
     def max_xml_size_bytes(self) -> int:
         return self.max_xml_size_mb * 1024 * 1024
+
+    @property
+    def max_json_size_bytes(self) -> int:
+        return self.max_json_size_mb * 1024 * 1024
 
     @property
     def max_message_size_bytes(self) -> int:
@@ -188,15 +302,23 @@ class Config:
             imap_folder=str(merged["imap_folder"]),
             move_to_processed_folder=bool(merged["move_to_processed_folder"]),
             processed_folder=str(merged["processed_folder"]),
+            enable_tls_rpt=bool(merged["enable_tls_rpt"]),
+            tlsrpt_imap_folder=str(merged["tlsrpt_imap_folder"]),
+            tlsrpt_processed_folder=str(merged["tlsrpt_processed_folder"]),
             own_domains=tuple(merged["own_domains"]),
             own_ip_networks=tuple(merged["own_ip_networks"]),
             max_attachment_size_mb=int(merged["max_attachment_size_mb"]),
             max_xml_size_mb=int(merged["max_xml_size_mb"]),
+            max_json_size_mb=int(merged["max_json_size_mb"]),
+            max_tls_policies_per_report=int(merged["max_tls_policies_per_report"]),
+            max_tls_failure_details_per_policy=int(merged["max_tls_failure_details_per_policy"]),
             max_message_size_mb=int(merged["max_message_size_mb"]),
             max_records_per_report=int(merged["max_records_per_report"]),
             notify_on_new_findings=bool(merged["notify_on_new_findings"]),
             enable_reverse_dns_lookup=bool(merged["enable_reverse_dns_lookup"]),
             menubar_days=int(merged["menubar_days"]),
+            enable_auto_dns_check=bool(merged["enable_auto_dns_check"]),
+            auto_dns_check_interval_days=int(merged["auto_dns_check_interval_days"]),
         )
 
 

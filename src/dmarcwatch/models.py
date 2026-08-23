@@ -74,3 +74,46 @@ class AggregateReport:
     metadata: ReportMetadata
     policy_published: PolicyPublished
     records: tuple[Record, ...]
+
+
+@dataclass(frozen=True)
+class TLSReportMetadata:
+    organization_name: str
+    report_id: str
+    date_begin: int
+    date_end: int
+    contact_info: str = ""
+
+
+@dataclass(frozen=True)
+class TLSPolicy:
+    policy_type: str
+    policy_domain: str
+    policy_strings: tuple[str, ...] = field(default_factory=tuple)
+    mx_host: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class TLSFailureDetail:
+    result_type: str
+    sending_mta_ip: str = ""
+    receiving_mx_hostname: str = ""
+    receiving_mx_helo: str = ""
+    receiving_ip: str = ""
+    failed_session_count: int = 0
+    additional_information: str = ""
+    failure_reason_code: str = ""
+
+
+@dataclass(frozen=True)
+class TLSPolicyResult:
+    policy: TLSPolicy
+    successful_session_count: int
+    failure_count: int
+    failure_details: tuple[TLSFailureDetail, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class TLSReport:
+    metadata: TLSReportMetadata
+    policy_results: tuple[TLSPolicyResult, ...]

@@ -3,11 +3,19 @@
 Textausgabe, deshalb muss die Feldstruktur stabil sein."""
 import argparse
 import json
+import time
 from unittest.mock import patch
 
 from dmarcwatch import cli
-from dmarcwatch.config import write_config
-from dmarcwatch.dns_verify import DKIMCheckResult, DMARCCheckResult, DomainVerification
+from dmarcwatch.config import read_dns_check_result, write_config
+from dmarcwatch.dns_verify import (
+    DKIMCheckResult,
+    DMARCCheckResult,
+    DomainVerification,
+    MTASTSCheckResult,
+    TLSRPTDNSCheckResult,
+    WildcardSPFCheckResult,
+)
 from dmarcwatch.spf import SPFCheckResult
 
 
@@ -30,6 +38,9 @@ def _sample_result(domain: str) -> DomainVerification:
             lookup_count=1, lookup_limit_ok=True, warnings=[],
         ),
         dkim=[DKIMCheckResult(selector="default", exists=True, key_type="rsa", warnings=[])],
+        mta_sts=MTASTSCheckResult(configured=False),
+        tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
+        wildcard_spf=WildcardSPFCheckResult(configured=False),
     )
 
 
@@ -70,3 +81,35 @@ def test_no_domain_and_no_config_fails_clearly(tmp_path, monkeypatch):
 
     result = cli.cmd_verify_dns(_args())
     assert result == 2
+
+
+def test_result_is_persisted_for_menubar_app(tmp_path, monkeypatch):
+    """Jeder verify-dns-Lauf (Klick auf "DNS prüfen…" oder Terminal) muss
+    das Ergebnis speichern, damit die Menüleisten-App den letzten bekannten
+    Stand zeigen kann (Rot-Färbung/Details), ohne selbst eine DNS-Abfrage
+    zu machen - siehe config.read_dns_check_result()."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("example.com")):
+        cli.cmd_verify_dns(_args(json=True))
+
+    stored = read_dns_check_result()
+    assert stored is not None
+    assert stored["checked_at"] == time.strftime("%Y-%m-%d")
+    assert len(stored["domains"]) == 1
+    assert stored["domains"][0]["domain"] == "example.com"
+    assert stored["domains"][0]["has_warnings"] is False
+
+
+def test_persisted_result_flags_warnings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
+    result = _sample_result("example.com")
+    result.dmarc.warnings.append("p=none: rein beobachtend")
+
+    with patch.object(cli, "verify_domain", return_value=result):
+        cli.cmd_verify_dns(_args(json=True))
+
+    stored = read_dns_check_result()
+    assert stored["domains"][0]["has_warnings"] is True

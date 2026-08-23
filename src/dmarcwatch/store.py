@@ -18,9 +18,9 @@ from pathlib import Path
 
 from .anomaly import evaluate_record
 from .config import Config
-from .models import AggregateReport
+from .models import AggregateReport, TLSReport
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -85,7 +85,58 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2}
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    # TLS-RPT (RFC 8460) - eigene Tabellen statt Wiederverwendung von
+    # reports/records, weil die Struktur eine andere ist (Policies statt
+    # Einzel-Records, Erfolgs-/Fehlerzähler statt Auth-Ergebnis pro
+    # Quell-IP). Ein Report kann laut RFC mehrere policies für
+    # unterschiedliche Domains enthalten - deshalb hängt die
+    # Domain-Zugehörigkeit an tls_policies, nicht an tls_reports.
+    conn.executescript(
+        """
+        CREATE TABLE tls_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organization_name TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            contact_info TEXT NOT NULL DEFAULT '',
+            date_begin INTEGER NOT NULL,
+            date_end INTEGER NOT NULL,
+            ingested_at INTEGER NOT NULL,
+            UNIQUE(organization_name, report_id)
+        );
+
+        CREATE TABLE tls_policies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tls_report_id INTEGER NOT NULL REFERENCES tls_reports(id) ON DELETE CASCADE,
+            policy_type TEXT NOT NULL,
+            policy_domain TEXT NOT NULL,
+            policy_strings_json TEXT NOT NULL DEFAULT '[]',
+            mx_host_json TEXT NOT NULL DEFAULT '[]',
+            successful_session_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE tls_failure_details (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tls_policy_id INTEGER NOT NULL REFERENCES tls_policies(id) ON DELETE CASCADE,
+            result_type TEXT NOT NULL,
+            sending_mta_ip TEXT NOT NULL DEFAULT '',
+            receiving_mx_hostname TEXT NOT NULL DEFAULT '',
+            receiving_mx_helo TEXT NOT NULL DEFAULT '',
+            receiving_ip TEXT NOT NULL DEFAULT '',
+            failed_session_count INTEGER NOT NULL DEFAULT 0,
+            additional_information TEXT NOT NULL DEFAULT '',
+            failure_reason_code TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX idx_tls_policies_report ON tls_policies(tls_report_id);
+        CREATE INDEX idx_tls_failure_details_policy ON tls_failure_details(tls_policy_id);
+        CREATE INDEX idx_tls_reports_date_end ON tls_reports(date_end);
+        """
+    )
+
+
+MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3}
 
 
 def get_cached_whois(conn: sqlite3.Connection, source_ip: str) -> tuple[str, int] | None:
@@ -325,6 +376,145 @@ def _ingest_report_inner(conn: sqlite3.Connection, report: AggregateReport, conf
             flagged_count=flagged_count,
             total_records=len(report.records),
         )
+
+
+class TLSIngestStatus(str, Enum):
+    INSERTED = "inserted"
+    DUPLICATE = "duplicate"
+    REJECTED_FOREIGN_DOMAIN = "rejected_foreign_domain"
+
+
+@dataclass
+class TLSIngestResult:
+    status: TLSIngestStatus
+    tls_report_row_id: int | None = None
+    total_failure_count: int = 0
+
+
+def ingest_tls_report(conn: sqlite3.Connection, report: TLSReport, config: Config) -> TLSIngestResult:
+    """Analog zu ingest_report (DMARC). Ein TLS-RPT-Report kann laut RFC 8460
+    mehrere policies-Einträge für verschiedene Domains enthalten (anders als
+    bei DMARC, wo ein Report zu genau einer Domain gehört) - deshalb wird
+    hier pro Policy-Eintrag gefiltert statt der ganze Report verworfen, nur
+    weil einzelne Einträge fremde Domains betreffen."""
+    own_policy_results = [
+        pr for pr in report.policy_results if config.is_own_domain(pr.policy.policy_domain)
+    ]
+    if not own_policy_results:
+        return TLSIngestResult(status=TLSIngestStatus.REJECTED_FOREIGN_DOMAIN)
+
+    try:
+        return _ingest_tls_report_inner(conn, report, own_policy_results)
+    finally:
+        secure_wal_sidecar_files(conn)
+
+
+def _ingest_tls_report_inner(
+    conn: sqlite3.Connection, report: TLSReport, own_policy_results: list
+) -> TLSIngestResult:
+    with conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO tls_reports
+                (organization_name, report_id, contact_info, date_begin, date_end, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report.metadata.organization_name,
+                report.metadata.report_id,
+                report.metadata.contact_info,
+                report.metadata.date_begin,
+                report.metadata.date_end,
+                int(time.time()),
+            ),
+        )
+        if cur.rowcount == 0:
+            # UNIQUE(organization_name, report_id) hat zugeschlagen.
+            return TLSIngestResult(status=TLSIngestStatus.DUPLICATE)
+
+        tls_report_row_id = cur.lastrowid
+        total_failure_count = 0
+        for pr in own_policy_results:
+            total_failure_count += pr.failure_count
+            policy_cur = conn.execute(
+                """
+                INSERT INTO tls_policies
+                    (tls_report_id, policy_type, policy_domain, policy_strings_json,
+                     mx_host_json, successful_session_count, failure_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tls_report_row_id,
+                    pr.policy.policy_type,
+                    pr.policy.policy_domain,
+                    json.dumps(list(pr.policy.policy_strings), ensure_ascii=False),
+                    json.dumps(list(pr.policy.mx_host), ensure_ascii=False),
+                    pr.successful_session_count,
+                    pr.failure_count,
+                ),
+            )
+            policy_row_id = policy_cur.lastrowid
+            for fd in pr.failure_details:
+                conn.execute(
+                    """
+                    INSERT INTO tls_failure_details
+                        (tls_policy_id, result_type, sending_mta_ip, receiving_mx_hostname,
+                         receiving_mx_helo, receiving_ip, failed_session_count,
+                         additional_information, failure_reason_code)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        policy_row_id,
+                        fd.result_type,
+                        fd.sending_mta_ip,
+                        fd.receiving_mx_hostname,
+                        fd.receiving_mx_helo,
+                        fd.receiving_ip,
+                        fd.failed_session_count,
+                        fd.additional_information,
+                        fd.failure_reason_code,
+                    ),
+                )
+
+        return TLSIngestResult(
+            status=TLSIngestStatus.INSERTED,
+            tls_report_row_id=tls_report_row_id,
+            total_failure_count=total_failure_count,
+        )
+
+
+def query_tls_policies(
+    conn: sqlite3.Connection,
+    since_ts: int,
+    until_ts: int,
+) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT p.id, p.policy_type, p.policy_domain, p.policy_strings_json, p.mx_host_json,
+               p.successful_session_count, p.failure_count,
+               rep.organization_name, rep.report_id, rep.date_begin, rep.date_end
+        FROM tls_policies p
+        JOIN tls_reports rep ON rep.id = p.tls_report_id
+        WHERE rep.date_end >= ? AND rep.date_begin <= ?
+        ORDER BY rep.date_begin ASC, p.policy_domain ASC
+        """,
+        (since_ts, until_ts),
+    ).fetchall()
+
+
+def query_tls_failure_details(conn: sqlite3.Connection, tls_policy_id: int) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT result_type, sending_mta_ip, receiving_mx_hostname, receiving_mx_helo,
+               receiving_ip, failed_session_count, additional_information, failure_reason_code
+        FROM tls_failure_details
+        WHERE tls_policy_id = ?
+        ORDER BY failed_session_count DESC
+        """,
+        (tls_policy_id,),
+    ).fetchall()
 
 
 def query_records(

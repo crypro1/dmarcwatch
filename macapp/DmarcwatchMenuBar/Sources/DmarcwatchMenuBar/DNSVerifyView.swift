@@ -9,9 +9,17 @@ struct DNSVerifyView: View {
     var onClose: () -> Void
 
     var body: some View {
+        // Padding bewusst NICHT auf das ganze VStack, sondern nur auf
+        // Titel/Fehlerzustände/Knopfzeile - die ScrollView selbst bleibt
+        // ungepolstert und geht bis an den Fensterrand, sonst hängt ihre
+        // eigene Scrollbar sichtbar vom rechten Rand abgesetzt in der Luft
+        // statt bündig daran zu liegen. Die Content-VStack innerhalb der
+        // ScrollView bekommt ihr eigenes Padding stattdessen.
         VStack(alignment: .leading, spacing: 16) {
             Text("DNS-Prüfung")
                 .font(.headline)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
 
             Group {
                 if viewModel.isLoading {
@@ -19,14 +27,17 @@ struct DNSVerifyView: View {
                         ProgressView().controlSize(.small)
                         Text("Prüft DMARC/SPF/DKIM…")
                     }
+                    .padding(.horizontal, 20)
                 } else if let error = viewModel.errorMessage {
                     Text(error)
                         .foregroundColor(.red)
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 20)
                 } else if viewModel.results.isEmpty {
                     Text("Keine Ergebnisse.")
                         .foregroundStyle(.secondary)
+                        .padding(.horizontal, 20)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
@@ -40,7 +51,8 @@ struct DNSVerifyView: View {
                                 }
                             }
                         }
-                        .padding(.trailing, 4)
+                        .padding(.leading, 20)
+                        .padding(.trailing, 12)
                     }
                 }
             }
@@ -51,9 +63,10 @@ struct DNSVerifyView: View {
                 Button("Schließen") { onClose() }
                     .keyboardShortcut(.defaultAction)
             }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
         }
-        .padding(20)
-        .frame(width: 520, height: 480)
+        .frame(width: 640, height: 620)
     }
 
     @ViewBuilder
@@ -109,6 +122,34 @@ struct DNSVerifyView: View {
                     }
                 }
             }
+
+            // MTA-STS/TLS-RPT-DNS/Wildcard-SPF sind optional - nur
+            // anzeigen, wenn die Domain das überhaupt konfiguriert hat,
+            // sonst unnötiges Rauschen für die meisten Domains.
+            if result.mtaSts.configured {
+                group("MTA-STS") {
+                    detail("Ziel", result.mtaSts.cnameTarget ?? "(A/AAAA statt CNAME)")
+                    detail("Policy-Eintrag", result.mtaSts.policyTxt ?? "(nicht gefunden)")
+                    if let reachable = result.mtaSts.policyReachable {
+                        statusPill(label: reachable ? "MTA-STS UP" : "MTA-STS DOWN", isUp: reachable)
+                    }
+                    warnings(result.mtaSts.warnings)
+                }
+            }
+
+            if result.tlsrptDns.configured {
+                group("TLS-RPT-DNS") {
+                    detail("Eintrag", result.tlsrptDns.record ?? "-")
+                    warnings(result.tlsrptDns.warnings)
+                }
+            }
+
+            if result.wildcardSpf.configured {
+                group("Wildcard-SPF") {
+                    detail("Eintrag", result.wildcardSpf.record ?? "-")
+                    warnings(result.wildcardSpf.warnings)
+                }
+            }
         }
     }
 
@@ -128,6 +169,21 @@ struct DNSVerifyView: View {
                 .textSelection(.enabled)
         }
         .font(.callout)
+    }
+
+    /// Grüne/rote Pille für den Ergebnis-Kurzstatus - Ergebnis eines
+    /// direkten HTTPS-Abrufs der eigenen Policy-Datei (siehe
+    /// dns_verify.py: _fetch_mta_sts_policy), nicht der Status eines
+    /// bestimmten Hosting-Anbieters.
+    private func statusPill(label: String, isUp: Bool) -> some View {
+        Text(label)
+            .font(.caption.bold())
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(isUp ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
+            )
+            .foregroundStyle(isUp ? Color.green : Color.red)
     }
 
     @ViewBuilder
