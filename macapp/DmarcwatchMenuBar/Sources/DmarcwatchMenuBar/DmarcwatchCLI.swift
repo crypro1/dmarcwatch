@@ -206,6 +206,23 @@ enum DmarcwatchCLI {
         }
     }
 
+    /// Liest die bereits lokal gespeicherten TLS-RPT-Reports (RFC 8460) -
+    /// reines Lesen aus der SQLite-DB wie fetchMenubarReport(), kein
+    /// Netzzugriff. Bewusst synchron wie fetchMenubarReport(), nicht async:
+    /// wird direkt aus refresh() mit aufgerufen (selber schneller lokaler
+    /// Subprozess-Aufruf, kein separates Fenster mehr - TLS-RPT erscheint
+    /// jetzt inline im selben Dropdown-Menü wie DMARC).
+    static func fetchTLSReport(days: Int = 7) throws -> TLSReportResponse {
+        let result = try run(arguments: ["tls-report", "--json", "--days", "\(days)"])
+        guard result.exitCode == 0 || result.exitCode == 1 else {
+            throw CLIError.processFailed(result.exitCode, result.stderr)
+        }
+        guard let data = result.stdout.data(using: .utf8) else {
+            throw CLIError.decodingFailed("Ausgabe war kein gültiges UTF-8")
+        }
+        return try JSONDecoder().decode(TLSReportResponse.self, from: data)
+    }
+
     /// `fetch` verbindet sich per IMAP und kann mehrere Sekunden dauern -
     /// laeuft deshalb im Hintergrund, die Menuleiste blockiert nicht.
     ///

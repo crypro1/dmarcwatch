@@ -54,6 +54,50 @@ struct SetupView: View {
                             "Uhrzeit", selection: $viewModel.scheduleTime,
                             displayedComponents: .hourAndMinute
                         )
+                        // Wirkt sofort (SMAppService), nicht erst beim
+                        // Speichern des restlichen Formulars - siehe
+                        // applyStartAtLogin-Kommentar im ViewModel.
+                        Toggle("Automatisch bei Anmeldung starten", isOn: $viewModel.startAtLogin)
+                            .onChange(of: viewModel.startAtLogin) { newValue in
+                                viewModel.applyStartAtLogin(newValue)
+                            }
+                    }
+
+                    group("TLS-RPT (optional)") {
+                        Toggle("TLS-RPT-Auswertung aktivieren", isOn: $viewModel.enableTlsRpt)
+                        // Ordnerfeld bewusst IMMER sichtbar, nicht erst nach
+                        // dem Einschalten: die Postfach-Filterregel muss
+                        // zuerst eingerichtet werden, dafür muss man den
+                        // Ordnernamen schon vorher kennen/bestätigen können,
+                        // nicht erst danach.
+                        field(
+                            "TLS-RPT-Ordner", text: $viewModel.tlsrptImapFolder,
+                            hint: "Zuerst im Postfach eine Filterregel einrichten, die Mail an die " +
+                                "TLS-RPT-rua-Adresse in genau diesen Ordner einsortiert - dann hier " +
+                                "aktivieren."
+                        )
+                    }
+
+                    group("DNS-Check (optional)") {
+                        Toggle("Automatischen DNS-Check aktivieren", isOn: $viewModel.enableAutoDnsCheck)
+                        Text(
+                            "Prüft periodisch die eigenen DMARC-/SPF-/DKIM-DNS-Einträge, huckepack im " +
+                            "ohnehin täglichen Abruf - dasselbe wie \"DNS prüfen…\" im Menü, nur " +
+                            "automatisch statt nur auf Klick."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        // Stepper statt Freitext - wie die Uhrzeit beim
+                        // täglichen Abruf per DatePicker verstellbar, ohne
+                        // künstliche Obergrenze (ein Tageslimit wäre für ein
+                        // Intervall willkürlich) - nur ein großzügiger
+                        // Rahmen (1...365) statt einer eigenen Zahl-
+                        // Validierung.
+                        Stepper(
+                            "Intervall: alle \(viewModel.autoDnsCheckIntervalDays) Tage",
+                            value: $viewModel.autoDnsCheckIntervalDays, in: 1...365
+                        )
                     }
                 }
                 .padding(.trailing, 4)  // Platz für die Scrollbar, nichts wird davon verdeckt

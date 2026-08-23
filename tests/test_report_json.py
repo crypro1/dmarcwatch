@@ -66,4 +66,14 @@ def test_empty_range_produces_zero_counts(tmp_path):
     assert data["total_count"] == 0
     assert data["flagged_count"] == 0
     assert data["days_grouped"] == []
+    assert data["skipped_items"] == []
     conn.close()
+
+
+def test_skipped_items_included_and_sanitized_again():
+    """Kommt bereits sanitisiert aus config.read_skipped_items() (siehe
+    cli.cmd_fetch), wird hier zur Sicherheit trotzdem erneut durch
+    sanitize_field() geführt - gleiche defensive Doppelung wie bei
+    whois_organization."""
+    data = to_json_dict([], days=7, skipped_items=["ein Anhang | wurde übersprungen"])
+    assert data["skipped_items"] == ["ein Anhang / wurde übersprungen"]

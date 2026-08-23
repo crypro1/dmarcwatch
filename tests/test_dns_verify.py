@@ -11,7 +11,22 @@ naiv die erste Zeile zu nehmen liefert dann fälschlich "kein Public Key".
 import subprocess
 from unittest.mock import patch
 
-from dmarcwatch.dns_verify import check_dkim, check_dmarc
+from dmarcwatch.dns_verify import (
+    DKIMCheckResult,
+    DMARCCheckResult,
+    DomainVerification,
+    MTASTSCheckResult,
+    TLSRPTDNSCheckResult,
+    WildcardSPFCheckResult,
+    _fetch_mta_sts_policy,
+    check_dkim,
+    check_dmarc,
+    check_mta_sts,
+    check_tlsrpt_dns,
+    check_wildcard_spf,
+    has_warnings,
+)
+from dmarcwatch.spf import SPFCheckResult
 
 
 def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -149,3 +164,242 @@ def test_check_dkim_unknown_key_type():
     ):
         result = check_dkim("example.com", "selector1")
     assert any("Unbekannter Key-Typ" in w for w in result.warnings)
+
+
+# --- has_warnings() ---
+
+
+def _clean_result(domain: str = "example.com") -> DomainVerification:
+    return DomainVerification(
+        domain=domain,
+        dmarc=DMARCCheckResult(exists=True, record="v=DMARC1; p=reject; rua=mailto:a@example.com", policy="reject"),
+        spf=SPFCheckResult(exists=True, record="v=spf1 -all", lookup_count=0, lookup_limit_ok=True),
+        dkim=[DKIMCheckResult(selector="default", exists=True, key_type="rsa")],
+        mta_sts=MTASTSCheckResult(configured=False),
+        tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
+        wildcard_spf=WildcardSPFCheckResult(configured=False),
+    )
+
+
+def test_has_warnings_false_for_clean_result():
+    assert has_warnings(_clean_result()) is False
+
+
+def test_has_warnings_true_for_dmarc_warning():
+    result = _clean_result()
+    result.dmarc.warnings.append("p=none: rein beobachtend")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_spf_warning():
+    result = _clean_result()
+    result.spf.warnings.append("SPF: fehlender all-Mechanismus")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_spf_error_even_without_warning_list():
+    """Ein harter SPF-Fehler (z. B. DNS nicht erreichbar) landet nicht in
+    warnings, sondern in error - zählt aber genauso als Auffälligkeit."""
+    result = _clean_result()
+    result.spf = SPFCheckResult(exists=False, error="DNS-Abfrage fehlgeschlagen")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_dkim_warning():
+    result = _clean_result()
+    result.dkim[0].warnings.append("Kein Public Key")
+    assert has_warnings(result) is True
+
+
+# --- check_mta_sts() ---
+
+
+def test_check_mta_sts_absent_is_not_configured_no_warning():
+    with patch("dmarcwatch.dns_verify._dig", return_value=[]):
+        with patch("dmarcwatch.dns_verify._txt_records", return_value=[]):
+            result = check_mta_sts("example.com")
+    assert result.configured is False
+    assert result.warnings == []
+
+
+def test_check_mta_sts_fully_configured_no_warning():
+    def fake_dig(record_type, name):
+        if record_type == "CNAME" and name == "mta-sts.example.com":
+            return ["assets.provider.example."]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch(
+            "dmarcwatch.dns_verify._txt_records",
+            return_value=["v=STSv1; id=20260101000000Z"],
+        ):
+            with patch("dmarcwatch.dns_verify._fetch_mta_sts_policy", return_value=(True, None)):
+                result = check_mta_sts("example.com")
+    assert result.configured is True
+    assert result.cname_target == "assets.provider.example"
+    assert result.policy_reachable is True
+    assert result.warnings == []
+
+
+def test_check_mta_sts_policy_without_hostname_warns():
+    """Regressionstest für den echten, per Hand gefundenen Bug: ein
+    Policy-TXT-Eintrag existiert, aber der Hostname (mta-sts.<domain>) ist
+    nicht erreichbar - z. B. weil er im DNS-Panel versehentlich unter einem
+    doppelt zusammengesetzten Namen gelandet ist."""
+    with patch("dmarcwatch.dns_verify._dig", return_value=[]):
+        with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=STSv1; id=123"]):
+            result = check_mta_sts("example.com")
+    assert result.configured is True
+    assert any("weder CNAME noch A/AAAA" in w for w in result.warnings)
+
+
+def test_check_mta_sts_hostname_without_policy_warns():
+    with patch("dmarcwatch.dns_verify._dig", return_value=["assets.provider.example."]):
+        with patch("dmarcwatch.dns_verify._txt_records", return_value=[]):
+            with patch("dmarcwatch.dns_verify._fetch_mta_sts_policy", return_value=(True, None)):
+                result = check_mta_sts("example.com")
+    assert result.configured is True
+    assert any("keinen gültigen" in w for w in result.warnings)
+
+
+def test_check_mta_sts_missing_id_tag_warns():
+    with patch("dmarcwatch.dns_verify._dig", return_value=["assets.provider.example."]):
+        with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=STSv1; mode=testing"]):
+            with patch("dmarcwatch.dns_verify._fetch_mta_sts_policy", return_value=(True, None)):
+                result = check_mta_sts("example.com")
+    assert any("id=" in w for w in result.warnings)
+
+
+def test_check_mta_sts_unreachable_policy_file_warns():
+    """Hostname und DNS-Policy-Eintrag sind korrekt, aber die tatsächliche
+    Policy-Datei ist per HTTPS nicht erreichbar (z. B. Hosting-Ausfall
+    oder falsch konfigurierter Webserver) - das ist ein eigenständiger
+    Fehlerfall, den reine DNS-Prüfung nicht abdecken würde."""
+    with patch("dmarcwatch.dns_verify._dig", return_value=["assets.provider.example."]):
+        with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=STSv1; id=123"]):
+            with patch(
+                "dmarcwatch.dns_verify._fetch_mta_sts_policy",
+                return_value=(False, "HTTP 404"),
+            ):
+                result = check_mta_sts("example.com")
+    assert result.policy_reachable is False
+    assert any("nicht erreichbar" in w and "HTTP 404" in w for w in result.warnings)
+
+
+def test_check_mta_sts_absent_skips_https_fetch_entirely():
+    """Ohne konfigurierten Hostnamen wird gar nicht erst versucht, die
+    Policy-Datei abzurufen - kein unnötiger Netzverkehr, wenn schon die
+    DNS-Prüfung zeigt, dass MTA-STS nicht genutzt wird."""
+    with patch("dmarcwatch.dns_verify._dig", return_value=[]):
+        with patch("dmarcwatch.dns_verify._txt_records", return_value=[]):
+            with patch("dmarcwatch.dns_verify._fetch_mta_sts_policy") as mock_fetch:
+                result = check_mta_sts("example.com")
+    mock_fetch.assert_not_called()
+    assert result.policy_reachable is None
+
+
+# --- check_tlsrpt_dns() ---
+
+
+def test_check_tlsrpt_dns_absent_is_not_configured_no_warning():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=[]):
+        result = check_tlsrpt_dns("example.com")
+    assert result.configured is False
+    assert result.warnings == []
+
+
+def test_check_tlsrpt_dns_valid_no_warning():
+    with patch(
+        "dmarcwatch.dns_verify._txt_records",
+        return_value=["v=TLSRPTv1; rua=mailto:tlsrpt@example.com"],
+    ):
+        result = check_tlsrpt_dns("example.com")
+    assert result.configured is True
+    assert result.warnings == []
+
+
+def test_check_tlsrpt_dns_missing_rua_warns():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=TLSRPTv1"]):
+        result = check_tlsrpt_dns("example.com")
+    assert any("rua=" in w for w in result.warnings)
+
+
+def test_check_tlsrpt_dns_multiple_records_warns():
+    with patch(
+        "dmarcwatch.dns_verify._txt_records",
+        return_value=["v=TLSRPTv1; rua=mailto:a@example.com", "v=TLSRPTv1; rua=mailto:b@example.com"],
+    ):
+        result = check_tlsrpt_dns("example.com")
+    assert any("2 TLS-RPT-Einträge" in w for w in result.warnings)
+
+
+# --- check_wildcard_spf() ---
+
+
+def test_check_wildcard_spf_absent_is_not_configured_no_warning():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=[]):
+        result = check_wildcard_spf("example.com")
+    assert result.configured is False
+    assert result.warnings == []
+
+
+def test_check_wildcard_spf_restrictive_no_warning():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=spf1 -all"]):
+        result = check_wildcard_spf("example.com")
+    assert result.configured is True
+    assert result.warnings == []
+
+
+def test_check_wildcard_spf_permissive_warns():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=spf1 +all"]):
+        result = check_wildcard_spf("example.com")
+    assert any("-all" in w for w in result.warnings)
+
+
+# --- _fetch_mta_sts_policy() ---
+
+
+class _FakeHTTPResponse:
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    def read(self, n=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_fetch_mta_sts_policy_valid_response():
+    fake_response = _FakeHTTPResponse(200, b"version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 604800")
+    with patch("dmarcwatch.dns_verify.urllib.request.urlopen", return_value=fake_response):
+        reachable, error = _fetch_mta_sts_policy("mta-sts.example.com")
+    assert reachable is True
+    assert error is None
+
+
+def test_fetch_mta_sts_policy_wrong_content():
+    fake_response = _FakeHTTPResponse(200, b"<html>not a policy file</html>")
+    with patch("dmarcwatch.dns_verify.urllib.request.urlopen", return_value=fake_response):
+        reachable, error = _fetch_mta_sts_policy("mta-sts.example.com")
+    assert reachable is False
+    assert error is not None
+
+
+def test_fetch_mta_sts_policy_http_error_status():
+    fake_response = _FakeHTTPResponse(404, b"not found")
+    with patch("dmarcwatch.dns_verify.urllib.request.urlopen", return_value=fake_response):
+        reachable, error = _fetch_mta_sts_policy("mta-sts.example.com")
+    assert reachable is False
+    assert "404" in error
+
+
+def test_fetch_mta_sts_policy_connection_error():
+    with patch("dmarcwatch.dns_verify.urllib.request.urlopen", side_effect=OSError("connection refused")):
+        reachable, error = _fetch_mta_sts_policy("mta-sts.example.com")
+    assert reachable is False
+    assert "connection refused" in error

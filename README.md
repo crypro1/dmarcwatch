@@ -3,7 +3,9 @@
 Lokaler DMARC-Monitor für macOS. Holt DMARC-Aggregate-Reports per IMAP von
 mailbox.org ab, wertet sie aus, speichert sie in einer lokalen SQLite-
 Datenbank und zeigt Auffälligkeiten in einer nativen Menüleisten-App
-(Swift/AppKit) an. Alternativ auch über SwiftBar nutzbar.
+(Swift/AppKit) an. Alternativ auch über SwiftBar nutzbar. Optional
+(`enable_tls_rpt`) wertet dmarcwatch zusätzlich SMTP-TLS-RPT-Reports
+(RFC 8460) aus einem separaten IMAP-Ordner aus.
 
 Keine Cloud, kein Konto, kein Dritter. Der einzige Netzwerkverkehr, den
 dmarcwatch erzeugt, ist die IMAP-Verbindung zum konfigurierten Host (plus,
@@ -152,13 +154,22 @@ Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   Ergebnis von `dmarcwatch verify-dns --json` für alle konfigurierten
   `own_domains` - DMARC/SPF/DKIM-Gültigkeit und Fehlkonfigurationen, siehe
   [`verify-dns`](#befehle) unten. Reine Diagnose, verändert nichts.
+- **TLS-RPT-Bericht…** öffnet ein Fenster mit den bereits lokal gespeicherten
+  SMTP-TLS-RPT-Reports (`dmarcwatch tls-report --json`, siehe
+  [Konfiguration](#konfiguration) und [`tls-report`](#befehle) unten) - pro
+  Domain Policy-Typ, erfolgreiche/fehlgeschlagene TLS-Sitzungen und
+  gemeldete Fehlertypen. Reines Lesen der lokalen DB wie die
+  Haupt-Menüleiste, deshalb ohne Bestätigungsdialog (anders als "DNS
+  prüfen…"/"WHOIS abrufen…", die tatsächlich nach außen gehen). Nur
+  aussagekräftig, wenn `enable_tls_rpt` aktiviert ist.
 
 Abgesehen von **"WHOIS abrufen…"**, **"Aus SPF ermitteln…"** und
 **"DNS prüfen…"** macht die App selbst **keine** Netzwerkanfrage von sich
-aus - alles andere liest ausschließlich aus der lokalen SQLite-Datenbank,
-die `fetch` befüllt. Das sind die einzigen drei Stellen, an denen ein Klick
-tatsächlich nach außen geht (RDAP bzw. DNS), und alle drei immer erst nach
-expliziter Bestätigung im Dialog, nie automatisch im Hintergrund.
+aus - alles andere (inklusive **"TLS-RPT-Bericht…"**) liest ausschließlich
+aus der lokalen SQLite-Datenbank, die `fetch` befüllt. Das sind die
+einzigen drei Stellen, an denen ein Klick tatsächlich nach außen geht (RDAP
+bzw. DNS), und alle drei immer erst nach expliziter Bestätigung im Dialog,
+nie automatisch im Hintergrund.
 
 Wichtig: dmarcwatch darf **nicht** unter `~/Desktop`, `~/Documents` oder
 `~/Downloads` liegen. Diese Ordner sind unter macOS durch TCC geschützt -
@@ -208,6 +219,12 @@ mit Defaults angelegt, Verzeichnis `0700`, Datei `0600`):
 | `notify_on_new_findings` | macOS-Notification bei neuen Auffälligkeiten | `true` |
 | `enable_reverse_dns_lookup` | Reverse-DNS für Quell-IPs (verlässt das Gerät!) - aktuell nicht implementiert, Platzhalter für künftige, ausdrücklich einzuschaltende Erweiterung | `false` |
 | `menubar_days` | Zeitfenster für die Menüleisten-Anzeige | `7` |
+| `enable_tls_rpt` | TLS-RPT-Auswertung (RFC 8460) ein-/ausschalten⁹ | `false` |
+| `tlsrpt_imap_folder` | Ordner mit den TLS-RPT-Reports, nur relevant wenn obiges aktiv ist | `INBOX/TLS-RPT` |
+| `tlsrpt_processed_folder` | Zielordner, falls `move_to_processed_folder` aktiv ist | `INBOX/TLS-RPT/verarbeitet` |
+| `max_json_size_mb` | Obergrenze für entpacktes TLS-RPT-JSON¹⁰ | `2` |
+| `max_tls_policies_per_report` | Obergrenze für `policies`-Einträge pro TLS-RPT-Report¹¹ | `50` |
+| `max_tls_failure_details_per_policy` | Obergrenze für `failure-details`-Einträge pro Policy¹¹ | `200` |
 
 Das IMAP-Passwort steht **nicht** in dieser Datei, sondern ausschließlich im
 Schlüsselbund (Dienst `dmarcwatch`, Account = `imap_user`).
@@ -253,17 +270,91 @@ Spielraum.
 CPU-Zeit, dieses Limit macht das Verhalten bei absichtlicher Datenflut
 zusätzlich deterministisch, statt sich allein auf den CPU-Zeit-Backstop des
 LaunchAgents zu verlassen.
+<br>
+<sup>9</sup> Standardmäßig aus: ein bestehendes Setup hätte sonst plötzlich
+einen fehlschlagenden `fetch` (Ordner existiert nicht), nur weil ein Update
+dieses Feld einführt. Vor dem Aktivieren zuerst eine Filterregel im
+Postfach anlegen, die Mail an die TLS-RPT-`rua`-Adresse in
+`tlsrpt_imap_folder` einsortiert.
+<br><br>
+Damit überhaupt TLS-RPT-Reports mit Inhalt hereinkommen, muss die eigene
+Domain vorher **MTA-STS** (RFC 8461) oder **DANE** einrichten - ohne eine
+der beiden bekommen die meisten Absender höchstens einen "no-policy-found"-
+Eintrag ohne echte Fehlerdaten. Für MTA-STS braucht es eine per HTTPS
+erreichbare Policy-Datei unter `https://mta-sts.<domain>/.well-known/mta-sts.txt`
+mit einem zum Hostnamen passenden Zertifikat - ohne eigenen Webspace lässt
+sich das z. B. über [CaptainDNS](https://www.captaindns.com/) (EU/Frankreich)
+per CNAME hosten, ganz ohne eigenen Server. Eine Stolperfalle dabei, die
+wenig bekannt ist und leicht zu Frust führt: CaptainDNS zeigt den
+einzutragenden DNS-Namen als vollständigen Domainnamen an (z. B.
+`_mta-sts.example.com.`), viele DNS-Verwalter (u. a. INWX) erwarten im
+Namensfeld aber nur den Teil **vor** der eigenen Domain und hängen den Rest
+selbst an. Trägt man dort den vollen Namen aus der Anleitung ein, entsteht
+ein doppelter, nicht funktionierender Eintrag
+(`_mta-sts.example.com.example.com` statt `_mta-sts.example.com`) - der
+Eintrag scheint vorhanden zu sein, wird aber nie gefunden. Im Zweifel den
+Eintrag danach direkt per `dig` gegen die eigenen Nameserver prüfen, nicht
+nur im Panel nachsehen.
+
+Beispiel für die Domain `example.com` (Werte hier frei erfunden, nicht die
+tatsächlich von einem Anbieter ausgegebenen):
+
+| Typ | Name **im DNS-Panel** (relativ zur Zone, z. B. bei INWX) | Wert |
+|---|---|---|
+| CNAME | `mta-sts` | `hosting.beispiel-anbieter.test` |
+| TXT | `_mta-sts` | `v=STSv1; id=2026081900000001` |
+| TXT | `_captaindns-assets-verify` (oder analog, je nach Anbieter) | `beispiel-verifizierungscode-123abc` |
+
+Falsch wäre es, im Namensfeld stattdessen den vollen Namen aus der
+Anbieter-Anleitung einzutragen:
+
+| Typ | Falsch eingetragener Name | Tatsächlich entstehender (nutzloser) Eintrag |
+|---|---|---|
+| CNAME | `mta-sts.example.com` | `mta-sts.example.com.example.com` |
+| TXT | `_mta-sts.example.com` | `_mta-sts.example.com.example.com` |
+
+Ob es bei INWX genauso läuft wie bei anderen Panels: einfach ausprobieren
+und mit `dig` gegenprüfen - das Prinzip (Namensfeld relativ zur eigenen
+Zone, Anbieter-Anleitung zeigt aber oft den vollen Namen) betrifft nicht
+nur CaptainDNS, sondern jeden Dienst, der einen fertigen DNS-Eintrag zum
+Kopieren vorgibt.
+<br>
+<sup>10</sup> TLS-RPT-Reports (RFC 8460) sind typischerweise deutlich
+kleiner als DMARC-Aggregate-Reports - keine Pro-Quell-IP-Aufschlüsselung in
+vergleichbarem Umfang, deshalb ein eigener, kleinerer Wert statt
+`max_xml_size_mb` mitzubenutzen.
+<br>
+<sup>11</sup> Analog zu `max_records_per_report` bei DMARC, aber bewusst
+enger: ein TLS-RPT-Report hat pro Domain realistisch eine Handvoll
+`policies`-Einträge (eigene STS-Policy, ggf. TLSA, "no-policy-found"), nicht
+Tausende wie DMARC-Records bei großen Absendern. `failure-details` fasst
+laut RFC bereits nach (Ergebnistyp, sendende MTA-IP, empfangender MX-Host)
+zusammen - auch bei einer echten Störung realistischerweise eine niedrige
+zweistellige Zahl unterschiedlicher Kombinationen, nicht Zehntausende.
 
 ## Befehle
 
 - `dmarcwatch setup [--install-agent] [--remove-agent] [--hour H] [--minute M]`
   Legt Konfiguration und Schlüsselbund-Eintrag an, verwaltet den LaunchAgent.
 - `dmarcwatch fetch [-v]`
-  Holt neue Reports, wertet sie aus, speichert sie. Exit-Code `1`, wenn der
-  Lauf neue Auffälligkeiten gebracht hat, sonst `0`; Netzwerk-/IMAP-Fehler
-  führen ebenfalls zu Exit-Code `1` und einem Logeintrag.
+  Holt neue Reports, wertet sie aus, speichert sie - DMARC immer, TLS-RPT
+  zusätzlich aus einem separaten Ordner, wenn `enable_tls_rpt` aktiv ist
+  (siehe [Konfiguration](#konfiguration)). Exit-Code `1`, wenn der Lauf neue
+  DMARC-Auffälligkeiten oder gemeldete TLS-RPT-Fehlschläge gebracht hat,
+  sonst `0`; Netzwerk-/IMAP-Fehler führen ebenfalls zu Exit-Code `1` und
+  einem Logeintrag.
 - `dmarcwatch report [--days N]`
   Tabellarische Zusammenfassung für die letzten N Tage (Default 7).
+- `dmarcwatch tls-report [--days N] [--json]`
+  Tabellarische Zusammenfassung der bereits gespeicherten TLS-RPT-Reports
+  (RFC 8460) für die letzten N Tage - pro Domain Policy-Typ, erfolgreiche/
+  fehlgeschlagene TLS-Sitzungen und gemeldete Fehlertypen. Exit-Code `1` bei
+  mindestens einem Fehlschlag im Zeitraum, sonst `0`. `--json` gibt
+  strukturierte Ausgabe statt der Tabelle aus - für das
+  "TLS-RPT-Bericht…"-Fenster in der Menüleisten-App gedacht, funktioniert
+  aber genauso von Hand im Terminal. Nur aussagekräftig, wenn
+  `enable_tls_rpt` aktiv ist und `fetch` schon mindestens einmal danach
+  gelaufen ist.
 - `dmarcwatch inspect <ip-oder-cidr> [--days N] [--whois]`
   Vollständige Details zu einer IP oder einem Netz (z. B. `2a01:111::/32`),
   ohne von Hand SQL gegen die Datenbank zu schreiben. `--whois` fragt
@@ -373,7 +464,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-137 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+175 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
@@ -505,6 +596,21 @@ nicht als vertrauenswürdige Eingabe:
   Angriffsvektor "viele flache Records statt Entity-Explosion" damit schon
   vor diesem Limit gedeckelt; das Limit macht das Verhalten bei
   absichtlicher Datenflut zusätzlich deterministisch.
+- **TLS-RPT (RFC 8460) als eigene, aber gleichwertig abgesicherte
+  Angriffsfläche** ([tls_parser.py](src/dmarcwatch/tls_parser.py),
+  [archive.py](src/dmarcwatch/archive.py)): dieselbe
+  IMAP-Verbindung/TLS-Konfiguration, dieselbe
+  Größenprüfung-vor-Volltextabruf, dieselbe
+  Dekompressionsbomben-Absicherung (`_extract_gz`/`_extract_zip`, geteilter
+  Code) und dieselbe Fremd-Domain-Filterung wie bei DMARC - siehe
+  `max_json_size_mb`, `max_tls_policies_per_report`,
+  `max_tls_failure_details_per_policy` oben. JSON kennt zwar keine
+  externen Entitäten (kein XXE-Äquivalent), aber sehr tief verschachtelte
+  Eingaben können `json.loads()` intern einen `RecursionError`/
+  Stack-Overflow auslösen - wird abgefangen wie jeder andere
+  Parse-Fehler (empirisch mit 200.000 Verschachtelungsebenen getestet,
+  siehe [test_tls_parser.py](tests/test_tls_parser.py)), kein
+  Absturz und kein Abbruch des restlichen Laufs.
 - **WAL-Modus für SQLite** ([store.py](src/dmarcwatch/store.py) `connect`):
   echtes nicht-blockierendes Nebeneinander von Lesen (Menüleisten-App, alle
   paar Minuten) und Schreiben (täglicher `fetch`-Lauf, Bruchteile einer

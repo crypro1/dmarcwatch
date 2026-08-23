@@ -5,9 +5,10 @@ nicht Reaktion. dmarcwatchs Kernfunktion wertet aus, was andere Server
 stattdessen proaktiv, ob die eigenen DNS-Einträge überhaupt korrekt
 aufgesetzt sind, unabhängig von jedem einzelnen Report.
 
-Verlässt das Gerät (DNS) - deshalb ein expliziter CLI-Befehl, nie
-automatisch während `fetch` ausgeführt, gleiche Begründung wie bei
-`inspect --whois` und `resolve-spf`.
+Verlässt das Gerät (DNS, und bei konfiguriertem MTA-STS zusätzlich ein
+einzelner HTTPS-Abruf der eigenen Policy-Datei) - deshalb ein expliziter
+CLI-Befehl, nie automatisch während `fetch` ausgeführt, gleiche
+Begründung wie bei `inspect --whois` und `resolve-spf`.
 
 DKIM-Selektoren werden nicht geraten (die üblichen Tools probieren eine
 feste Liste "typischer" Namen durch, was zwangsläufig unvollständig
@@ -21,11 +22,16 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import ssl
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 
-from .spf import DIG_TIMEOUT_SECONDS, SPFCheckResult, _txt_records, validate_spf
+from .spf import DIG_TIMEOUT_SECONDS, SPFCheckResult, SPFResolutionError, _dig, _txt_records, validate_spf
 from .store import get_known_dkim_selectors
+
+_HTTPS_TIMEOUT_SECONDS = 5.0
 
 VALID_POLICIES = {"none", "quarantine", "reject"}
 
@@ -57,11 +63,55 @@ class DKIMCheckResult:
 
 
 @dataclass
+class MTASTSCheckResult:
+    """MTA-STS (RFC 8461) ist optional - anders als DMARC/SPF/DKIM erzeugt
+    ein komplettes Fehlen hier keine Warnung, nur ein angefangenes, aber
+    unvollständiges Setup.
+
+    policy_reachable: None, solange kein HTTPS-Abruf versucht wurde (z. B.
+    weil noch nicht mal der Hostname konfiguriert ist), sonst das
+    tatsächliche Ergebnis des Abrufs von https://mta-sts.<domain>/
+    .well-known/mta-sts.txt - anbieterunabhängig, prüft die eigene Domain
+    direkt statt eines Drittanbieter-Status."""
+
+    configured: bool
+    cname_target: str | None = None
+    policy_txt: str | None = None
+    policy_reachable: bool | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TLSRPTDNSCheckResult:
+    """Der DNS-Eintrag, der anderen Mailservern sagt, wohin TLS-RPT-Berichte
+    für die eigene Domain geschickt werden sollen (RFC 8460) - unabhängig
+    von dmarcwatchs eigener TLS-RPT-Auswertung (enable_tls_rpt). Ebenfalls
+    optional, keine Warnung bei komplettem Fehlen."""
+
+    configured: bool
+    record: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WildcardSPFCheckResult:
+    """SPF für *.<domain> - schützt vor Phishing über nicht existierende
+    Subdomains. Optional/fortgeschritten, keine Warnung bei Fehlen."""
+
+    configured: bool
+    record: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class DomainVerification:
     domain: str
     dmarc: DMARCCheckResult
     spf: SPFCheckResult
     dkim: list[DKIMCheckResult]
+    mta_sts: MTASTSCheckResult
+    tlsrpt_dns: TLSRPTDNSCheckResult
+    wildcard_spf: WildcardSPFCheckResult
 
 
 def _parse_dmarc_tags(record: str) -> dict[str, str]:
@@ -202,11 +252,183 @@ def check_dkim(domain: str, selector: str) -> DKIMCheckResult:
     return DKIMCheckResult(selector=selector, exists=True, key_type=key_type, warnings=warnings)
 
 
+def _fetch_mta_sts_policy(hostname: str) -> tuple[bool, str | None]:
+    """Ruft die tatsächliche MTA-STS-Policy-Datei per HTTPS ab (RFC 8461) -
+    liefert (erreichbar, Fehlermeldung-falls-nicht). Anbieterunabhängig:
+    prüft direkt, ob die eigene Domain funktioniert, statt sich auf den
+    allgemeinen Status eines bestimmten Hosting-Anbieters zu verlassen -
+    der könnte "up" sein, während die eigene Policy trotzdem falsch
+    konfiguriert ist (oder umgekehrt)."""
+    url = f"https://{hostname}/.well-known/mta-sts.txt"
+    context = ssl.create_default_context()
+    request = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(request, timeout=_HTTPS_TIMEOUT_SECONDS, context=context) as response:
+            if response.status != 200:
+                return False, f"HTTP {response.status}"
+            content = response.read(4096).decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, str(exc)
+
+    if not content.strip().lower().startswith("version: stsv1"):
+        return False, "Antwort beginnt nicht mit 'version: STSv1'"
+    return True, None
+
+
+def check_mta_sts(domain: str) -> MTASTSCheckResult:
+    """Prüft `mta-sts.<domain>` (CNAME oder direkter A/AAAA-Eintrag) und
+    `_mta-sts.<domain>` (Policy-TXT, RFC 8461). Optional - fehlt beides
+    komplett, ist das keine Warnung (die meisten Domains nutzen kein
+    MTA-STS), nur ein angefangenes, aber unvollständiges Setup wird
+    gemeldet (z. B. Policy-TXT ohne erreichbaren Hostnamen - genau der
+    Fehler, der bei einem doppelt eingetragenen Domainnamen im DNS-Panel
+    entsteht)."""
+    try:
+        cname_lines = _dig("CNAME", f"mta-sts.{domain}")
+    except SPFResolutionError:
+        cname_lines = []
+    cname_target = cname_lines[0].rstrip(".") if cname_lines else None
+
+    has_address = False
+    if not cname_target:
+        try:
+            has_address = bool(_dig("A", f"mta-sts.{domain}")) or bool(_dig("AAAA", f"mta-sts.{domain}"))
+        except SPFResolutionError:
+            has_address = False
+    hostname_configured = bool(cname_target) or has_address
+
+    try:
+        policy_records = [r for r in _txt_records(f"_mta-sts.{domain}") if r.lower().startswith("v=stsv1")]
+    except SPFResolutionError:
+        policy_records = []
+    policy_txt = policy_records[0] if policy_records else None
+
+    configured = hostname_configured or policy_txt is not None
+    warnings: list[str] = []
+    if configured:
+        if not hostname_configured:
+            warnings.append(
+                f"_mta-sts.{domain} hat einen Policy-Eintrag, aber mta-sts.{domain} hat "
+                "weder CNAME noch A/AAAA-Eintrag - die Policy-Datei ist für andere "
+                "Mailserver dadurch nicht erreichbar."
+            )
+        if not policy_txt:
+            warnings.append(
+                f"mta-sts.{domain} ist konfiguriert, aber _mta-sts.{domain} hat keinen "
+                "gültigen 'v=STSv1'-Policy-Eintrag - MTA-STS wird von anderen "
+                "Mailservern dadurch nicht erkannt."
+            )
+        elif "id=" not in policy_txt.lower():
+            warnings.append(f"_mta-sts.{domain}-Eintrag hat kein 'id='-Tag (Pflichtfeld laut RFC 8461).")
+
+    # Nur tatsächlich abrufen, wenn der Hostname überhaupt auflöst - sonst
+    # bräuchte es keinen Netzverkehr, um "nicht erreichbar" festzustellen,
+    # das steht schon aus den DNS-Prüfungen oben fest.
+    policy_reachable: bool | None = None
+    if hostname_configured:
+        reachable, error = _fetch_mta_sts_policy(f"mta-sts.{domain}")
+        policy_reachable = reachable
+        if not reachable:
+            warnings.append(
+                f"Policy-Datei unter https://mta-sts.{domain}/.well-known/mta-sts.txt "
+                f"nicht erreichbar oder ungültig: {error}"
+            )
+
+    return MTASTSCheckResult(
+        configured=configured, cname_target=cname_target, policy_txt=policy_txt,
+        policy_reachable=policy_reachable, warnings=warnings,
+    )
+
+
+def check_tlsrpt_dns(domain: str) -> TLSRPTDNSCheckResult:
+    """Prüft `_smtp._tls.<domain>` (TLS-RPT-Policy-DNS-Eintrag, RFC 8460) -
+    sagt anderen Mailservern, wohin TLS-Berichte für die eigene Domain
+    geschickt werden sollen. Unabhängig von dmarcwatchs eigener
+    TLS-RPT-Auswertung (`enable_tls_rpt`): dieser DNS-Eintrag existiert für
+    die eigene Domain, egal ob die eingehenden Berichte selbst mit
+    dmarcwatch ausgewertet werden oder über einen Drittanbieter laufen.
+    Optional, keine Warnung bei komplettem Fehlen."""
+    try:
+        records = [r for r in _txt_records(f"_smtp._tls.{domain}") if r.lower().startswith("v=tlsrptv1")]
+    except SPFResolutionError:
+        records = []
+
+    if not records:
+        return TLSRPTDNSCheckResult(configured=False)
+
+    record = records[0]
+    warnings: list[str] = []
+    if "rua=" not in record.lower():
+        warnings.append(
+            f"_smtp._tls.{domain}-Eintrag hat kein 'rua='-Tag - ohne Berichts-Adresse "
+            "bekommt niemand TLS-RPT-Berichte zugeschickt."
+        )
+    if len(records) > 1:
+        warnings.append(
+            f"{len(records)} TLS-RPT-Einträge unter _smtp._tls.{domain} gefunden - "
+            "mehrere Einträge können zu uneindeutigem Verhalten führen."
+        )
+
+    return TLSRPTDNSCheckResult(configured=True, record=record, warnings=warnings)
+
+
+def check_wildcard_spf(domain: str) -> WildcardSPFCheckResult:
+    """Prüft `*.<domain>` TXT - schützt vor Phishing über nicht existierende
+    Subdomains. Optional/fortgeschritten, keine Warnung bei Fehlen, nur ein
+    vorhandener, aber zu offener Eintrag wird gemeldet."""
+    try:
+        records = [r for r in _txt_records(f"*.{domain}") if r.lower().startswith("v=spf1")]
+    except SPFResolutionError:
+        records = []
+
+    if not records:
+        return WildcardSPFCheckResult(configured=False)
+
+    record = records[0]
+    warnings: list[str] = []
+    if "-all" not in record.lower():
+        warnings.append(
+            f"Wildcard-SPF-Eintrag (*.{domain}) endet nicht auf '-all' - er sollte "
+            "möglichst restriktiv sein, da er für alle nicht existierenden Subdomains gilt."
+        )
+
+    return WildcardSPFCheckResult(configured=True, record=record, warnings=warnings)
+
+
 def verify_domain(conn: sqlite3.Connection, domain: str) -> DomainVerification:
     """DMARC + SPF + DKIM (bekannte Selektoren aus echten, bereits
-    abgerufenen Reports) für `domain` prüfen."""
+    abgerufenen Reports) sowie MTA-STS/TLS-RPT-DNS/Wildcard-SPF (alle drei
+    optional) für `domain` prüfen."""
     dmarc = check_dmarc(domain)
     spf = validate_spf(domain)
     selectors = get_known_dkim_selectors(conn, domain)
     dkim = [check_dkim(domain, selector) for selector in selectors]
-    return DomainVerification(domain=domain, dmarc=dmarc, spf=spf, dkim=dkim)
+    mta_sts = check_mta_sts(domain)
+    tlsrpt_dns = check_tlsrpt_dns(domain)
+    wildcard_spf = check_wildcard_spf(domain)
+    return DomainVerification(
+        domain=domain, dmarc=dmarc, spf=spf, dkim=dkim,
+        mta_sts=mta_sts, tlsrpt_dns=tlsrpt_dns, wildcard_spf=wildcard_spf,
+    )
+
+
+def has_warnings(result: DomainVerification) -> bool:
+    """True, wenn verify_domain() für diese Domain irgendeine Auffälligkeit
+    gefunden hat - für die Rot-Einfärbung in der Menüleisten-App (siehe
+    cmd_verify_dns/cmd_fetch in cli.py). Jede Warnung zählt, auch kleinere
+    wie p=none oder pct<100 - nichts wird hier stillschweigend als "nicht
+    schlimm genug" eingestuft. Ein SPF-Fehler (spf.error, z. B. DNS nicht
+    erreichbar) zählt ebenfalls, auch ohne eigene Warnung in der Liste.
+    MTA-STS/TLS-RPT-DNS/Wildcard-SPF sind optional - nur ein angefangenes,
+    unvollständiges Setup zählt als Warnung, nicht das bloße Fehlen."""
+    if result.dmarc.warnings:
+        return True
+    if result.spf.warnings or result.spf.error:
+        return True
+    if any(d.warnings for d in result.dkim):
+        return True
+    if result.mta_sts.warnings:
+        return True
+    if result.tlsrpt_dns.warnings:
+        return True
+    return bool(result.wildcard_spf.warnings)

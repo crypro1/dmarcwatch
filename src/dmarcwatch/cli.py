@@ -6,6 +6,7 @@ import ipaddress
 import json
 import sys
 import time
+from datetime import date
 
 from . import keychain, launchd, notify
 from .anomaly import REASON_LABELS_DE
@@ -15,16 +16,30 @@ from .config import (
     db_path,
     load_config,
     log_path,
+    read_dns_check_result,
     read_last_fetch_date,
     read_raw_config,
+    read_skipped_items,
     write_config,
     write_default_config_if_missing,
+    write_dns_check_result,
     write_last_fetch_date,
+    write_skipped_items,
 )
-from .dns_verify import DomainVerification, verify_domain
+from .dns_verify import DomainVerification, has_warnings, verify_domain
 from .fetch import FetchError, connect_imap, fetch_and_ingest
 from .logging_setup import setup_logging
-from .report import collect_rows, day_range_to_ts, format_table, has_findings, to_json_dict
+from .report import (
+    collect_rows,
+    collect_tls_rows,
+    day_range_to_ts,
+    format_table,
+    format_tls_table,
+    has_findings,
+    has_tls_failures,
+    to_json_dict,
+    to_tls_json_dict,
+)
 from .menubar import render_swiftbar
 from .sanitize import sanitize_field
 from .spf import SPFResolutionError, resolve_own_ip_networks
@@ -85,6 +100,14 @@ def _prompt_config_interactively(existing: dict) -> dict:
             "aussagekräftig. Die eigenen Sende-Netze findest du in den ersten echten, "
             "sauberen Reports (source_ip) oder im eigenen SPF-DNS-Eintrag. Danach von "
             f"Hand eintragen in: {config_path()}"
+        )
+    if not existing.get("enable_tls_rpt"):
+        print()
+        print(
+            "Hinweis: TLS-RPT-Auswertung (RFC 8460) ist optional und standardmäßig "
+            "aus. Dafür zuerst einen eigenen Postfachordner (Default: INBOX/TLS-RPT) "
+            "mit Filterregel für die TLS-RPT-rua-Adresse anlegen, dann in "
+            f"{config_path()} \"enable_tls_rpt\": true setzen."
         )
     return updated
 
@@ -243,6 +266,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     # darüber, wann der Mac an/aus war.
     write_last_fetch_date(today)
 
+    # Gründe für übersprungene Nachrichten/Anhänge (z. B. eine abgelehnte
+    # Dekompressionsbombe oder ein zu großer Anhang) landen bisher nur im
+    # Logfile - für die Menüleisten-App und die Terminal-Ausgabe hier
+    # zusätzlich sichtbar machen. sanitize_field() schützt davor, dass ein
+    # böswillig gewählter Dateiname (kommt unverändert aus einem
+    # E-Mail-Anhang, also unvertrauenswürdig) in einer Menüzeile oder
+    # Notification landet. Wird bei jedem Lauf komplett überschrieben, kein
+    # anwachsendes Protokoll (siehe write_skipped_items).
+    skipped_reasons = [sanitize_field(e, max_len=200) for e in summary.errors]
+    write_skipped_items(skipped_reasons)
+
     logger.info(
         "Lauf beendet: %d Nachricht(en), %d zu groß/unbestimmbar, %d Report(s) neu, "
         "%d Duplikat(e), %d fremde Domain, %d auffällig, %d Anhänge übersprungen",
@@ -260,14 +294,66 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         f"{summary.flagged_count} auffällig, {summary.attachments_skipped} Anhänge übersprungen, "
         f"{summary.messages_skipped_too_large} Nachricht(en) zu groß/unbestimmbar"
     )
+    if config.enable_tls_rpt:
+        print(
+            f"TLS-RPT: {summary.tls_messages_seen} Nachricht(en), {summary.tls_reports_inserted} neue "
+            f"Report(s), {summary.tls_reports_duplicate} Duplikat(e), "
+            f"{summary.tls_reports_rejected_foreign} fremde Domain, {summary.tls_failure_count} "
+            f"gemeldete Fehlschläge"
+        )
+    if skipped_reasons:
+        print("Übersprungen:")
+        for reason in skipped_reasons:
+            print(f"  - {reason}")
 
     if config.notify_on_new_findings and summary.flagged_count > 0:
         notify.send_notification(
             title="DMARC Auffälligkeit",
             message=f"{summary.flagged_count} auffällige Einträge in neuen Reports",
         )
+    if config.notify_on_new_findings and summary.tls_failure_count > 0:
+        notify.send_notification(
+            title="TLS-RPT Fehlschläge",
+            message=f"{summary.tls_failure_count} gemeldete Fehlschläge in neuen TLS-RPT-Reports",
+        )
+    if config.notify_on_new_findings and skipped_reasons:
+        # Rein informativ (kein "Fund" wie oben) - trotzdem sichtbar machen,
+        # sonst merkt man von einem abgelehnten Angriffsversuch nie etwas,
+        # außer man liest von Hand die Logdatei.
+        detail = skipped_reasons[0] if len(skipped_reasons) == 1 else "Details im Menü/Terminal"
+        notify.send_notification(
+            title="Nachricht/Anhang übersprungen",
+            message=f"{len(skipped_reasons)}x übersprungen: {detail}",
+        )
 
-    return 1 if summary.flagged_count > 0 else 0
+    # Periodischer automatischer DNS-Check: nur wenn per Checkbox
+    # ausdrücklich zugestimmt (enable_auto_dns_check) - das Aktivieren ist
+    # die einmalige Zustimmung, analog zum täglichen fetch-Zeitplan selbst,
+    # danach keine erneute Bestätigung pro Lauf wie bei "DNS prüfen…" im
+    # Menü. Läuft huckepack im ohnehin schon täglichen fetch, kein
+    # zweiter LaunchAgent nötig. Beeinflusst bewusst NICHT den Exit-Code
+    # von fetch - das ist ein eigenes Signal (Konfigurationszustand), kein
+    # "neuer Fund in einem Report".
+    if config.enable_auto_dns_check and config.own_domains:
+        last_check = read_dns_check_result()
+        days_since: float | None = None
+        if last_check and isinstance(last_check.get("checked_at"), str):
+            try:
+                last_date = date.fromisoformat(last_check["checked_at"])
+                days_since = (date.today() - last_date).days
+            except ValueError:
+                days_since = None
+        due = last_check is None or days_since is None or days_since >= config.auto_dns_check_interval_days
+        if due:
+            dns_results = _run_dns_check_and_persist(list(config.own_domains))
+            warned_domains = [r.domain for r in dns_results if has_warnings(r)]
+            if config.notify_on_new_findings and warned_domains:
+                notify.send_notification(
+                    title="DNS-Konfiguration auffällig",
+                    message=f"Auffälligkeiten bei: {', '.join(warned_domains)}",
+                )
+
+    return 1 if (summary.flagged_count > 0 or summary.tls_failure_count > 0) else 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -277,6 +363,19 @@ def cmd_report(args: argparse.Namespace) -> int:
     db_conn.close()
     print(format_table(rows))
     return 1 if has_findings(rows) else 0
+
+
+def cmd_tls_report(args: argparse.Namespace) -> int:
+    db_conn = connect(db_path())
+    since_ts, until_ts = day_range_to_ts(args.days)
+    rows = collect_tls_rows(db_conn, since_ts, until_ts)
+    db_conn.close()
+    if args.json:
+        json.dump(to_tls_json_dict(rows, args.days), sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        print(format_tls_table(rows))
+    return 1 if has_tls_failures(rows) else 0
 
 
 def _parse_inspect_query(
@@ -398,7 +497,9 @@ def cmd_menubar_json(args: argparse.Namespace) -> int:
     rows = collect_rows(db_conn, since_ts, until_ts)
     whois_by_ip = get_all_cached_whois(db_conn)
     db_conn.close()
-    json.dump(to_json_dict(rows, config.menubar_days, whois_by_ip), sys.stdout)
+    skipped_items = read_skipped_items()
+    dns_check = read_dns_check_result()
+    json.dump(to_json_dict(rows, config.menubar_days, whois_by_ip, skipped_items, dns_check), sys.stdout)
     sys.stdout.write("\n")
     return 0
 
@@ -464,6 +565,34 @@ def _print_verify_result(result: DomainVerification) -> None:
         for warning in dkim_result.warnings:
             print(f"    ⚠ {warning}")
 
+    # MTA-STS/TLS-RPT-DNS/Wildcard-SPF sind optional - nur ausgeben, wenn
+    # tatsächlich etwas konfiguriert ist, sonst unnötiges Rauschen für die
+    # meisten Domains, die das gar nicht nutzen.
+    if result.mta_sts.configured:
+        print()
+        print(f"MTA-STS (mta-sts.{result.domain} / _mta-sts.{result.domain})")
+        print(f"  Ziel:              {result.mta_sts.cname_target or '(A/AAAA statt CNAME)'}")
+        print(f"  Policy-Eintrag:    {result.mta_sts.policy_txt or '(nicht gefunden)'}")
+        if result.mta_sts.policy_reachable is not None:
+            status = "erreichbar" if result.mta_sts.policy_reachable else "NICHT erreichbar"
+            print(f"  Policy-Datei:      {status} (https://mta-sts.{result.domain}/.well-known/mta-sts.txt)")
+        for warning in result.mta_sts.warnings:
+            print(f"  ⚠ {warning}")
+
+    if result.tlsrpt_dns.configured:
+        print()
+        print(f"TLS-RPT-DNS (_smtp._tls.{result.domain})")
+        print(f"  Eintrag:           {result.tlsrpt_dns.record}")
+        for warning in result.tlsrpt_dns.warnings:
+            print(f"  ⚠ {warning}")
+
+    if result.wildcard_spf.configured:
+        print()
+        print(f"Wildcard-SPF (*.{result.domain})")
+        print(f"  Eintrag:           {result.wildcard_spf.record}")
+        for warning in result.wildcard_spf.warnings:
+            print(f"  ⚠ {warning}")
+
 
 def _verification_to_dict(result: DomainVerification) -> dict:
     """JSON-Repräsentation für den `--json`-Modus - von der Menüleisten-App
@@ -500,13 +629,56 @@ def _verification_to_dict(result: DomainVerification) -> dict:
             }
             for d in result.dkim
         ],
+        "mta_sts": {
+            "configured": result.mta_sts.configured,
+            "cname_target": result.mta_sts.cname_target,
+            "policy_txt": result.mta_sts.policy_txt,
+            "policy_reachable": result.mta_sts.policy_reachable,
+            "warnings": result.mta_sts.warnings,
+        },
+        "tlsrpt_dns": {
+            "configured": result.tlsrpt_dns.configured,
+            "record": result.tlsrpt_dns.record,
+            "warnings": result.tlsrpt_dns.warnings,
+        },
+        "wildcard_spf": {
+            "configured": result.wildcard_spf.configured,
+            "record": result.wildcard_spf.record,
+            "warnings": result.wildcard_spf.warnings,
+        },
     }
+
+
+def _run_dns_check_and_persist(domains: list[str]) -> list[DomainVerification]:
+    """Führt verify_domain() für alle domains aus und speichert das Ergebnis
+    (überschreibt die vorherige Datei komplett, kein wachsendes Protokoll) -
+    von cmd_verify_dns (Klick auf "DNS prüfen…" oder Terminal-Aufruf) UND
+    vom periodischen automatischen Check in cmd_fetch genutzt, damit die
+    Menüleisten-App unabhängig vom Auslöser immer den letzten bekannten
+    Stand anzeigen kann, ohne selbst eine DNS-Abfrage zu machen."""
+    db_conn = connect(db_path())
+    try:
+        results = [verify_domain(db_conn, domain) for domain in domains]
+    finally:
+        db_conn.close()
+
+    write_dns_check_result(
+        {
+            "checked_at": time.strftime("%Y-%m-%d"),
+            "domains": [
+                {**_verification_to_dict(r), "has_warnings": has_warnings(r)} for r in results
+            ],
+        }
+    )
+    return results
 
 
 def cmd_verify_dns(args: argparse.Namespace) -> int:
     """Prüft die eigenen DMARC/SPF/DKIM-DNS-Einträge auf Gültigkeit und
     häufige Fehlkonfigurationen (siehe dns_verify.py) - verlässt das Gerät
-    (DNS), deshalb ein expliziter Befehl, nie automatisch während `fetch`."""
+    (DNS). Läuft entweder auf ausdrücklichen Klick/Terminal-Aufruf, oder
+    periodisch automatisch über `fetch`, wenn `enable_auto_dns_check`
+    aktiv ist (einmalige Zustimmung per Checkbox, siehe cmd_fetch)."""
     if args.domain:
         domains = [args.domain]
     else:
@@ -519,11 +691,7 @@ def cmd_verify_dns(args: argparse.Namespace) -> int:
             )
             return 2
 
-    db_conn = connect(db_path())
-    try:
-        results = [verify_domain(db_conn, domain) for domain in domains]
-    finally:
-        db_conn.close()
+    results = _run_dns_check_and_persist(domains)
 
     if args.json:
         json.dump([_verification_to_dict(r) for r in results], sys.stdout)
@@ -596,6 +764,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser("report", help="Tabellarische Zusammenfassung anzeigen")
     p_report.add_argument("--days", type=int, default=7, help="Zeitraum in Tagen (Default: 7)")
     p_report.set_defaults(func=cmd_report)
+
+    p_tls_report = sub.add_parser(
+        "tls-report", help="Tabellarische Zusammenfassung der TLS-RPT-Reports anzeigen"
+    )
+    p_tls_report.add_argument("--days", type=int, default=7, help="Zeitraum in Tagen (Default: 7)")
+    p_tls_report.add_argument("--json", action="store_true", help="Ausgabe als JSON statt Tabelle")
+    p_tls_report.set_defaults(func=cmd_tls_report)
 
     p_inspect = sub.add_parser(
         "inspect", help="Vollständige Details zu einer IP oder einem CIDR-Netz anzeigen"

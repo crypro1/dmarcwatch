@@ -22,6 +22,28 @@ final class SetupViewModel: ObservableObject {
     // Config.__post_init__ (cli.py fängt ValueError ab und zeigt den Fehler
     // hier an) - keine doppelte ipaddress-Validierung in Swift.
     @Published var ownIpNetworks = ""
+    // TLS-RPT (RFC 8460) ist opt-in (siehe DEFAULT_CONFIG-Kommentar in
+    // config.py): erst wenn im Postfach eine Filterregel für die
+    // TLS-RPT-rua-Adresse in einen eigenen Ordner eingerichtet ist, macht
+    // das Aktivieren hier Sinn - deshalb Default aus, nicht automatisch an.
+    @Published var enableTlsRpt = false
+    @Published var tlsrptImapFolder = "INBOX/TLS-RPT"
+    // Periodischer automatischer DNS-Check (DMARC/SPF/DKIM) - Default aus,
+    // das Aktivieren hier ist die einmalige Zustimmung dazu, siehe
+    // enable_auto_dns_check-Kommentar in config.py.
+    @Published var enableAutoDnsCheck = false
+    // Als Int statt String: über einen Stepper verstellbar (wie die
+    // Uhrzeit beim täglichen Abruf per DatePicker), nicht per Freitext-
+    // Eingabe - Bereich 1...31 direkt über den Stepper erzwungen, keine
+    // separate Validierung nötig.
+    @Published var autoDnsCheckIntervalDays = 7
+    // Kein config.json-Feld - direkt über SMAppService (LoginItemManager),
+    // vormals ein Menüpunkt in der Statusleiste, jetzt hierher verschoben,
+    // um das Menü zu entschlacken. Wendet sich sofort an, nicht erst beim
+    // Speichern des restlichen Formulars (siehe applyStartAtLogin) - war
+    // vorher auch ein sofort wirksamer Klick, kein Teil einer
+    // Speichern/Abbrechen-Transaktion.
+    @Published var startAtLogin = LoginItemManager.isEnabled
     @Published var password = ""
     // Uhrzeit als Date statt zweier String-Felder: ein DatePicker mit
     // .hourAndMinute ist die native macOS-Kontrolle dafür und vermeidet die
@@ -61,9 +83,31 @@ final class SetupViewModel: ObservableObject {
             if let networks = cfg.ownIpNetworks, !networks.isEmpty {
                 ownIpNetworks = networks.joined(separator: ", ")
             }
+            enableTlsRpt = cfg.enableTlsRpt ?? enableTlsRpt
+            tlsrptImapFolder = cfg.tlsrptImapFolder ?? tlsrptImapFolder
+            enableAutoDnsCheck = cfg.enableAutoDnsCheck ?? enableAutoDnsCheck
+            if let interval = cfg.autoDnsCheckIntervalDays { autoDnsCheckIntervalDays = min(max(interval, 1), 365) }
         }
+        // Frisch von SMAppService lesen statt eines zwischengespeicherten
+        // Werts - kann sich extern geändert haben (z. B. Systemeinstellungen
+        // > Anmeldeobjekte).
+        startAtLogin = LoginItemManager.isEnabled
         password = ""
         errorMessage = nil
+    }
+
+    /// Wendet die Login-Item-Registrierung sofort an, unabhängig vom
+    /// restlichen Speichern/Abbrechen-Formular - war vorher ein einzelner
+    /// Klick im Menü, kein Teil einer Transaktion. Bei Fehlschlag wird der
+    /// Schalter auf den tatsächlichen Systemzustand zurückgesetzt statt auf
+    /// einen zwischengespeicherten alten Wert.
+    func applyStartAtLogin(_ enabled: Bool) {
+        do {
+            try LoginItemManager.setEnabled(enabled)
+        } catch {
+            errorMessage = "Anmeldeobjekt konnte nicht geändert werden: \(error)"
+            startAtLogin = LoginItemManager.isEnabled
+        }
     }
 
     private func currentDomains() -> [String] {
@@ -130,6 +174,11 @@ final class SetupViewModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
 
+        let tlsrptFolder = tlsrptImapFolder.trimmingCharacters(in: .whitespaces)
+        if enableTlsRpt && tlsrptFolder.isEmpty {
+            errorMessage = "TLS-RPT-Ordner ist erforderlich, wenn TLS-RPT-Auswertung aktiv ist."
+            return
+        }
         var payload: [String: Any] = [
             "imap_host": host,
             "imap_port": port,
@@ -137,6 +186,10 @@ final class SetupViewModel: ObservableObject {
             "imap_folder": folder,
             "own_domains": domains,
             "own_ip_networks": networks,
+            "enable_tls_rpt": enableTlsRpt,
+            "tlsrpt_imap_folder": tlsrptFolder,
+            "enable_auto_dns_check": enableAutoDnsCheck,
+            "auto_dns_check_interval_days": autoDnsCheckIntervalDays,
         ]
         // Leeres Feld = Passwort unverändert lassen (bereits im
         // Schlüsselbund gespeichert) statt versehentlich zu löschen.
