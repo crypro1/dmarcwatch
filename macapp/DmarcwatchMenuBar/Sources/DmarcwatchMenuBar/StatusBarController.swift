@@ -399,13 +399,16 @@ final class StatusBarController: NSObject {
         let dnsItem = NSMenuItem(title: "DNS prüfen…", action: #selector(verifyDNS(_:)), keyEquivalent: "")
         let dnsSubtitle: String
         if let dnsCheck = dnsCheck {
+            let checkedAt = Self.germanDate(dnsCheck.checkedAt)
             dnsSubtitle = dnsHasWarnings
-                ? "Zuletzt geprüft: \(dnsCheck.checkedAt) - \(dnsWarnedDomains.count) auffällig"
-                : "Zuletzt geprüft: \(dnsCheck.checkedAt) - keine Auffälligkeiten"
+                ? "Zuletzt geprüft: \(checkedAt) - \(dnsWarnedDomains.count) auffällig"
+                : "Zuletzt geprüft: \(checkedAt) - keine Auffälligkeiten"
         } else {
             dnsSubtitle = "Noch nicht geprüft"
         }
-        dnsItem.attributedTitle = Self.compactHeaderTitle(dnsItem.title, subtitle: dnsSubtitle, icon: nil)
+        dnsItem.attributedTitle = Self.compactHeaderTitle(
+            dnsItem.title, subtitle: dnsSubtitle, icon: nil
+        )
         // Nur die Farbe wechselt (rot statt Template-Weiß/Schwarz), nicht
         // das Symbol selbst (kein .fill) - dieselbe Kontur wie im Normalfall.
         dnsItem.image = Self.symbol("checkmark.seal", color: dnsHasWarnings ? .systemRed : nil)
@@ -440,7 +443,8 @@ final class StatusBarController: NSObject {
     private func dayMenuItem(for day: DayGroup) -> NSMenuItem {
         let dayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         let countLabel = day.records.count == 1 ? "1 Eintrag" : "\(day.records.count) Einträge"
-        let title = day.flaggedCount > 0 ? "\(day.date) — \(day.flaggedCount) auffällig" : "\(day.date) — \(countLabel)"
+        let displayDate = Self.germanDate(day.date)
+        let title = day.flaggedCount > 0 ? "\(displayDate) — \(day.flaggedCount) auffällig" : "\(displayDate) — \(countLabel)"
         dayItem.title = title
         if day.flaggedCount > 0 {
             dayItem.image = Self.symbol("exclamationmark.triangle.fill")
@@ -536,7 +540,9 @@ final class StatusBarController: NSObject {
         let failureCount = entries.reduce(0) { $0 + $1.failureCount }
         let dayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         let countLabel = entries.count == 1 ? "1 Eintrag" : "\(entries.count) Einträge"
-        dayItem.title = failureCount > 0 ? "\(date) — \(failureCount) Fehlschläge" : "\(date) — \(countLabel)"
+        let displayDate = Self.germanDate(date)
+        dayItem.title = failureCount > 0
+            ? "\(displayDate) — \(failureCount) Fehlschläge" : "\(displayDate) — \(countLabel)"
         dayItem.image = Self.symbol(failureCount > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle")
 
         let submenu = NSMenu()
@@ -819,7 +825,7 @@ final class StatusBarController: NSObject {
     private static func compactHeaderTitle(_ title: String, subtitle: String, icon: String?) -> NSAttributedString {
         let result = NSMutableAttributedString(
             string: title + (icon != nil ? "  " : ""),
-            attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)]
+            attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize)]
         )
         if let icon, let image = Self.symbol(icon, pointSize: NSFont.systemFontSize * 0.85) {
             let attachment = NSTextAttachment()
@@ -841,5 +847,29 @@ final class StatusBarController: NSObject {
             )
         )
         return result
+    }
+
+    private static let isoDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
+    private static let germanDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd.MM.yyyy"
+        formatter.locale = Locale(identifier: "de_DE")
+        return formatter
+    }()
+
+    /// config.py schreibt checked_at als reines ISO-Datum ("yyyy-MM-dd",
+    /// siehe cli.py `time.strftime("%Y-%m-%d")`) - hier fürs Menü ins
+    /// gewohnte deutsche Format (TT.MM.JJJJ) umgewandelt. Fällt bei einem
+    /// unerwarteten Format auf den Rohwert zurück statt auf einen Absturz
+    /// oder eine leere Anzeige.
+    private static func germanDate(_ isoDate: String) -> String {
+        guard let date = isoDateFormatter.date(from: isoDate) else { return isoDate }
+        return germanDateFormatter.string(from: date)
     }
 }

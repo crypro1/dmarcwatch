@@ -50,10 +50,21 @@ struct SetupView: View {
                     }
 
                     group("Täglicher Abruf") {
-                        DatePicker(
-                            "Uhrzeit", selection: $viewModel.scheduleTime,
-                            displayedComponents: .hourAndMinute
-                        )
+                        // Zwei Stepper statt DatePicker - siehe Kommentar
+                        // bei scheduleHour/scheduleMinute im ViewModel.
+                        // Gleicher Aufbau wie "Intervall: alle X Tage" beim
+                        // DNS-Check unten, für ein einheitliches Bild statt
+                        // einer nativen Pille an nur dieser einen Stelle.
+                        HStack(spacing: 20) {
+                            Stepper(
+                                "Stunde: \(String(format: "%02d", viewModel.scheduleHour))",
+                                value: $viewModel.scheduleHour, in: 0...23
+                            )
+                            Stepper(
+                                "Minute: \(String(format: "%02d", viewModel.scheduleMinute))",
+                                value: $viewModel.scheduleMinute, in: 0...59
+                            )
+                        }
                         // Wirkt sofort (SMAppService), nicht erst beim
                         // Speichern des restlichen Formulars - siehe
                         // applyStartAtLogin-Kommentar im ViewModel.

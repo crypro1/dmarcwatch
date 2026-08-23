@@ -45,28 +45,25 @@ final class SetupViewModel: ObservableObject {
     // Speichern/Abbrechen-Transaktion.
     @Published var startAtLogin = LoginItemManager.isEnabled
     @Published var password = ""
-    // Uhrzeit als Date statt zweier String-Felder: ein DatePicker mit
-    // .hourAndMinute ist die native macOS-Kontrolle dafür und vermeidet die
-    // eigene Zahl-Validierung. (Zwei TextFields nebeneinander in einem
-    // HStack innerhalb eines Form-Abschnitts hatten außerdem ein Rendering-
-    // Problem: macOS' automatische Form-Beschriftung pro Kontrolle ließ die
-    // Werte selbst leer erscheinen.)
-    @Published var scheduleTime: Date = SetupViewModel.defaultScheduleTime
+    // Stunde/Minute als zwei einfache Int statt eines DatePicker(Date):
+    // die native .hourAndMinute-Kontrolle hat auf macOS einen Rendering-Bug
+    // (die letzte Ziffer wird innerhalb der eigenen Pille abgeschnitten,
+    // unabhängig von jeder SwiftUI-seitigen Breitenvorgabe) und wirkt
+    // dazu inkonsistent neben dem Tage-Stepper beim DNS-Check. Zwei
+    // Stepper statt dessen - gleiche Kontrolle, gleiches Aussehen.
+    // 07:30 als Default - derselbe wie zuvor beim interaktiven
+    // CLI-Prompt (_prompt_schedule in cli.py). config.json speichert die
+    // geplante Uhrzeit nicht (nur die bereits installierte
+    // LaunchAgent-plist tut das), daher kein aus der bestehenden
+    // Konfiguration vorausgefüllter Wert.
+    @Published var scheduleHour = 7
+    @Published var scheduleMinute = 30
     @Published var isSaving = false
     @Published var isResolvingSpf = false
     @Published var errorMessage: String?
 
     var onSaved: (() -> Void)?
     var onCancel: (() -> Void)?
-
-    /// 07:30 als Datum ohne festes Kalenderdatum - derselbe Default wie
-    /// zuvor beim interaktiven CLI-Prompt (_prompt_schedule in cli.py).
-    /// config.json speichert die geplante Uhrzeit nicht (nur die bereits
-    /// installierte LaunchAgent-plist tut das), daher gibt es hier keinen
-    /// aus der bestehenden Konfiguration vorausgefüllten Wert.
-    private static var defaultScheduleTime: Date {
-        Calendar.current.date(from: DateComponents(hour: 7, minute: 30)) ?? Date()
-    }
 
     /// Werte aus der bestehenden config.json übernehmen (falls vorhanden),
     /// Passwort- und Fehlerfeld zurücksetzen - wird bei jedem Öffnen des
@@ -149,11 +146,6 @@ final class SetupViewModel: ObservableObject {
             errorMessage = "IMAP-Port muss eine Zahl sein."
             return
         }
-        let scheduleComponents = Calendar.current.dateComponents([.hour, .minute], from: scheduleTime)
-        guard let hourInt = scheduleComponents.hour, let minuteInt = scheduleComponents.minute else {
-            errorMessage = "Uhrzeit für den täglichen Abruf ist ungültig."
-            return
-        }
         let host = imapHost.trimmingCharacters(in: .whitespaces)
         let user = imapUser.trimmingCharacters(in: .whitespaces)
         let folder = imapFolder.trimmingCharacters(in: .whitespaces)
@@ -198,7 +190,7 @@ final class SetupViewModel: ObservableObject {
         }
 
         isSaving = true
-        DmarcwatchCLI.runSetup(payload: payload, hour: hourInt, minute: minuteInt) { [weak self] result in
+        DmarcwatchCLI.runSetup(payload: payload, hour: scheduleHour, minute: scheduleMinute) { [weak self] result in
             guard let self = self else { return }
             self.isSaving = false
             switch result {
