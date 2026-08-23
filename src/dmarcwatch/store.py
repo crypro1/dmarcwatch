@@ -20,7 +20,7 @@ from .anomaly import evaluate_record
 from .config import Config
 from .models import AggregateReport, TLSReport
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -136,7 +136,24 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3}
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    # Lokaler Cache für explizit angefragte Spamhaus-ZEN-Ergebnisse
+    # (`dmarcwatch inspect --blacklist` sowie der MX-Server-Check in
+    # verify-dns). Rein informativ, siehe blacklist.py - analog zu
+    # whois_cache oben, gleiche "nie automatisch, nur auf Anfrage"-Regel.
+    conn.executescript(
+        """
+        CREATE TABLE blacklist_cache (
+            source_ip TEXT PRIMARY KEY,
+            listed INTEGER NOT NULL,
+            reasons_json TEXT NOT NULL DEFAULT '[]',
+            checked_at INTEGER NOT NULL
+        );
+        """
+    )
+
+
+MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3, 4: _migrate_v4}
 
 
 def get_cached_whois(conn: sqlite3.Connection, source_ip: str) -> tuple[str, int] | None:
@@ -169,6 +186,39 @@ def get_all_cached_whois(conn: sqlite3.Connection) -> dict[str, str]:
     Netzzugriff zu machen - reines Lesen aus der lokalen Datenbank."""
     rows = conn.execute("SELECT source_ip, organization FROM whois_cache").fetchall()
     return {row[0]: row[1] for row in rows}
+
+
+def get_cached_blacklist(conn: sqlite3.Connection, source_ip: str) -> tuple[bool, list[str], int] | None:
+    row = conn.execute(
+        "SELECT listed, reasons_json, checked_at FROM blacklist_cache WHERE source_ip = ?", (source_ip,)
+    ).fetchone()
+    if row is None:
+        return None
+    return bool(row[0]), json.loads(row[1]), row[2]
+
+
+def set_cached_blacklist(conn: sqlite3.Connection, source_ip: str, listed: bool, reasons: list[str]) -> None:
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO blacklist_cache (source_ip, listed, reasons_json, checked_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_ip) DO UPDATE SET
+                listed = excluded.listed,
+                reasons_json = excluded.reasons_json,
+                checked_at = excluded.checked_at
+            """,
+            (source_ip, int(listed), json.dumps(reasons), int(time.time())),
+        )
+    secure_wal_sidecar_files(conn)
+
+
+def get_all_cached_blacklist(conn: sqlite3.Connection) -> dict[str, tuple[bool, list[str]]]:
+    """Für die Menüleisten-App: alle bereits per `inspect --blacklist`
+    geprüften IPs in einem Rutsch, ohne selbst irgendeinen Netzzugriff zu
+    machen - reines Lesen aus der lokalen Datenbank."""
+    rows = conn.execute("SELECT source_ip, listed, reasons_json FROM blacklist_cache").fetchall()
+    return {row[0]: (bool(row[1]), json.loads(row[2])) for row in rows}
 
 
 def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]:

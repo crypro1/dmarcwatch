@@ -150,6 +150,19 @@ struct DNSVerifyView: View {
                     warnings(result.wildcardSpf.warnings)
                 }
             }
+
+            // checked statt configured - kein MX heißt meist einfach, dass
+            // die Domain selbst keine Mail empfängt, keine Warnung.
+            if result.mxBlacklist.checked {
+                group("Mailserver-Blacklist (Spamhaus ZEN)") {
+                    detail("MX-Server", result.mxBlacklist.mxHosts.joined(separator: ", "))
+                    statusPill(
+                        label: result.mxBlacklist.listed.isEmpty ? "Spamhaus sauber" : "Spamhaus gelistet",
+                        isUp: result.mxBlacklist.listed.isEmpty
+                    )
+                    warnings(result.mxBlacklist.warnings)
+                }
+            }
         }
     }
 

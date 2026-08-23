@@ -5,10 +5,11 @@ nicht Reaktion. dmarcwatchs Kernfunktion wertet aus, was andere Server
 stattdessen proaktiv, ob die eigenen DNS-Einträge überhaupt korrekt
 aufgesetzt sind, unabhängig von jedem einzelnen Report.
 
-Verlässt das Gerät (DNS, und bei konfiguriertem MTA-STS zusätzlich ein
-einzelner HTTPS-Abruf der eigenen Policy-Datei) - deshalb ein expliziter
-CLI-Befehl, nie automatisch während `fetch` ausgeführt, gleiche
-Begründung wie bei `inspect --whois` und `resolve-spf`.
+Verlässt das Gerät (DNS, bei konfiguriertem MTA-STS zusätzlich ein
+einzelner HTTPS-Abruf der eigenen Policy-Datei, und für die eigenen
+MX-Server-IP(s) eine Spamhaus-ZEN-Abfrage, siehe blacklist.py) - deshalb
+ein expliziter CLI-Befehl, nie automatisch während `fetch` ausgeführt,
+gleiche Begründung wie bei `inspect --whois` und `resolve-spf`.
 
 DKIM-Selektoren werden nicht geraten (die üblichen Tools probieren eine
 feste Liste "typischer" Namen durch, was zwangsläufig unvollständig
@@ -28,6 +29,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from .blacklist import BlacklistCheckError, check_ip_blacklist
 from .spf import DIG_TIMEOUT_SECONDS, SPFCheckResult, SPFResolutionError, _dig, _txt_records, validate_spf
 from .store import get_known_dkim_selectors
 
@@ -104,6 +106,23 @@ class WildcardSPFCheckResult:
 
 
 @dataclass
+class MXBlacklistCheckResult:
+    """Prüft die IP(s) der eigenen Mailserver (per MX-Eintrag aufgelöst)
+    gegen Spamhaus ZEN (siehe blacklist.py) - ein gelisteter eigener
+    Mailserver ist ein ernstzunehmendes Problem (viele Empfänger lehnen
+    Mail von dort ab), unabhängig vom sonstigen DMARC/SPF/DKIM-Setup.
+
+    checked=False, wenn keine MX-Einträge gefunden wurden oder die
+    DNS-Abfrage dafür fehlschlug - dann gibt es nichts zu warnen (kein MX
+    heißt meist einfach, dass die Domain selbst keine Mail empfängt)."""
+
+    checked: bool
+    mx_hosts: list[str] = field(default_factory=list)
+    listed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class DomainVerification:
     domain: str
     dmarc: DMARCCheckResult
@@ -112,6 +131,7 @@ class DomainVerification:
     mta_sts: MTASTSCheckResult
     tlsrpt_dns: TLSRPTDNSCheckResult
     wildcard_spf: WildcardSPFCheckResult
+    mx_blacklist: MXBlacklistCheckResult
 
 
 def _parse_dmarc_tags(record: str) -> dict[str, str]:
@@ -395,10 +415,58 @@ def check_wildcard_spf(domain: str) -> WildcardSPFCheckResult:
     return WildcardSPFCheckResult(configured=True, record=record, warnings=warnings)
 
 
+def check_mx_blacklist(domain: str) -> MXBlacklistCheckResult:
+    """Löst die MX-Einträge von `domain` auf, prüft deren IP(s) gegen
+    Spamhaus ZEN. Kein MX oder eine fehlgeschlagene DNS-Abfrage ergibt
+    checked=False statt einer Warnung - siehe MXBlacklistCheckResult."""
+    try:
+        mx_lines = _dig("MX", domain)
+    except SPFResolutionError:
+        return MXBlacklistCheckResult(checked=False)
+
+    hosts: list[str] = []
+    for line in mx_lines:
+        parts = line.split()
+        if not parts:
+            continue
+        hostname = parts[-1].rstrip(".")
+        if hostname and hostname not in hosts:
+            hosts.append(hostname)
+    if not hosts:
+        return MXBlacklistCheckResult(checked=False)
+
+    # Mehrere MX-Hosts können auf dieselbe IP zeigen (z. B. Failover-
+    # Konfiguration) - jede IP nur einmal tatsächlich abfragen.
+    ip_to_host: dict[str, str] = {}
+    for host in hosts:
+        try:
+            a_records = _dig("A", host)
+        except SPFResolutionError:
+            a_records = []
+        for ip in a_records:
+            ip_to_host.setdefault(ip, host)
+
+    listed: list[str] = []
+    warnings: list[str] = []
+    for ip, host in ip_to_host.items():
+        try:
+            result = check_ip_blacklist(ip)
+        except BlacklistCheckError as exc:
+            warnings.append(f"Spamhaus-Abfrage für {host} ({ip}) fehlgeschlagen: {exc}")
+            continue
+        if result.listed:
+            reasons = "; ".join(result.reasons)
+            listed.append(f"{host} ({ip}): {reasons}")
+            warnings.append(f"Mailserver {host} ({ip}) ist bei Spamhaus ZEN gelistet: {reasons}")
+
+    return MXBlacklistCheckResult(checked=True, mx_hosts=hosts, listed=listed, warnings=warnings)
+
+
 def verify_domain(conn: sqlite3.Connection, domain: str) -> DomainVerification:
     """DMARC + SPF + DKIM (bekannte Selektoren aus echten, bereits
     abgerufenen Reports) sowie MTA-STS/TLS-RPT-DNS/Wildcard-SPF (alle drei
-    optional) für `domain` prüfen."""
+    optional) und eine Spamhaus-Prüfung der eigenen MX-Server für `domain`
+    prüfen."""
     dmarc = check_dmarc(domain)
     spf = validate_spf(domain)
     selectors = get_known_dkim_selectors(conn, domain)
@@ -406,9 +474,11 @@ def verify_domain(conn: sqlite3.Connection, domain: str) -> DomainVerification:
     mta_sts = check_mta_sts(domain)
     tlsrpt_dns = check_tlsrpt_dns(domain)
     wildcard_spf = check_wildcard_spf(domain)
+    mx_blacklist = check_mx_blacklist(domain)
     return DomainVerification(
         domain=domain, dmarc=dmarc, spf=spf, dkim=dkim,
         mta_sts=mta_sts, tlsrpt_dns=tlsrpt_dns, wildcard_spf=wildcard_spf,
+        mx_blacklist=mx_blacklist,
     )
 
 
@@ -431,4 +501,6 @@ def has_warnings(result: DomainVerification) -> bool:
         return True
     if result.tlsrpt_dns.warnings:
         return True
-    return bool(result.wildcard_spf.warnings)
+    if result.wildcard_spf.warnings:
+        return True
+    return bool(result.mx_blacklist.warnings)

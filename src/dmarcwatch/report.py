@@ -100,6 +100,7 @@ def to_json_dict(
     whois_by_ip: dict[str, str] | None = None,
     skipped_items: list[str] | None = None,
     dns_check: dict | None = None,
+    blacklist_by_ip: dict[str, tuple[bool, list[str]]] | None = None,
 ) -> dict:
     """Strukturierte, nach Tag gruppierte Sicht für native Konsumenten
     (z. B. die Swift-Menüleisten-App). Anders als format_table()/render_swiftbar()
@@ -114,6 +115,7 @@ def to_json_dict(
     selbst nachgeschlagen, nur was schon vorliegt, wird mit ausgegeben.
     """
     whois_by_ip = whois_by_ip or {}
+    blacklist_by_ip = blacklist_by_ip or {}
     flagged = [r for r in rows if r.is_flagged]
 
     by_day: dict[str, list[ReportRow]] = {}
@@ -140,6 +142,13 @@ def to_json_dict(
                     "whois_organization": sanitize_field(whois_by_ip[r.source_ip], max_len=_MAX_JSON_FIELD_LEN)
                     if r.source_ip in whois_by_ip
                     else None,
+                    "blacklist_listed": blacklist_by_ip[r.source_ip][0] if r.source_ip in blacklist_by_ip else None,
+                    "blacklist_reasons": [
+                        sanitize_field(reason, max_len=_MAX_JSON_FIELD_LEN)
+                        for reason in blacklist_by_ip[r.source_ip][1]
+                    ]
+                    if r.source_ip in blacklist_by_ip
+                    else [],
                 }
             )
         days_out.append(

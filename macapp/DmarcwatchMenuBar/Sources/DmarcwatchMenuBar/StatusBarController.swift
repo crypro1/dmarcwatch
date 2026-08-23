@@ -188,13 +188,41 @@ final class StatusBarController: NSObject {
                 let errorAlert = NSAlert()
                 errorAlert.alertStyle = .warning
                 errorAlert.messageText = "WHOIS-Abfrage fehlgeschlagen"
-                errorAlert.informativeText = "\(error)"
+                errorAlert.informativeText = self?.describeError(error) ?? "\(error)"
                 errorAlert.runModal()
             }
             // Neu laden, unabhängig vom Ergebnis: bei Erfolg zeigt das
             // Untermenü jetzt die Organisation, bei einem (nicht gecachten)
             // Fehlschlag bleibt einfach "WHOIS abrufen…" für einen
             // erneuten Versuch stehen.
+            self?.refresh(nil)
+        }
+    }
+
+    /// Gleiches Muster wie lookupWhois() oben, nur gegen Spamhaus ZEN statt
+    /// RDAP.
+    @objc private func lookupBlacklist(_ sender: NSMenuItem) {
+        guard let ip = sender.representedObject as? String else { return }
+
+        let confirm = NSAlert()
+        confirm.alertStyle = .informational
+        confirm.messageText = "Spamhaus-Status abfragen?"
+        confirm.informativeText = """
+        Fragt, ob \(ip) bei Spamhaus ZEN gelistet ist - das verlässt dein \
+        Gerät. Rein informativ: ändert nichts an der Einstufung als auffällig.
+        """
+        confirm.addButton(withTitle: "Abfragen")
+        confirm.addButton(withTitle: "Abbrechen")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        DmarcwatchCLI.runInspectBlacklist(ip: ip) { [weak self] result in
+            if case .failure(let error) = result {
+                let errorAlert = NSAlert()
+                errorAlert.alertStyle = .warning
+                errorAlert.messageText = "Spamhaus-Abfrage fehlgeschlagen"
+                errorAlert.informativeText = self?.describeError(error) ?? "\(error)"
+                errorAlert.runModal()
+            }
             self?.refresh(nil)
         }
     }
@@ -517,6 +545,26 @@ final class StatusBarController: NSObject {
             whoisItem.representedObject = record.sourceIp
             submenu.addItem(whoisItem)
         }
+        // Gleiches Muster wie WHOIS oben, nur gegen Spamhaus ZEN statt RDAP -
+        // und nur für IPv4 (Doppelpunkt = IPv6), da blacklist.py IPv6 nicht
+        // unterstützt (siehe blacklist.py-Modul-Docstring). Der Knopf wird
+        // für IPv6-Quell-IPs deshalb gar nicht erst angeboten, statt einen
+        // Klick anzubieten, der garantiert immer scheitert - `inspect
+        // --blacklist` beendet sich dabei mit Exit-Code 0 (Fehler steht nur
+        // inline im Text, wie bei WHOIS), der Knopf würde also nach Klick
+        // einfach kommentarlos wieder in seinem Ausgangszustand erscheinen.
+        if let listed = record.blacklistListed {
+            let status = listed ? "gelistet - " + record.blacklistReasons.joined(separator: "; ") : "nicht gelistet"
+            submenu.addItem(disabledDetailLine("Spamhaus (nur Hinweis)", status))
+        } else if record.isFlagged && !record.sourceIp.contains(":") {
+            let blacklistItem = NSMenuItem(
+                title: "Blacklist abrufen…", action: #selector(lookupBlacklist(_:)), keyEquivalent: ""
+            )
+            blacklistItem.image = Self.symbol("shield.slash")
+            blacklistItem.target = self
+            blacklistItem.representedObject = record.sourceIp
+            submenu.addItem(blacklistItem)
+        }
         item.submenu = submenu
 
         return item
@@ -670,12 +718,33 @@ final class StatusBarController: NSObject {
         for warning in result.wildcardSpf.warnings {
             submenu.addItem(disabledDetailLine("Wildcard-SPF", warning))
         }
+        for warning in result.mxBlacklist.warnings {
+            submenu.addItem(disabledDetailLine("Spamhaus", warning))
+        }
         item.submenu = submenu
         return item
     }
 
+    // Breit genug für das längste tatsächlich vorkommende Label
+    // ("Empfänger (envelope_to):", ca. 157pt in der Menü-Schrift, empirisch
+    // gemessen statt geraten) plus etwas Luft - ein echter Tab-Stopp statt
+    // Leerzeichen-Auffüllung, weil die System-Schrift nicht monospaced ist
+    // und Leerzeichen deshalb je nach Label unterschiedlich breit wirken.
+    private static let detailLineValueColumn: CGFloat = 168
+
     private func disabledDetailLine(_ label: String, _ value: String) -> NSMenuItem {
-        return disabledItem("\(label): \(value)")
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.tabStops = [NSTextTab(textAlignment: .left, location: Self.detailLineValueColumn)]
+        paragraphStyle.defaultTabInterval = Self.detailLineValueColumn
+
+        let text = "\(label):\t\(value)"
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .paragraphStyle: paragraphStyle]
+        )
+        return item
     }
 
     private func disabledItem(_ text: String, secondary: Bool = false) -> NSMenuItem {
@@ -702,6 +771,8 @@ final class StatusBarController: NSObject {
             return "Fehler (Code \(code)): \(stderr.isEmpty ? "unbekannt" : stderr)"
         case CLIError.decodingFailed(let message):
             return "Antwort konnte nicht gelesen werden: \(message)"
+        case CLIError.inspectLookupFailed(let message):
+            return message.isEmpty ? "Abfrage fehlgeschlagen" : message
         default:
             return error.localizedDescription
         }

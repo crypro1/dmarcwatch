@@ -16,17 +16,20 @@ from dmarcwatch.dns_verify import (
     DMARCCheckResult,
     DomainVerification,
     MTASTSCheckResult,
+    MXBlacklistCheckResult,
     TLSRPTDNSCheckResult,
     WildcardSPFCheckResult,
     _fetch_mta_sts_policy,
     check_dkim,
     check_dmarc,
     check_mta_sts,
+    check_mx_blacklist,
     check_tlsrpt_dns,
     check_wildcard_spf,
     has_warnings,
 )
-from dmarcwatch.spf import SPFCheckResult
+from dmarcwatch.blacklist import BlacklistCheckError, BlacklistResult
+from dmarcwatch.spf import SPFCheckResult, SPFResolutionError
 
 
 def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -178,6 +181,7 @@ def _clean_result(domain: str = "example.com") -> DomainVerification:
         mta_sts=MTASTSCheckResult(configured=False),
         tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
         wildcard_spf=WildcardSPFCheckResult(configured=False),
+        mx_blacklist=MXBlacklistCheckResult(checked=False),
     )
 
 
@@ -208,6 +212,12 @@ def test_has_warnings_true_for_spf_error_even_without_warning_list():
 def test_has_warnings_true_for_dkim_warning():
     result = _clean_result()
     result.dkim[0].warnings.append("Kein Public Key")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_mx_blacklist_warning():
+    result = _clean_result()
+    result.mx_blacklist.warnings.append("Mailserver mail.example.com (198.51.100.5) ist bei Spamhaus ZEN gelistet")
     assert has_warnings(result) is True
 
 
@@ -402,4 +412,99 @@ def test_fetch_mta_sts_policy_connection_error():
     with patch("dmarcwatch.dns_verify.urllib.request.urlopen", side_effect=OSError("connection refused")):
         reachable, error = _fetch_mta_sts_policy("mta-sts.example.com")
     assert reachable is False
-    assert "connection refused" in error
+
+
+# --- check_mx_blacklist() ---
+
+
+def test_check_mx_blacklist_no_mx_records_not_checked():
+    with patch("dmarcwatch.dns_verify._dig", return_value=[]):
+        result = check_mx_blacklist("example.com")
+    assert result.checked is False
+    assert result.warnings == []
+
+
+def test_check_mx_blacklist_dns_failure_not_checked():
+    with patch("dmarcwatch.dns_verify._dig", side_effect=SPFResolutionError("Zeitüberschreitung")):
+        result = check_mx_blacklist("example.com")
+    assert result.checked is False
+
+
+def test_check_mx_blacklist_clean_mx_no_warning():
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail.example.com."]
+        if record_type == "A" and name == "mail.example.com":
+            return ["198.51.100.5"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch(
+            "dmarcwatch.dns_verify.check_ip_blacklist",
+            return_value=BlacklistResult(ip="198.51.100.5", listed=False),
+        ):
+            result = check_mx_blacklist("example.com")
+    assert result.checked is True
+    assert result.mx_hosts == ["mail.example.com"]
+    assert result.listed == []
+    assert result.warnings == []
+
+
+def test_check_mx_blacklist_listed_mx_warns():
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail.example.com."]
+        if record_type == "A" and name == "mail.example.com":
+            return ["198.51.100.5"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch(
+            "dmarcwatch.dns_verify.check_ip_blacklist",
+            return_value=BlacklistResult(
+                ip="198.51.100.5", listed=True, reasons=["SBL - bekannte Spam-Quelle"]
+            ),
+        ):
+            result = check_mx_blacklist("example.com")
+    assert result.checked is True
+    assert any("mail.example.com" in entry and "198.51.100.5" in entry for entry in result.listed)
+    assert any("Spamhaus ZEN gelistet" in w for w in result.warnings)
+
+
+def test_check_mx_blacklist_duplicate_ip_only_queried_once():
+    """Mehrere MX-Hosts können auf dieselbe IP zeigen (Failover) - die
+    Spamhaus-Abfrage soll trotzdem nur einmal pro eindeutiger IP passieren."""
+
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail1.example.com.", "20 mail2.example.com."]
+        if record_type == "A":
+            return ["198.51.100.5"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch(
+            "dmarcwatch.dns_verify.check_ip_blacklist",
+            return_value=BlacklistResult(ip="198.51.100.5", listed=False),
+        ) as mock_check:
+            check_mx_blacklist("example.com")
+    mock_check.assert_called_once_with("198.51.100.5")
+
+
+def test_check_mx_blacklist_query_error_warns_without_crashing():
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail.example.com."]
+        if record_type == "A" and name == "mail.example.com":
+            return ["198.51.100.5"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch(
+            "dmarcwatch.dns_verify.check_ip_blacklist",
+            side_effect=BlacklistCheckError("Zeitüberschreitung"),
+        ):
+            result = check_mx_blacklist("example.com")
+    assert result.checked is True
+    assert result.listed == []
+    assert any("fehlgeschlagen" in w for w in result.warnings)

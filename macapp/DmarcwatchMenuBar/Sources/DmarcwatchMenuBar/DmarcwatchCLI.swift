@@ -15,6 +15,13 @@ enum CLIError: Error {
     case binaryNotFound(String)
     case processFailed(Int32, String)
     case decodingFailed(String)
+    // Eigener Fall statt processFailed: `inspect --whois`/`--blacklist`
+    // beendet sich bei einem fehlgeschlagenen Lookup bewusst mit Exit-Code 3
+    // (nicht 0/Erfolg, nicht 1/2 - siehe cmd_inspect in cli.py), damit
+    // runInspectWhois/runInspectBlacklist das ohne Textabgleich auf den
+    // deutschen stdout-Text erkennen koennen. Der Nachrichtentext kommt aus
+    // stderr (dort schreibt cmd_inspect die konkrete Fehlermeldung hin).
+    case inspectLookupFailed(String)
 }
 
 enum DmarcwatchCLI {
@@ -127,6 +134,41 @@ enum DmarcwatchCLI {
                 let result = try run(arguments: ["inspect", ip, "--whois"])
                 if result.exitCode == 0 {
                     DispatchQueue.main.async { completion(.success(result.stdout)) }
+                } else if result.exitCode == 3 {
+                    // Treffer gefunden, aber der WHOIS-Lookup selbst ist
+                    // fehlgeschlagen (z. B. Netzwerk-Timeout) - siehe
+                    // cmd_inspect in cli.py. Bewusst nicht gecacht, ein
+                    // erneuter Klick soll es einfach nochmal versuchen.
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.inspectLookupFailed(result.stderr)))
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.processFailed(result.exitCode, result.stderr)))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+
+    /// Gleiches Muster wie runInspectWhois() oben, nur gegen Spamhaus ZEN
+    /// statt RDAP (siehe StatusBarController.lookupBlacklist) - erst nach
+    /// Bestaetigung im Dialog. Speichert das Ergebnis ueber
+    /// set_cached_blacklist in der lokalen DB.
+    static func runInspectBlacklist(ip: String, completion: @escaping (Result<String, Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try run(arguments: ["inspect", ip, "--blacklist"])
+                if result.exitCode == 0 {
+                    DispatchQueue.main.async { completion(.success(result.stdout)) }
+                } else if result.exitCode == 3 {
+                    // Gleicher Fall wie in runInspectWhois() oben, nur fuer
+                    // den Spamhaus-Lookup.
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.inspectLookupFailed(result.stderr)))
+                    }
                 } else {
                     DispatchQueue.main.async {
                         completion(.failure(CLIError.processFailed(result.exitCode, result.stderr)))
