@@ -152,8 +152,19 @@ Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   bequemer erreichbar - siehe Einschränkung direkt darunter.
 - **DNS prüfen…** öffnet nach Bestätigung im Dialog ein Fenster mit dem
   Ergebnis von `dmarcwatch verify-dns --json` für alle konfigurierten
-  `own_domains` - DMARC/SPF/DKIM-Gültigkeit und Fehlkonfigurationen, siehe
-  [`verify-dns`](#befehle) unten. Reine Diagnose, verändert nichts.
+  `own_domains` - DMARC/SPF/DKIM/MTA-STS/TLS-RPT-DNS/Wildcard-SPF-Gültigkeit
+  und Fehlkonfigurationen, siehe [`verify-dns`](#befehle) unten. Reine
+  Diagnose, verändert nichts. Die Unterzeile unter "DNS prüfen…" zeigt immer
+  den Zeitpunkt und das Ergebnis der letzten Prüfung (auch vom periodischen
+  automatischen Check, siehe `enable_auto_dns_check` in der
+  [Konfiguration](#konfiguration)), nicht nur von einem manuellen Klick.
+  Sobald mindestens eine Domain eine Warnung hat, färben sich Symbol und die
+  Fläche hinter den Statusleisten-Icons rot, und jede betroffene Domain
+  bekommt darunter eine eigene, aufklappbare Zeile mit den konkreten
+  Gründen - eine saubere Domain erzeugt keine zusätzliche Zeile, die
+  Unterzeile "keine Auffälligkeiten" reicht dafür. Der Bestätigungsdialog
+  selbst erklärt beim ersten Klick, was geprüft wird und wann rot erscheint,
+  und lässt sich über "Nicht mehr fragen" dauerhaft überspringen.
 - **TLS-RPT-Bericht…** öffnet ein Fenster mit den bereits lokal gespeicherten
   SMTP-TLS-RPT-Reports (`dmarcwatch tls-report --json`, siehe
   [Konfiguration](#konfiguration) und [`tls-report`](#befehle) unten) - pro
@@ -162,6 +173,15 @@ Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   Haupt-Menüleiste, deshalb ohne Bestätigungsdialog (anders als "DNS
   prüfen…"/"WHOIS abrufen…", die tatsächlich nach außen gehen). Nur
   aussagekräftig, wenn `enable_tls_rpt` aktiviert ist.
+
+Drei Kopfzeilen im Hauptmenü - DMARC, TLS-RPT und "Übersprungen" - erscheinen
+jeweils nur dann, wenn es dazu tatsächlich etwas anzuzeigen gibt: die
+TLS-RPT-Sektion nur bei aktivem `enable_tls_rpt` **und** mindestens einem
+gespeicherten Report, "Übersprungen" nur, wenn beim letzten `fetch`-Lauf
+tatsächlich eine Nachricht oder ein Anhang abgelehnt wurde (z. B. eine
+Größengrenze oder eine erkannte Dekompressionsbombe, siehe
+[Sicherheitsentscheidungen](#sicherheitsentscheidungen)) - keine dauerhaft
+leere Sektion nur zur Vollständigkeit.
 
 Abgesehen von **"WHOIS abrufen…"**, **"Aus SPF ermitteln…"** und
 **"DNS prüfen…"** macht die App selbst **keine** Netzwerkanfrage von sich
@@ -225,6 +245,8 @@ mit Defaults angelegt, Verzeichnis `0700`, Datei `0600`):
 | `max_json_size_mb` | Obergrenze für entpacktes TLS-RPT-JSON¹⁰ | `2` |
 | `max_tls_policies_per_report` | Obergrenze für `policies`-Einträge pro TLS-RPT-Report¹¹ | `50` |
 | `max_tls_failure_details_per_policy` | Obergrenze für `failure-details`-Einträge pro Policy¹¹ | `200` |
+| `enable_auto_dns_check` | Periodische, automatische `verify-dns`-Prüfung während `fetch`¹² | `false` |
+| `auto_dns_check_interval_days` | Abstand zwischen zwei automatischen Prüfungen, falls obiges aktiv ist | `7` |
 
 Das IMAP-Passwort steht **nicht** in dieser Datei, sondern ausschließlich im
 Schlüsselbund (Dienst `dmarcwatch`, Account = `imap_user`).
@@ -331,6 +353,16 @@ Tausende wie DMARC-Records bei großen Absendern. `failure-details` fasst
 laut RFC bereits nach (Ergebnistyp, sendende MTA-IP, empfangender MX-Host)
 zusammen - auch bei einer echten Störung realistischerweise eine niedrige
 zweistellige Zahl unterschiedlicher Kombinationen, nicht Zehntausende.
+<br>
+<sup>12</sup> Läuft als Teil des täglichen `fetch`-Laufs mit, nicht als
+eigener LaunchAgent - prüft vor jedem `fetch` anhand einer Datumsdatei, ob
+seit der letzten automatischen Prüfung mindestens `auto_dns_check_interval_days`
+Tage vergangen sind, und ruft dann intern dieselbe Prüfung wie `verify-dns`
+auf. Das Ergebnis fließt in `menubar-json` ein (Statusleisten-Pille/rote
+Domain-Zeilen, siehe [Native Menüleisten-App](#native-menüleisten-app)) und
+löst bei Auffälligkeiten eine eigene Notification aus, hat aber **keinen**
+Einfluss auf den Exit-Code von `fetch` selbst - ein DNS-Konfigurationsproblem
+ist kein Anzeichen für einen fehlgeschlagenen Abruf.
 
 ## Befehle
 
@@ -394,9 +426,21 @@ zweistellige Zahl unterschiedlicher Kombinationen, nicht Zehntausende.
   RSA- und Ed25519-Schlüssel, folgt CNAME-Delegation (viele Anbieter,
   z. B. mailbox.org, verweisen den DKIM-Eintrag per CNAME auf sich
   selbst, damit Kund:innen bei einer Schlüsselrotation nichts ändern
-  müssen). Verlässt das Gerät (DNS). `--json` gibt strukturierte Ausgabe
-  statt der Tabelle aus - für das "DNS prüfen…"-Fenster in der
-  Menüleisten-App gedacht, funktioniert aber genauso von Hand im Terminal.
+  müssen). Verlässt das Gerät (DNS). Zusätzlich drei rein optionale Checks -
+  **fehlen** sie ganz, erzeugt das keine Warnung, nur ein angefangenes/kaputtes
+  Setup fällt auf: **MTA-STS** (RFC 8461) prüft `mta-sts.<domain>`
+  (CNAME/A/AAAA) und die Policy-TXT unter `_mta-sts.<domain>`, ruft
+  zusätzlich die tatsächliche Policy-Datei per HTTPS unter
+  `https://mta-sts.<domain>/.well-known/mta-sts.txt` ab (anbieterunabhängig,
+  kein Rückgriff auf eine bestimmte Hosting-API/Statusseite - siehe
+  [Konfiguration](#konfiguration) oben zu CaptainDNS) und meldet, ob sie
+  tatsächlich erreichbar ist und mit `version: STSv1` beginnt. **TLS-RPT-DNS**
+  prüft den `_smtp._tls.<domain>`-TXT-Eintrag (`v=TLSRPTv1; rua=...`), der
+  ankündigt, wohin TLS-RPT-Reports gehen sollen. **Wildcard-SPF** prüft einen
+  `*.<domain>`-TXT-Eintrag als Schutz vor Phishing über nicht existierende
+  Subdomains. `--json` gibt strukturierte Ausgabe statt der Tabelle aus -
+  für das "DNS prüfen…"-Fenster in der Menüleisten-App gedacht, funktioniert
+  aber genauso von Hand im Terminal.
 
 Logs: `~/Library/Application Support/dmarcwatch/dmarcwatch.log` (0600,
 keine Zugangsdaten, keine vollständigen Mailadressen).
@@ -464,7 +508,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-175 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+212 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
