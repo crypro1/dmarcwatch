@@ -131,7 +131,7 @@ struct SetupView: View {
             }
         }
         .padding(20)
-        .frame(width: 480, height: 560)
+        .frame(width: 520, height: 580)
         // Wie beim WHOIS-Knopf im Menü: DNS-Abfrage geht wirklich nach
         // außen, deshalb erst nach expliziter Bestätigung, nie automatisch
         // beim Eintippen der Domain.
@@ -147,8 +147,11 @@ struct SetupView: View {
         }
     }
 
-    /// Eine Gruppe von Feldern mit gemeinsamer Überschrift - rein visuell,
-    /// kein Form-Section mit eigener Spaltenlogik.
+    /// Eine Gruppe von Feldern mit gemeinsamer Überschrift, als abgesetzte
+    /// Karte (wie die gruppierten Boxen in System Settings.app seit
+    /// Ventura) statt reiner Überschrift-mit-Einzug - rein visuell über
+    /// background/overlay auf dem bestehenden VStack, KEIN Form/Section
+    /// (siehe Kommentar oben zu den zwei echten Layout-Bugs damit).
     @ViewBuilder
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -157,6 +160,16 @@ struct SetupView: View {
                 .foregroundStyle(.secondary)
             content()
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5)
+        )
     }
 
     /// Label über dem Feld statt daneben - vermeidet jede Spaltenbreiten-

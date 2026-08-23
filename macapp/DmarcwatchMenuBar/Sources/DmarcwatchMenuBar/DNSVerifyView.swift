@@ -40,15 +40,14 @@ struct DNSVerifyView: View {
                         .padding(.horizontal, 20)
                 } else {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 20) {
-                            // Trennlinie nur ZWISCHEN Domains, nicht nach der
-                            // letzten (sonst hängt sie vor dem
-                            // "Schließen"-Knopf frei in der Luft).
-                            ForEach(Array(viewModel.results.enumerated()), id: \.element.domain) { index, result in
+                        // Jede Domain jetzt eine eigene Karte (siehe
+                        // domainSection()/group() unten) statt nur einer
+                        // Trennlinie zwischen ihnen - die Karte selbst trennt
+                        // schon klar genug, eine zusätzliche Divider() wäre
+                        // doppelt gemoppelt.
+                        VStack(alignment: .leading, spacing: 16) {
+                            ForEach(viewModel.results, id: \.domain) { result in
                                 domainSection(result)
-                                if index < viewModel.results.count - 1 {
-                                    Divider()
-                                }
                             }
                         }
                         .padding(.leading, 20)
@@ -66,12 +65,12 @@ struct DNSVerifyView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 640, height: 620)
+        .frame(width: 640, height: 720)
     }
 
     @ViewBuilder
     private func domainSection(_ result: DomainVerificationResponse) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 11) {
             Text(result.domain)
                 .font(.title3.bold())
 
@@ -164,6 +163,16 @@ struct DNSVerifyView: View {
                 }
             }
         }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5)
+        )
     }
 
     @ViewBuilder
