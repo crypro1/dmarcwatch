@@ -119,7 +119,7 @@ kommt aus `generate_icon.swift` - nur bei Bedarf neu auszuführen, falls
 sich das Icon mal ändern soll (siehe Kommentar im Skript). Erfordert
 macOS 13 (Ventura) oder neuer.
 
-Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
+Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
 
 - **Einstellungen…** öffnet ein natives Formular für IMAP-Server/Login/
   Passwort/Ordner, eigene Domain(s), eigene Sende-Netze und die Uhrzeit des
@@ -135,15 +135,16 @@ Vier Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   CIDR-Bereiche vor - inklusive `include:`/`redirect=`/`a`/`mx`-Auflösung,
   mit dem RFC-7208-Lookup-Limit von 10 gegen kaputte oder böswillig
   verschachtelte Records abgesichert (siehe `spf.py`). Der Vorschlag landet
-  nur im Textfeld, nichts wird ungesehen gespeichert.
-- **Bei Anmeldung starten** registriert die App selbst als Login-Item über
-  `SMAppService` (`LoginItemManager.swift`), statt wie früher über eine von
-  `dmarcwatch setup` installierte LaunchAgent-plist. Vorteil: System
-  Settings > Anmeldeobjekte zeigt das echte App-Icon statt eines
-  generischen Platzhalters (plist-basierte LaunchAgents bekommen dort
-  grundsätzlich nur ein Platzhalter-Icon, unabhängig vom Ziel-Bundle).
-  Nachteil gegenüber der alten Lösung: kein automatischer Neustart bei
-  einem Absturz - für ein reines Anzeige-Utility hinnehmbar.
+  nur im Textfeld, nichts wird ungesehen gespeichert. Der Schalter
+  **"Automatisch bei Anmeldung starten"** registriert die App selbst als
+  Login-Item über `SMAppService` (`LoginItemManager.swift`), statt wie
+  früher über eine von `dmarcwatch setup` installierte LaunchAgent-plist -
+  wirkt sofort, nicht erst nach "Speichern". Vorteil: System Settings >
+  Anmeldeobjekte zeigt das echte App-Icon statt eines generischen
+  Platzhalters (plist-basierte LaunchAgents bekommen dort grundsätzlich nur
+  ein Platzhalter-Icon, unabhängig vom Ziel-Bundle). Nachteil gegenüber der
+  alten Lösung: kein automatischer Neustart bei einem Absturz - für ein
+  reines Anzeige-Utility hinnehmbar.
 - **WHOIS abrufen…** erscheint im Untermenü eines auffälligen Records ohne
   gecachten WHOIS-Eintrag. Fragt vor der eigentlichen Abfrage per Dialog
   nach ("Fragt die Organisation hinter \<IP\> bei rdap.org ab - das
