@@ -111,12 +111,23 @@ struct DNSVerifyView: View {
                 }
                 ForEach(result.dkim, id: \.selector) { dkim in
                     VStack(alignment: .leading, spacing: 2) {
+                        let selectorLabel = dkim.selector + (dkim.keyType.map { " (\($0))" } ?? "")
                         HStack(spacing: 4) {
+                            // Das Icon ist die einzige visuelle Stelle, die
+                            // gefunden/nicht gefunden zeigt (kein Textwort
+                            // dafür daneben) - ohne accessibilityHidden
+                            // würde VoiceOver nur den rohen SF-Symbol-Namen
+                            // vorlesen ("Haken Kreis") statt eines
+                            // verständlichen Zustands. Das Label unten
+                            // ersetzt das durch ein echtes Wort.
                             Image(systemName: dkim.exists ? "checkmark.circle" : "exclamationmark.triangle.fill")
                                 .foregroundStyle(dkim.exists ? Color.secondary : Color.orange)
-                            Text(dkim.selector + (dkim.keyType.map { " (\($0))" } ?? ""))
+                                .accessibilityHidden(true)
+                            Text(selectorLabel)
                                 .font(.callout)
                         }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("\(selectorLabel), \(dkim.exists ? "gefunden" : "nicht gefunden")")
                         warnings(dkim.warnings)
                     }
                 }
@@ -191,6 +202,10 @@ struct DNSVerifyView: View {
                 .textSelection(.enabled)
         }
         .font(.callout)
+        // Ohne das liest VoiceOver Label und Wert als zwei getrennte
+        // Stopps ("Policy:" - Pause - "quarantine") statt eines
+        // zusammenhängenden Satzes.
+        .accessibilityElement(children: .combine)
     }
 
     /// Grüne/rote Pille für den Ergebnis-Kurzstatus - Ergebnis eines
@@ -218,6 +233,10 @@ struct DNSVerifyView: View {
                     .foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // Gleicher Grund wie bei detail() oben - sonst liest VoiceOver
+            // "Warnzeichen" und den eigentlichen Text als zwei getrennte
+            // Stopps statt einer zusammenhängenden Warnung.
+            .accessibilityElement(children: .combine)
         }
     }
 }

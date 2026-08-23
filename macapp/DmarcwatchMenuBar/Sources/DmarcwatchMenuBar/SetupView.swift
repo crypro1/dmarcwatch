@@ -178,8 +178,13 @@ struct SetupView: View {
     private func field(_ label: String, text: Binding<String>, hint: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label).font(.callout)
+            // Ohne dieses Label liest VoiceOver hier nur "Textfeld" vor -
+            // der leere Platzhalter ("") in TextField selbst reicht dafür
+            // nicht, das sichtbare Text(label) darüber ist rein visuell
+            // ohne diese explizite Verknüpfung.
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityLabel(label)
             if let hint {
                 Text(hint)
                     .font(.caption)
@@ -194,6 +199,7 @@ struct SetupView: View {
             Text(label).font(.callout)
             SecureField("", text: text)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityLabel(label)
             if let hint {
                 Text(hint)
                     .font(.caption)

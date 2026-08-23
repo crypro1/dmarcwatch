@@ -7,9 +7,10 @@ Datenbank und zeigt Auffälligkeiten in einer nativen Menüleisten-App
 (`enable_tls_rpt`) wertet dmarcwatch zusätzlich SMTP-TLS-RPT-Reports
 (RFC 8460) aus einem separaten IMAP-Ordner aus.
 
-Keine Cloud, kein Konto, kein Dritter. Der einzige Netzwerkverkehr, den
-dmarcwatch erzeugt, ist die IMAP-Verbindung zum konfigurierten Host (plus,
-nur auf ausdrücklichen Klick/Flag hin, eine einzelne WHOIS-Abfrage - siehe
+Keine Cloud, kein Konto, kein Dritter. Im automatischen Betrieb erzeugt
+dmarcwatch ausschließlich die IMAP-Verbindung zum konfigurierten Host -
+einzelne DNS-/WHOIS-Abfragen kommen nur auf ausdrücklichen Klick oder
+CLI-Flag hin dazu, nie automatisch im Hintergrund (siehe
 [Sicherheitsentscheidungen](#sicherheitsentscheidungen)).
 
 ## Inhalt
@@ -158,8 +159,9 @@ Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
 - **DNS prüfen…** öffnet nach Bestätigung im Dialog ein Fenster mit dem
   Ergebnis von `dmarcwatch verify-dns --json` für alle konfigurierten
   `own_domains` - DMARC/SPF/DKIM/MTA-STS/TLS-RPT-DNS/Wildcard-SPF-Gültigkeit
-  und Fehlkonfigurationen, siehe [`verify-dns`](#befehle) unten. Reine
-  Diagnose, verändert nichts. Die Unterzeile unter "DNS prüfen…" zeigt immer
+  und Fehlkonfigurationen sowie eine Spamhaus-Prüfung der eigenen
+  MX-Server, siehe [`verify-dns`](#befehle) unten. Reine Diagnose,
+  verändert nichts. Die Unterzeile unter "DNS prüfen…" zeigt immer
   den Zeitpunkt und das Ergebnis der letzten Prüfung (auch vom periodischen
   automatischen Check, siehe `enable_auto_dns_check` in der
   [Konfiguration](#konfiguration)), nicht nur von einem manuellen Klick.
@@ -488,9 +490,10 @@ schon einer erfolgreich lief. "Jetzt abrufen" im Menü und ein von Hand
 getipptes `dmarcwatch fetch` lassen das Flag bewusst weg und prüfen immer
 tatsächlich.
 
-Die Menüleisten-App installiert **keine** eigene launchd-plist mehr -
-"Bei Anmeldung starten" in ihrem Menü registriert stattdessen die App
-selbst über `SMAppService` (siehe Abschnitt oben). `dmarcwatch setup
+Die Menüleisten-App installiert **keine** eigene launchd-plist mehr - der
+Schalter "Automatisch bei Anmeldung starten" in den Einstellungen
+registriert stattdessen die App selbst über `SMAppService` (siehe
+Abschnitt oben). `dmarcwatch setup
 --remove-menubar-agent` bleibt als reine Migrationshilfe erhalten, um eine
 noch aus einer älteren Version vorhandene `local.dmarcwatch.menubar.plist`
 zu entfernen.
