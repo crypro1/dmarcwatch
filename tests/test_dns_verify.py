@@ -12,16 +12,25 @@ import subprocess
 from unittest.mock import patch
 
 from dmarcwatch.dns_verify import (
+    _BIMI_MAX_SVG_SIZE_BYTES,
+    BIMICheckResult,
+    DANECheckResult,
     DKIMCheckResult,
     DMARCCheckResult,
+    DNSSECCheckResult,
     DomainVerification,
     MTASTSCheckResult,
     MXBlacklistCheckResult,
     TLSRPTDNSCheckResult,
     WildcardSPFCheckResult,
+    _fetch_bimi_logo,
     _fetch_mta_sts_policy,
+    _validate_bimi_svg,
+    check_bimi,
+    check_dane,
     check_dkim,
     check_dmarc,
+    check_dnssec,
     check_mta_sts,
     check_mx_blacklist,
     check_tlsrpt_dns,
@@ -182,6 +191,9 @@ def _clean_result(domain: str = "example.com") -> DomainVerification:
         tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
         wildcard_spf=WildcardSPFCheckResult(configured=False),
         mx_blacklist=MXBlacklistCheckResult(checked=False),
+        dnssec=DNSSECCheckResult(configured=False),
+        dane=DANECheckResult(configured=False),
+        bimi=BIMICheckResult(configured=False),
     )
 
 
@@ -218,6 +230,24 @@ def test_has_warnings_true_for_dkim_warning():
 def test_has_warnings_true_for_mx_blacklist_warning():
     result = _clean_result()
     result.mx_blacklist.warnings.append("Mailserver mail.example.com (198.51.100.5) ist bei Spamhaus ZEN gelistet")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_dnssec_warning():
+    result = _clean_result()
+    result.dnssec.warnings.append("DNSSEC-Validierung schlägt fehl")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_dane_warning():
+    result = _clean_result()
+    result.dane.warnings.append("TLSA vorhanden, aber DNSSEC validiert nicht")
+    assert has_warnings(result) is True
+
+
+def test_has_warnings_true_for_bimi_warning():
+    result = _clean_result()
+    result.bimi.warnings.append("BIMI ohne durchgesetzte DMARC-Policy")
     assert has_warnings(result) is True
 
 
@@ -508,3 +538,281 @@ def test_check_mx_blacklist_query_error_warns_without_crashing():
     assert result.checked is True
     assert result.listed == []
     assert any("fehlgeschlagen" in w for w in result.warnings)
+
+
+# --- check_dnssec() ---
+
+
+def _dig_full_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+_VALIDATED_FLAGS = _dig_full_result(";; flags: qr rd ra ad; QUERY: 1, ANSWER: 3, AUTHORITY: 0, ADDITIONAL: 1\n")
+_UNVALIDATED_FLAGS = _dig_full_result(";; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1\n")
+
+
+def test_check_dnssec_absent_is_not_configured_no_warning():
+    with patch("dmarcwatch.dns_verify._dig", return_value=[]):
+        result = check_dnssec("example.com")
+    assert result.configured is False
+    assert result.validated is None
+    assert result.warnings == []
+
+
+def test_check_dnssec_fully_configured_and_validated_no_warning():
+    def fake_dig(record_type, name):
+        if record_type == "DNSKEY":
+            return ["257 3 13 abcd=="]
+        if record_type == "DS":
+            return ["2371 13 2 abcd"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_VALIDATED_FLAGS):
+            result = check_dnssec("example.com")
+    assert result.configured is True
+    assert result.validated is True
+    assert result.warnings == []
+
+
+def test_check_dnssec_ds_without_dnskey_warns():
+    def fake_dig(record_type, name):
+        if record_type == "DS":
+            return ["2371 13 2 abcd"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_UNVALIDATED_FLAGS):
+            result = check_dnssec("example.com")
+    assert result.configured is True
+    assert any("kein DNSKEY gefunden" in w for w in result.warnings)
+
+
+def test_check_dnssec_dnskey_without_ds_warns():
+    def fake_dig(record_type, name):
+        if record_type == "DNSKEY":
+            return ["257 3 13 abcd=="]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_UNVALIDATED_FLAGS):
+            result = check_dnssec("example.com")
+    assert result.configured is True
+    assert any("kein DS-Eintrag" in w for w in result.warnings)
+
+
+def test_check_dnssec_validation_fails_warns():
+    """Regressionstest für den echten dnssec-failed.org-Fall: DS vorhanden,
+    aber die Kette validiert nicht - z. B. abgelaufene Signatur."""
+
+    def fake_dig(record_type, name):
+        if record_type == "DNSKEY":
+            return ["257 3 13 abcd=="]
+        if record_type == "DS":
+            return ["2371 13 2 abcd"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_UNVALIDATED_FLAGS):
+            result = check_dnssec("example.com")
+    assert result.configured is True
+    assert result.validated is False
+    assert any("Vertrauenskette ist" in w for w in result.warnings)
+
+
+def test_check_dnssec_validation_query_error_warns():
+    def fake_dig(record_type, name):
+        if record_type == "DNSKEY":
+            return ["257 3 13 abcd=="]
+        if record_type == "DS":
+            return ["2371 13 2 abcd"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="dig", timeout=3)):
+            result = check_dnssec("example.com")
+    assert result.configured is True
+    assert result.validated is None
+    assert any("nicht geprüft werden" in w for w in result.warnings)
+
+
+# --- check_dane() ---
+
+
+def test_check_dane_no_mx_not_configured():
+    with patch("dmarcwatch.dns_verify._dig", return_value=[]):
+        result = check_dane("example.com")
+    assert result.configured is False
+    assert result.warnings == []
+
+
+def test_check_dane_mx_without_tlsa_not_configured():
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail.example.com."]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        result = check_dane("example.com")
+    assert result.configured is False
+
+
+def test_check_dane_with_tlsa_and_validated_dnssec_no_warning():
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail.example.com."]
+        if record_type == "TLSA" and name == "_25._tcp.mail.example.com":
+            return ["3 1 1 abcd"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_VALIDATED_FLAGS):
+            result = check_dane("example.com")
+    assert result.configured is True
+    assert result.mx_hosts_with_tlsa == ["mail.example.com"]
+    assert result.warnings == []
+
+
+def test_check_dane_tlsa_without_validated_dnssec_warns():
+    """TLSA ohne intaktes DNSSEC bietet keinen echten Schutz - siehe
+    DANECheckResult-Docstring."""
+
+    def fake_dig(record_type, name):
+        if record_type == "MX" and name == "example.com":
+            return ["10 mail.example.com."]
+        if record_type == "TLSA" and name == "_25._tcp.mail.example.com":
+            return ["3 1 1 abcd"]
+        return []
+
+    with patch("dmarcwatch.dns_verify._dig", side_effect=fake_dig):
+        with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_UNVALIDATED_FLAGS):
+            result = check_dane("example.com")
+    assert result.configured is True
+    assert any("DNSSEC validiert" in w for w in result.warnings)
+
+
+# --- check_bimi() ---
+
+
+def _dmarc_enforced() -> DMARCCheckResult:
+    return DMARCCheckResult(exists=True, record="v=DMARC1; p=reject", policy="reject", pct=100)
+
+
+def _dmarc_none() -> DMARCCheckResult:
+    return DMARCCheckResult(exists=True, record="v=DMARC1; p=none", policy="none")
+
+
+def test_check_bimi_absent_is_not_configured_no_warning():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=[]):
+        result = check_bimi("example.com", _dmarc_enforced())
+    assert result.configured is False
+    assert result.warnings == []
+
+
+def test_check_bimi_valid_with_enforced_dmarc_no_warning():
+    record = "v=BIMI1; l=https://example.com/logo.svg; a=https://example.com/vmc.pem"
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=[record]):
+        with patch(
+            "dmarcwatch.dns_verify._fetch_bimi_logo",
+            return_value=("<svg baseProfile=\"tiny-ps\"></svg>", True, []),
+        ):
+            result = check_bimi("example.com", _dmarc_enforced())
+    assert result.configured is True
+    assert result.logo_reachable is True
+    assert result.warnings == []
+
+
+def test_check_bimi_missing_logo_tag_warns():
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=["v=BIMI1; a=https://example.com/vmc.pem"]):
+        result = check_bimi("example.com", _dmarc_enforced())
+    assert any("l=" in w for w in result.warnings)
+
+
+def test_check_bimi_without_enforced_dmarc_warns():
+    record = "v=BIMI1; l=https://example.com/logo.svg"
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=[record]):
+        with patch("dmarcwatch.dns_verify._fetch_bimi_logo", return_value=(None, None, [])):
+            result = check_bimi("example.com", _dmarc_none())
+    assert any("nicht vollständig durchgesetzt" in w for w in result.warnings)
+
+
+def test_check_bimi_pct_below_100_warns():
+    record = "v=BIMI1; l=https://example.com/logo.svg"
+    dmarc = DMARCCheckResult(exists=True, record="v=DMARC1; p=reject; pct=50", policy="reject", pct=50)
+    with patch("dmarcwatch.dns_verify._txt_records", return_value=[record]):
+        with patch("dmarcwatch.dns_verify._fetch_bimi_logo", return_value=(None, None, [])):
+            result = check_bimi("example.com", dmarc)
+    assert any("nicht vollständig durchgesetzt" in w for w in result.warnings)
+
+
+# --- _fetch_bimi_logo() / _validate_bimi_svg() ---
+
+
+_VALID_BIMI_SVG = (
+    '<?xml version="1.0"?>'
+    '<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny-ps" '
+    'viewBox="0 0 100 100"><title>Example</title>'
+    '<rect x="0" y="0" width="100" height="100" fill="#000"/></svg>'
+).encode()
+
+
+def test_fetch_bimi_logo_rejects_non_https():
+    svg, reachable, warnings = _fetch_bimi_logo("http://example.com/logo.svg")
+    assert svg is None
+    assert reachable is False
+    assert any("HTTPS" in w for w in warnings)
+
+
+def test_fetch_bimi_logo_valid_svg_no_warnings():
+    fake_response = _FakeHTTPResponse(200, _VALID_BIMI_SVG)
+    with patch("dmarcwatch.dns_verify.urllib.request.urlopen", return_value=fake_response):
+        svg, reachable, warnings = _fetch_bimi_logo("https://example.com/logo.svg")
+    assert reachable is True
+    assert svg is not None
+    assert warnings == []
+
+
+def test_validate_bimi_svg_missing_base_profile_warns():
+    svg = _VALID_BIMI_SVG.decode().replace('baseProfile="tiny-ps"', "").encode()
+    warnings = _validate_bimi_svg(svg)
+    assert any("baseProfile" in w for w in warnings)
+
+
+def test_validate_bimi_svg_missing_title_warns():
+    svg = _VALID_BIMI_SVG.decode().replace("<title>Example</title>", "").encode()
+    warnings = _validate_bimi_svg(svg)
+    assert any("<title>" in w for w in warnings)
+
+
+def test_validate_bimi_svg_forbidden_script_element_warns():
+    svg = _VALID_BIMI_SVG.decode().replace("</svg>", "<script>alert(1)</script></svg>").encode()
+    warnings = _validate_bimi_svg(svg)
+    assert any("script" in w for w in warnings)
+
+
+def test_validate_bimi_svg_external_reference_warns():
+    svg = (
+        '<?xml version="1.0"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'version="1.2" baseProfile="tiny-ps" viewBox="0 0 100 100"><title>Example</title>'
+        '<use xlink:href="https://evil.example/x.svg#a"/></svg>'
+    ).encode()
+    warnings = _validate_bimi_svg(svg)
+    assert any("externe Ressource" in w for w in warnings)
+
+
+def test_validate_bimi_svg_non_square_warns():
+    svg = _VALID_BIMI_SVG.decode().replace('viewBox="0 0 100 100"', 'viewBox="0 0 100 50"').encode()
+    warnings = _validate_bimi_svg(svg)
+    assert any("quadratisch" in w for w in warnings)
+
+
+def test_validate_bimi_svg_too_large_warns():
+    padding = " " * (_BIMI_MAX_SVG_SIZE_BYTES + 100)
+    svg = _VALID_BIMI_SVG.decode().replace("<title>", f"<title>{padding}", 1).encode()
+    warnings = _validate_bimi_svg(svg)
+    assert any("32" in w or "Byte" in w for w in warnings)
+
+
+def test_validate_bimi_svg_valid_has_no_warnings():
+    assert _validate_bimi_svg(_VALID_BIMI_SVG) == []

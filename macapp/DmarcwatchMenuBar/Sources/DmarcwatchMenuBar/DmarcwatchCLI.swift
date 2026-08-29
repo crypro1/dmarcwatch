@@ -209,6 +209,33 @@ enum DmarcwatchCLI {
         }
     }
 
+    /// Statistik-Fenster (siehe StatsWindowController/StatsView) - reines
+    /// Lesen der lokalen DB wie tls-report/menubar-json, kein Netzzugriff,
+    /// deshalb ohne Bestaetigungsdialog beim Oeffnen.
+    static func runStats(days: Int, completion: @escaping (Result<StatsResponse, Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try run(arguments: ["stats", "--json", "--days", "\(days)"])
+                guard result.exitCode == 0 else {
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.processFailed(result.exitCode, result.stderr)))
+                    }
+                    return
+                }
+                guard let data = result.stdout.data(using: .utf8) else {
+                    DispatchQueue.main.async {
+                        completion(.failure(CLIError.decodingFailed("Ausgabe war kein gültiges UTF-8")))
+                    }
+                    return
+                }
+                let decoded = try JSONDecoder().decode(StatsResponse.self, from: data)
+                DispatchQueue.main.async { completion(.success(decoded)) }
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+
     /// Nutzerausgeloeste SPF-Aufloesung fuer den "Aus SPF ermitteln"-Knopf im
     /// Setup-Fenster - erst nach Bestaetigung im Dialog (siehe
     /// SetupView.swift). Loest jede Domain einzeln auf und vereinigt die

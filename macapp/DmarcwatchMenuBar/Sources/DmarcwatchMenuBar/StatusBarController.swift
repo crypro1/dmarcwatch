@@ -118,6 +118,10 @@ final class StatusBarController: NSObject {
         }
     }
 
+    @objc private func openStats(_ sender: Any?) {
+        StatsWindowController.shared.show()
+    }
+
     // Reine UI-Präferenz (kein Sicherheits-/Konfigurationswert), deshalb in
     // UserDefaults statt in config.json - "Nicht mehr fragen" unten setzt
     // das einmalig, ohne den Python-CLI-Umweg für ein reines Anzeigedetail.
@@ -293,11 +297,15 @@ final class StatusBarController: NSObject {
                     )
                 )
             }
-            if hasTLSData {
+            // Gleiches Muster wie exclamationmark.triangle.fill oben - nur
+            // bei tatsächlichen Fehlschlägen zeigen, nicht schon bei bloß
+            // vorhandenen TLS-RPT-Daten (die Statusleiste ist sonst voller
+            // "0", obwohl gar nichts auffällig ist).
+            if hasTLSData, let failureCount = tlsReport?.totalFailureCount, failureCount > 0 {
                 title.append(NSAttributedString(string: "  "))
                 title.append(
                     Self.iconText(
-                        symbol: "key.fill", count: tlsReport?.totalFailureCount ?? 0, targetHeight: iconHeight
+                        symbol: "key.fill", count: failureCount, targetHeight: iconHeight
                     )
                 )
             }
@@ -450,6 +458,14 @@ final class StatusBarController: NSObject {
         for domainResult in dnsWarnedDomains {
             menu.addItem(dnsDomainMenuItem(domainResult))
         }
+
+        // Reines Lesen der lokalen DB wie "TLS-RPT-Bericht…"/menubar-json,
+        // deshalb ohne Bestätigungsdialog (anders als "DNS prüfen…", das
+        // tatsächlich nach außen geht).
+        let statsItem = NSMenuItem(title: "Statistik…", action: #selector(openStats(_:)), keyEquivalent: "")
+        statsItem.image = Self.symbol("chart.line.uptrend.xyaxis")
+        statsItem.target = self
+        menu.addItem(statsItem)
 
         let setupItem = NSMenuItem(title: "Einstellungen…", action: #selector(openSetup(_:)), keyEquivalent: ",")
         setupItem.image = Self.symbol("gearshape")
@@ -720,6 +736,15 @@ final class StatusBarController: NSObject {
         }
         for warning in result.mxBlacklist.warnings {
             submenu.addItem(disabledDetailLine("Spamhaus", warning))
+        }
+        for warning in result.dnssec.warnings {
+            submenu.addItem(disabledDetailLine("DNSSEC", warning))
+        }
+        for warning in result.dane.warnings {
+            submenu.addItem(disabledDetailLine("DANE", warning))
+        }
+        for warning in result.bimi.warnings {
+            submenu.addItem(disabledDetailLine("BIMI", warning))
         }
         item.submenu = submenu
         return item

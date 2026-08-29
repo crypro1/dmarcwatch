@@ -578,7 +578,7 @@ def query_records(
         SELECT r.id, r.source_ip, r.count, r.disposition, r.dkim_result, r.spf_result,
                r.header_from, r.envelope_to, r.envelope_from, r.is_own_ip, r.is_flagged,
                r.flag_reasons, rep.org_name, rep.report_id, rep.domain, rep.date_begin,
-               rep.date_end
+               rep.date_end, rep.policy_p, rep.policy_pct
         FROM records r
         JOIN reports rep ON rep.id = r.report_id
         WHERE rep.date_end >= ? AND rep.date_begin <= ?

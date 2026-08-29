@@ -173,6 +173,54 @@ struct DNSVerifyView: View {
                     warnings(result.mxBlacklist.warnings)
                 }
             }
+
+            if result.dnssec.configured {
+                group("DNSSEC") {
+                    if let validated = result.dnssec.validated {
+                        statusPill(label: validated ? "DNSSEC gültig" : "DNSSEC ungültig", isUp: validated)
+                    }
+                    warnings(result.dnssec.warnings)
+                }
+            }
+
+            if result.dane.configured {
+                group("DANE/TLSA") {
+                    detail("MX mit TLSA", result.dane.mxHostsWithTlsa.joined(separator: ", "))
+                    // Keine eigene "validated"-Angabe wie bei DNSSEC - die
+                    // Pille leitet sich direkt aus warnings ab (leer heißt
+                    // hier: TLSA vorhanden UND DNSSEC validiert für alle
+                    // betroffenen Hosts, siehe dns_verify.py:check_dane).
+                    statusPill(
+                        label: result.dane.warnings.isEmpty ? "DANE abgesichert" : "DANE eingeschränkt",
+                        isUp: result.dane.warnings.isEmpty
+                    )
+                    warnings(result.dane.warnings)
+                }
+            }
+
+            if result.bimi.configured {
+                group("BIMI") {
+                    detail("Eintrag", result.bimi.record ?? "-")
+                    // NSImage rendert SVG-Daten direkt (empirisch mit dem
+                    // echten BIMI-Logo geprüft) - so lässt sich tatsächlich
+                    // sehen, ob das richtige Logo hinterlegt ist, statt nur
+                    // die rohe URL zu lesen.
+                    if let logoSvg = result.bimi.logoSvg,
+                       let data = logoSvg.data(using: .utf8),
+                       let nsImage = NSImage(data: data) {
+                        Image(nsImage: nsImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 48, height: 48)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    } else if result.bimi.logoReachable == false {
+                        Text("Logo-Datei nicht erreichbar oder ungültig.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    warnings(result.bimi.warnings)
+                }
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)

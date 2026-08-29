@@ -5,7 +5,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from .anomaly import REASON_LABELS_DE
+from .anomaly import REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
 from .sanitize import sanitize_field
 from .store import query_records, query_tls_failure_details, query_tls_policies
 
@@ -29,6 +29,12 @@ class ReportRow:
     envelope_to: str
     is_flagged: bool
     flag_reasons: list[str]
+    # Defaults statt Pflichtfelder, damit bestehende Test-Fixtures ohne
+    # DMARC-Policy-Kontext (die meisten) unverändert weiterlaufen - nur
+    # für die Verschärfungs-Einschätzung in stats.py gebraucht.
+    domain: str = ""
+    policy_p: str = ""
+    policy_pct: int = 100
 
 
 def collect_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list[ReportRow]:
@@ -48,6 +54,9 @@ def collect_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list
                 envelope_to=r["envelope_to"] or "",
                 is_flagged=bool(r["is_flagged"]),
                 flag_reasons=reasons,
+                domain=r["domain"],
+                policy_p=r["policy_p"],
+                policy_pct=r["policy_pct"],
             )
         )
     return result
@@ -278,4 +287,215 @@ def to_tls_json_dict(rows: list[TLSPolicyRow], days: int) -> dict:
         "days": days,
         "total_failure_count": sum(r.failure_count for r in rows),
         "policies": policies,
+    }
+
+
+@dataclass
+class DayStat:
+    date: str
+    clean_count: int
+    flagged_count: int
+
+
+def collect_daily_stats(rows: list[ReportRow]) -> list[DayStat]:
+    """Pro Tag saubere/auffällige Zahl, chronologisch aufsteigend (älteste
+    zuerst) statt wie collect_rows() rückwärts - für eine Trendlinie von
+    links nach rechts statt einer Liste mit dem neuesten Eintrag oben."""
+    by_day: dict[str, list[ReportRow]] = {}
+    for r in rows:
+        day = time.strftime("%Y-%m-%d", time.gmtime(r.date_begin))
+        by_day.setdefault(day, []).append(r)
+
+    result = []
+    for day in sorted(by_day.keys()):
+        day_rows = by_day[day]
+        flagged = sum(1 for r in day_rows if r.is_flagged)
+        result.append(DayStat(date=day, clean_count=len(day_rows) - flagged, flagged_count=flagged))
+    return result
+
+
+@dataclass
+class TLSDayStat:
+    date: str
+    successful_count: int
+    failure_count: int
+
+
+def collect_tls_daily_stats(tls_rows: list[TLSPolicyRow]) -> list[TLSDayStat]:
+    """Pro Tag erfolgreiche/fehlgeschlagene TLS-Sitzungen, chronologisch
+    aufsteigend - Pendant zu collect_daily_stats() für TLS-RPT statt DMARC."""
+    by_day: dict[str, list[TLSPolicyRow]] = {}
+    for r in tls_rows:
+        day = time.strftime("%Y-%m-%d", time.gmtime(r.date_begin))
+        by_day.setdefault(day, []).append(r)
+
+    result = []
+    for day in sorted(by_day.keys()):
+        day_rows = by_day[day]
+        result.append(
+            TLSDayStat(
+                date=day,
+                successful_count=sum(r.successful_session_count for r in day_rows),
+                failure_count=sum(r.failure_count for r in day_rows),
+            )
+        )
+    return result
+
+
+@dataclass
+class DMARCReadiness:
+    """Einschätzung pro Domain, ob eine Verschärfung der DMARC-Policy
+    (Richtung reject) im Beobachtungszeitraum sicher gewesen wäre - keine
+    Empfehlung, nur ein Blick auf bereits vorhandene Reports, nichts wird
+    automatisch geändert.
+
+    ready_for_reject prüft bewusst NICHT auf unbekannte IPs (unknown_ip) -
+    das sind potenzielle Spoofing-Versuche, genau die soll eine schärfere
+    Policy ja blockieren. Blockierend ist own_ip_auth_failures: bekannte,
+    eigene Sende-IPs, die an SPF/DKIM scheitern - die würde eine
+    schärfere Policy zusätzlich zu den eigentlichen Spoofing-Versuchen mit
+    ausblenden. Zusätzlich muss der Beobachtungszeitraum zum tatsächlichen
+    Sendevolumen passen (siehe _recommended_observation_days) - bei sehr
+    wenig Sendevolumen tauchen seltene, aber echte eigene Absender
+    (monatliche Rechnungen, Newsletter, ...) in einem kurzen Fenster u. U.
+    gar nicht auf, ein "0 Fehlschläge"-Ergebnis wäre dann nicht wirklich
+    aussagekräftig, auch wenn es technisch stimmt."""
+
+    domain: str
+    current_policy: str | None
+    current_pct: int | None
+    total_count: int
+    unknown_ip_failures: int
+    own_ip_auth_failures: int
+    avg_daily_volume: float
+    recommended_observation_days: int
+    observed_days: int
+    ready_for_reject: bool
+
+
+def _recommended_observation_days(avg_daily_volume: float) -> int:
+    """Grobe, aber nach Sendevolumen gestaffelte Richtwerte für die nötige
+    Mindestbeobachtungsdauer vor einer Verschärfung (DMARC Richtung
+    reject, MTA-STS Richtung enforce) - kein fester Wert für alle, ein
+    Postfach mit wenigen Mails pro Tag braucht deutlich länger, um
+    Vertrauen zu rechtfertigen, als eines mit hohem täglichem Volumen."""
+    if avg_daily_volume < 1:
+        return 60
+    if avg_daily_volume < 5:
+        return 30
+    return 14
+
+
+def compute_dmarc_readiness(rows: list[ReportRow], days: int) -> list[DMARCReadiness]:
+    by_domain: dict[str, list[ReportRow]] = {}
+    for r in rows:
+        if r.domain:
+            by_domain.setdefault(r.domain, []).append(r)
+
+    result = []
+    for domain, domain_rows in by_domain.items():
+        latest = max(domain_rows, key=lambda r: r.date_begin)
+        unknown_ip = sum(1 for r in domain_rows if REASON_UNKNOWN_IP in r.flag_reasons)
+        own_ip_fail = sum(1 for r in domain_rows if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons)
+        avg_daily = len(domain_rows) / days if days > 0 else 0.0
+        recommended_days = _recommended_observation_days(avg_daily)
+        result.append(
+            DMARCReadiness(
+                domain=domain,
+                current_policy=latest.policy_p or None,
+                current_pct=latest.policy_pct,
+                total_count=len(domain_rows),
+                unknown_ip_failures=unknown_ip,
+                own_ip_auth_failures=own_ip_fail,
+                avg_daily_volume=avg_daily,
+                recommended_observation_days=recommended_days,
+                observed_days=days,
+                ready_for_reject=(
+                    own_ip_fail == 0 and latest.policy_p != "reject" and days >= recommended_days
+                ),
+            )
+        )
+    return result
+
+
+@dataclass
+class MTASTSReadiness:
+    """Einschätzung, ob eine Verschärfung von MTA-STS (mode=testing auf
+    mode=enforce) im Beobachtungszeitraum sicher gewesen wäre, basierend
+    auf bereits gespeicherten TLS-RPT-Reports - keine Live-DNS-/HTTPS-
+    Abfrage, `stats` bleibt dadurch ein reiner, lokaler Lesebefehl wie
+    `report`/`tls-report`. has_data ist False, wenn im Zeitraum gar keine
+    TLS-RPT-Reports vorliegen (z. B. enable_tls_rpt aus) - dann lässt sich
+    nichts einschätzen, das ist kein "bereit". Gleiche
+    Sendevolumen-Staffelung wie bei DMARC (siehe
+    _recommended_observation_days) - wenige TLS-Sitzungen pro Tag
+    bedeuten, dass ein kurzes "0 Fehlschläge"-Fenster noch nicht viele
+    verschiedene empfangende Mailserver tatsächlich durchlaufen hat."""
+
+    total_failure_count: int
+    has_data: bool
+    avg_daily_volume: float
+    recommended_observation_days: int
+    observed_days: int
+    ready_for_enforce: bool
+
+
+def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int) -> MTASTSReadiness:
+    if not tls_rows:
+        recommended_days = _recommended_observation_days(0.0)
+        return MTASTSReadiness(
+            total_failure_count=0, has_data=False, avg_daily_volume=0.0,
+            recommended_observation_days=recommended_days, observed_days=days, ready_for_enforce=False,
+        )
+    total_failures = sum(r.failure_count for r in tls_rows)
+    total_sessions = sum(r.successful_session_count + r.failure_count for r in tls_rows)
+    avg_daily = total_sessions / days if days > 0 else 0.0
+    recommended_days = _recommended_observation_days(avg_daily)
+    return MTASTSReadiness(
+        total_failure_count=total_failures,
+        has_data=True,
+        avg_daily_volume=avg_daily,
+        recommended_observation_days=recommended_days,
+        observed_days=days,
+        ready_for_enforce=total_failures == 0 and days >= recommended_days,
+    )
+
+
+def to_stats_json_dict(
+    days: int,
+    daily: list[DayStat],
+    dmarc_readiness: list[DMARCReadiness],
+    mta_sts_readiness: MTASTSReadiness,
+    tls_daily: list[TLSDayStat] | None = None,
+) -> dict:
+    return {
+        "days": days,
+        "daily": [{"date": d.date, "clean_count": d.clean_count, "flagged_count": d.flagged_count} for d in daily],
+        "tls_daily": [
+            {"date": d.date, "successful_count": d.successful_count, "failure_count": d.failure_count}
+            for d in (tls_daily or [])
+        ],
+        "dmarc_readiness": [
+            {
+                "domain": sanitize_field(r.domain, max_len=_MAX_JSON_FIELD_LEN),
+                "current_policy": r.current_policy,
+                "current_pct": r.current_pct,
+                "total_count": r.total_count,
+                "unknown_ip_failures": r.unknown_ip_failures,
+                "own_ip_auth_failures": r.own_ip_auth_failures,
+                "avg_daily_volume": r.avg_daily_volume,
+                "recommended_observation_days": r.recommended_observation_days,
+                "observed_days": r.observed_days,
+                "ready_for_reject": r.ready_for_reject,
+            }
+            for r in dmarc_readiness
+        ],
+        "mta_sts_readiness": {
+            "total_failure_count": mta_sts_readiness.total_failure_count,
+            "has_data": mta_sts_readiness.has_data,
+            "avg_daily_volume": mta_sts_readiness.avg_daily_volume,
+            "recommended_observation_days": mta_sts_readiness.recommended_observation_days,
+            "observed_days": mta_sts_readiness.observed_days,
+            "ready_for_enforce": mta_sts_readiness.ready_for_enforce,
+        },
     }

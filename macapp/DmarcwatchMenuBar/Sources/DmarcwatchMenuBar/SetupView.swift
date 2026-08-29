@@ -69,8 +69,8 @@ struct SetupView: View {
                         // Speichern des restlichen Formulars - siehe
                         // applyStartAtLogin-Kommentar im ViewModel.
                         Toggle("Automatisch bei Anmeldung starten", isOn: $viewModel.startAtLogin)
-                            .onChange(of: viewModel.startAtLogin) { newValue in
-                                viewModel.applyStartAtLogin(newValue)
+                            .onChange(of: viewModel.startAtLogin) {
+                                viewModel.applyStartAtLogin(viewModel.startAtLogin)
                             }
                     }
 

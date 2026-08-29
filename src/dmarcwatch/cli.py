@@ -26,18 +26,23 @@ from .config import (
     write_last_fetch_date,
     write_skipped_items,
 )
-from .dns_verify import DomainVerification, has_warnings, verify_domain
+from .dns_verify import _DNSSEC_VALIDATING_RESOLVER, DomainVerification, has_warnings, verify_domain
 from .fetch import FetchError, connect_imap, fetch_and_ingest
 from .logging_setup import setup_logging
 from .report import (
+    collect_daily_stats,
     collect_rows,
+    collect_tls_daily_stats,
     collect_tls_rows,
+    compute_dmarc_readiness,
+    compute_mta_sts_readiness,
     day_range_to_ts,
     format_table,
     format_tls_table,
     has_findings,
     has_tls_failures,
     to_json_dict,
+    to_stats_json_dict,
     to_tls_json_dict,
 )
 from .blacklist import BlacklistCheckError, check_ip_blacklist
@@ -386,6 +391,70 @@ def cmd_tls_report(args: argparse.Namespace) -> int:
     return 1 if has_tls_failures(rows) else 0
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Kompakter Überblick über den Beobachtungszeitraum - Tagestrend
+    (sauber/auffällig) sowie eine Einschätzung, ob eine Verschärfung von
+    DMARC (Richtung reject) bzw. MTA-STS (Richtung enforce) im Zeitraum
+    sicher gewesen wäre. Reiner lokaler Lesebefehl wie `report`/
+    `tls-report`, keine Live-DNS-/HTTPS-Abfrage - siehe
+    compute_dmarc_readiness/compute_mta_sts_readiness in report.py."""
+    db_conn = connect(db_path())
+    since_ts, until_ts = day_range_to_ts(args.days)
+    rows = collect_rows(db_conn, since_ts, until_ts)
+    tls_rows = collect_tls_rows(db_conn, since_ts, until_ts)
+    db_conn.close()
+
+    daily = collect_daily_stats(rows)
+    tls_daily = collect_tls_daily_stats(tls_rows)
+    dmarc_readiness = compute_dmarc_readiness(rows, args.days)
+    mta_sts_readiness = compute_mta_sts_readiness(tls_rows, args.days)
+
+    if args.json:
+        json.dump(
+            to_stats_json_dict(args.days, daily, dmarc_readiness, mta_sts_readiness, tls_daily), sys.stdout
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    print(f"Statistik - letzte {args.days} Tage")
+    print()
+    print("Tag         Sauber  Auffällig")
+    for day in daily:
+        print(f"{day.date}  {day.clean_count:>6}  {day.flagged_count:>9}")
+    print()
+    if not dmarc_readiness:
+        print("DMARC: keine Reports im Zeitraum, keine Einschätzung möglich.")
+    for r in dmarc_readiness:
+        print(f"DMARC ({r.domain}): aktuelle Policy p={r.current_policy or '?'}, pct={r.current_pct}")
+        print(f"  {r.total_count} Einträge, davon {r.unknown_ip_failures} von unbekannten IPs")
+        if r.own_ip_auth_failures:
+            print(f"  ⚠ {r.own_ip_auth_failures} Fehlschläge von bekannten eigenen IPs - noch nicht bereit für p=reject")
+        elif r.current_policy == "reject":
+            print("  Bereits bei p=reject.")
+        elif r.observed_days < r.recommended_observation_days:
+            print(
+                f"  Noch nicht bereit: bei {r.avg_daily_volume:.1f} Einträgen/Tag werden mindestens "
+                f"{r.recommended_observation_days} Tage Beobachtung empfohlen, bisher nur "
+                f"{r.observed_days} Tage betrachtet."
+            )
+        else:
+            print("  Bereit für p=reject (keine eigenen IPs mit Fehlschlägen, ausreichend Beobachtungszeit).")
+    print()
+    if not mta_sts_readiness.has_data:
+        print("MTA-STS: keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")
+    elif mta_sts_readiness.total_failure_count:
+        print(f"MTA-STS: {mta_sts_readiness.total_failure_count} TLS-Fehlschläge im Zeitraum - noch nicht bereit für mode=enforce.")
+    elif mta_sts_readiness.observed_days < mta_sts_readiness.recommended_observation_days:
+        print(
+            f"MTA-STS: noch nicht bereit - bei {mta_sts_readiness.avg_daily_volume:.1f} TLS-Sitzungen/Tag "
+            f"werden mindestens {mta_sts_readiness.recommended_observation_days} Tage Beobachtung empfohlen, "
+            f"bisher nur {mta_sts_readiness.observed_days} Tage betrachtet."
+        )
+    else:
+        print("MTA-STS: 0 TLS-Fehlschläge, ausreichend Beobachtungszeit - bereit für mode=enforce, falls noch nicht aktiv.")
+    return 0
+
+
 def _parse_inspect_query(
     query: str,
 ) -> tuple[str | None, ipaddress.IPv4Network | ipaddress.IPv6Network | None]:
@@ -641,6 +710,32 @@ def _print_verify_result(result: DomainVerification) -> None:
         for warning in result.wildcard_spf.warnings:
             print(f"  ⚠ {warning}")
 
+    if result.dnssec.configured:
+        print()
+        print(f"DNSSEC ({result.domain})")
+        if result.dnssec.validated is not None:
+            status = "gültig" if result.dnssec.validated else "NICHT gültig"
+            print(f"  Validierung:       {status} (über {_DNSSEC_VALIDATING_RESOLVER})")
+        for warning in result.dnssec.warnings:
+            print(f"  ⚠ {warning}")
+
+    if result.dane.configured:
+        print()
+        print(f"DANE/TLSA ({result.domain})")
+        print(f"  MX mit TLSA:       {', '.join(result.dane.mx_hosts_with_tlsa)}")
+        for warning in result.dane.warnings:
+            print(f"  ⚠ {warning}")
+
+    if result.bimi.configured:
+        print()
+        print(f"BIMI (default._bimi.{result.domain})")
+        print(f"  Eintrag:           {result.bimi.record}")
+        if result.bimi.logo_reachable is not None:
+            status = "erreichbar" if result.bimi.logo_reachable else "NICHT erreichbar"
+            print(f"  Logo-Datei:        {status}")
+        for warning in result.bimi.warnings:
+            print(f"  ⚠ {warning}")
+
     if result.mx_blacklist.checked:
         print()
         print("Mailserver-Blacklist (Spamhaus ZEN)")
@@ -702,6 +797,23 @@ def _verification_to_dict(result: DomainVerification) -> dict:
             "configured": result.wildcard_spf.configured,
             "record": result.wildcard_spf.record,
             "warnings": result.wildcard_spf.warnings,
+        },
+        "dnssec": {
+            "configured": result.dnssec.configured,
+            "validated": result.dnssec.validated,
+            "warnings": result.dnssec.warnings,
+        },
+        "dane": {
+            "configured": result.dane.configured,
+            "mx_hosts_with_tlsa": result.dane.mx_hosts_with_tlsa,
+            "warnings": result.dane.warnings,
+        },
+        "bimi": {
+            "configured": result.bimi.configured,
+            "record": result.bimi.record,
+            "logo_svg": result.bimi.logo_svg,
+            "logo_reachable": result.bimi.logo_reachable,
+            "warnings": result.bimi.warnings,
         },
         "mx_blacklist": {
             "checked": result.mx_blacklist.checked,
@@ -834,6 +946,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tls_report.add_argument("--days", type=int, default=7, help="Zeitraum in Tagen (Default: 7)")
     p_tls_report.add_argument("--json", action="store_true", help="Ausgabe als JSON statt Tabelle")
     p_tls_report.set_defaults(func=cmd_tls_report)
+
+    p_stats = sub.add_parser(
+        "stats", help="Tagestrend und Verschärfungs-Einschätzung (DMARC/MTA-STS) anzeigen"
+    )
+    # 30 statt 7 Tage Default - für eine sinnvolle Verschärfungs-Einschätzung
+    # braucht es mehr als eine Woche Beobachtungszeitraum.
+    p_stats.add_argument("--days", type=int, default=30, help="Zeitraum in Tagen (Default: 30)")
+    p_stats.add_argument("--json", action="store_true", help="Ausgabe als JSON statt Tabelle")
+    p_stats.set_defaults(func=cmd_stats)
 
     p_inspect = sub.add_parser(
         "inspect", help="Vollständige Details zu einer IP oder einem CIDR-Netz anzeigen"
