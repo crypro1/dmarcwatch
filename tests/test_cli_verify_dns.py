@@ -9,8 +9,11 @@ from unittest.mock import patch
 from dmarcwatch import cli
 from dmarcwatch.config import read_dns_check_result, write_config
 from dmarcwatch.dns_verify import (
+    BIMICheckResult,
+    DANECheckResult,
     DKIMCheckResult,
     DMARCCheckResult,
+    DNSSECCheckResult,
     DomainVerification,
     MTASTSCheckResult,
     MXBlacklistCheckResult,
@@ -43,6 +46,9 @@ def _sample_result(domain: str) -> DomainVerification:
         tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
         wildcard_spf=WildcardSPFCheckResult(configured=False),
         mx_blacklist=MXBlacklistCheckResult(checked=False),
+        dnssec=DNSSECCheckResult(configured=False),
+        dane=DANECheckResult(configured=False),
+        bimi=BIMICheckResult(configured=False),
     )
 
 

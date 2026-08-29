@@ -3,6 +3,7 @@
 Textausgabe, deshalb muss die Feldstruktur stabil sein."""
 import argparse
 import json
+from datetime import datetime, timedelta, timezone
 
 from dmarcwatch import cli
 from dmarcwatch.config import Config, db_path
@@ -17,12 +18,18 @@ def _args(**overrides):
 
 
 def _sample(policy_domain: str = "example.com") -> bytes:
+    # Relativ zu "jetzt" statt einem festen Datum - sonst fällt die Fixture
+    # irgendwann außerhalb des 7-Tage-Fensters (genau das ist real
+    # passiert: ein fest eingetragenes Datum lag nach genug verstrichener
+    # Zeit nicht mehr in den letzten 7 Tagen).
+    end = datetime.now(timezone.utc) - timedelta(hours=1)
+    start = end - timedelta(hours=1)
     return json.dumps(
         {
             "organization-name": "Mail Provider",
             "date-range": {
-                "start-datetime": "2026-08-21T00:00:00Z",
-                "end-datetime": "2026-08-22T00:00:00Z",
+                "start-datetime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end-datetime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
             "report-id": "report-id-1",
             "policies": [

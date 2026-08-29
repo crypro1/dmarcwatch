@@ -3,9 +3,11 @@ import PackageDescription
 
 let package = Package(
     name: "DmarcwatchMenuBar",
-    // v13 (Ventura): SMAppService (LoginItemManager.swift) gibt es erst ab
-    // macOS 13 - vorher nur die alte, jetzt entfernte plist-Installation.
-    platforms: [.macOS(.v13)],
+    // v14 (Sonoma): SectorMark (Swift Charts, StatsView.swift) gibt es erst
+    // ab macOS 14 - v13 hätte hier nur die Balkendiagramm-Variante ohne
+    // Kreisdiagramm erlaubt. SMAppService (LoginItemManager.swift) selbst
+    // bräuchte nur v13.
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
             name: "DmarcwatchMenuBar",

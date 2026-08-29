@@ -64,10 +64,13 @@ struct DNSCheckDomainResult: Decodable {
     let tlsrptDns: TLSRPTDNSCheck
     let wildcardSpf: WildcardSPFCheck
     let mxBlacklist: MXBlacklistCheck
+    let dnssec: DNSSECCheck
+    let dane: DANECheck
+    let bimi: BIMICheck
     let hasWarnings: Bool
 
     enum CodingKeys: String, CodingKey {
-        case domain, dmarc, spf, dkim
+        case domain, dmarc, spf, dkim, dnssec, dane, bimi
         case mtaSts = "mta_sts"
         case tlsrptDns = "tlsrpt_dns"
         case wildcardSpf = "wildcard_spf"
@@ -75,15 +78,15 @@ struct DNSCheckDomainResult: Decodable {
         case hasWarnings = "has_warnings"
     }
 
-    // decodeIfPresent für mxBlacklist statt synthetisierter Konformität:
-    // last_dns_check.json ist ein von einem FRÜHEREN `verify-dns`-Lauf
-    // persistierter, roher Dict-Schnappschuss (siehe config.py
-    // read_dns_check_result) - eine bereits vorhandene Datei aus der Zeit
-    // vor diesem Feld hätte sonst beim nächsten App-Start/Hover die
-    // komplette Dekodierung von MenubarReport zum Scheitern gebracht (nicht
-    // nur dieses eine Feld leer gelassen), bis der nächste verify-dns-Lauf
-    // die Datei überschreibt. Gleiche Begründung wie bei
-    // MenubarReport.skippedItems/dnsCheck oben.
+    // decodeIfPresent für mxBlacklist/dnssec/dane/bimi statt synthetisierter
+    // Konformität: last_dns_check.json ist ein von einem FRÜHEREN
+    // `verify-dns`-Lauf persistierter, roher Dict-Schnappschuss (siehe
+    // config.py read_dns_check_result) - eine bereits vorhandene Datei aus
+    // der Zeit vor einem dieser Felder hätte sonst beim nächsten
+    // App-Start/Hover die komplette Dekodierung von MenubarReport zum
+    // Scheitern gebracht (nicht nur dieses eine Feld leer gelassen), bis
+    // der nächste verify-dns-Lauf die Datei überschreibt. Gleiche
+    // Begründung wie bei MenubarReport.skippedItems/dnsCheck oben.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         domain = try container.decode(String.self, forKey: .domain)
@@ -95,6 +98,12 @@ struct DNSCheckDomainResult: Decodable {
         wildcardSpf = try container.decode(WildcardSPFCheck.self, forKey: .wildcardSpf)
         mxBlacklist = try container.decodeIfPresent(MXBlacklistCheck.self, forKey: .mxBlacklist)
             ?? MXBlacklistCheck(checked: false, mxHosts: [], listed: [], warnings: [])
+        dnssec = try container.decodeIfPresent(DNSSECCheck.self, forKey: .dnssec)
+            ?? DNSSECCheck(configured: false, validated: nil, warnings: [])
+        dane = try container.decodeIfPresent(DANECheck.self, forKey: .dane)
+            ?? DANECheck(configured: false, mxHostsWithTlsa: [], warnings: [])
+        bimi = try container.decodeIfPresent(BIMICheck.self, forKey: .bimi)
+            ?? BIMICheck(configured: false, record: nil, logoSvg: nil, logoReachable: nil, warnings: [])
         hasWarnings = try container.decode(Bool.self, forKey: .hasWarnings)
     }
 }
@@ -112,6 +121,54 @@ struct MXBlacklistCheck: Decodable {
     enum CodingKeys: String, CodingKey {
         case checked, warnings, listed
         case mxHosts = "mx_hosts"
+    }
+}
+
+/// DNSSEC - schützt die Integrität aller anderen hier geprüften
+/// DNS-Einträge. Optional wie MTA-STS/TLS-RPT-DNS/Wildcard-SPF, keine
+/// Warnung bei komplettem Fehlen. validated ist nil, solange nicht
+/// configured, sonst das Ergebnis einer echten Validierung über einen
+/// extern bekannt validierenden Resolver (siehe dns_verify.py).
+struct DNSSECCheck: Decodable {
+    let configured: Bool
+    let validated: Bool?
+    let warnings: [String]
+}
+
+/// DANE/TLSA für SMTP - Sicherheit hängt vollständig von DNSSEC ab, siehe
+/// dns_verify.py-Kommentar. Optional, keine Warnung bei komplettem Fehlen.
+struct DANECheck: Decodable {
+    let configured: Bool
+    let mxHostsWithTlsa: [String]
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case configured, warnings
+        case mxHostsWithTlsa = "mx_hosts_with_tlsa"
+    }
+}
+
+/// BIMI (Markenlogo in unterstützenden Mail-Clients) - optional, keine
+/// Warnung bei komplettem Fehlen. Braucht bei den meisten Anbietern eine
+/// durchgesetzte DMARC-Policy, sonst wird trotz korrektem Eintrag kein
+/// Logo angezeigt (siehe dns_verify.py check_bimi).
+struct BIMICheck: Decodable {
+    let configured: Bool
+    let record: String?
+    // Der tatsächlich abgerufene SVG-Inhalt der Logo-Datei (siehe
+    // dns_verify.py:check_bimi/_fetch_bimi_logo) - nil, wenn kein
+    // 'l='-Tag da ist oder der Abruf fehlschlägt. Optional-typisierte
+    // Felder werden von Swifts synthetisierter Decodable-Konformität
+    // automatisch mit decodeIfPresent behandelt, deshalb kein eigener
+    // init(from:) nötig wie bei DNSCheckDomainResult oben.
+    let logoSvg: String?
+    let logoReachable: Bool?
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case configured, record, warnings
+        case logoSvg = "logo_svg"
+        case logoReachable = "logo_reachable"
     }
 }
 
@@ -242,9 +299,12 @@ struct DomainVerificationResponse: Decodable {
     let tlsrptDns: TLSRPTDNSCheck
     let wildcardSpf: WildcardSPFCheck
     let mxBlacklist: MXBlacklistCheck
+    let dnssec: DNSSECCheck
+    let dane: DANECheck
+    let bimi: BIMICheck
 
     enum CodingKeys: String, CodingKey {
-        case domain, dmarc, spf, dkim
+        case domain, dmarc, spf, dkim, dnssec, dane, bimi
         case mtaSts = "mta_sts"
         case tlsrptDns = "tlsrpt_dns"
         case wildcardSpf = "wildcard_spf"
@@ -329,6 +389,132 @@ struct TLSPolicyEntry: Decodable {
         case successfulSessionCount = "successful_session_count"
         case failureCount = "failure_count"
         case failureResultTypes = "failure_result_types"
+    }
+}
+
+/// Spiegelt to_stats_json_dict() aus report.py (`dmarcwatch stats --json`)
+/// - für das Statistik-Fenster (StatsView.swift). Rein lesend aus der
+/// lokalen DB, kein Netzzugriff.
+struct StatsResponse: Decodable {
+    let days: Int
+    let daily: [DayStatEntry]
+    let tlsDaily: [TLSDayStatEntry]
+    let dmarcReadiness: [DMARCReadinessEntry]
+    let mtaStsReadiness: MTASTSReadinessEntry
+
+    enum CodingKeys: String, CodingKey {
+        case days, daily
+        case tlsDaily = "tls_daily"
+        case dmarcReadiness = "dmarc_readiness"
+        case mtaStsReadiness = "mta_sts_readiness"
+    }
+}
+
+struct DayStatEntry: Decodable, Identifiable {
+    let date: String
+    let cleanCount: Int
+    let flaggedCount: Int
+
+    var id: String { date }
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case cleanCount = "clean_count"
+        case flaggedCount = "flagged_count"
+    }
+
+    private static let isoFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
+    /// Für einen echten Zeit-x-Achsen in StatsView (statt einer rein
+    /// kategorialen Text-Achse, die jedes Datum einzeln und ungekürzt
+    /// beschriftet, egal wie viele Tage im Zeitraum liegen) - report.py
+    /// liefert das Datum als reinen ISO-String ("yyyy-MM-dd").
+    var dateValue: Date {
+        Self.isoFormatter.date(from: date) ?? Date()
+    }
+}
+
+struct TLSDayStatEntry: Decodable, Identifiable {
+    let date: String
+    let successfulCount: Int
+    let failureCount: Int
+
+    var id: String { date }
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case successfulCount = "successful_count"
+        case failureCount = "failure_count"
+    }
+
+    private static let isoFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
+    var dateValue: Date {
+        Self.isoFormatter.date(from: date) ?? Date()
+    }
+}
+
+/// Einschätzung pro Domain, ob eine DMARC-Verschärfung (Richtung reject)
+/// im Beobachtungszeitraum sicher gewesen wäre - siehe
+/// report.py:compute_dmarc_readiness zur genauen Begründung
+/// (unknownIpFailures zählt bewusst NICHT gegen die Bereitschaft).
+struct DMARCReadinessEntry: Decodable, Identifiable {
+    let domain: String
+    let currentPolicy: String?
+    let currentPct: Int?
+    let totalCount: Int
+    let unknownIpFailures: Int
+    let ownIpAuthFailures: Int
+    // Sendevolumen-abhängige Mindestbeobachtungsdauer (siehe
+    // report.py:_recommended_observation_days) - readyForReject ist
+    // bereits FALSE, solange observedDays darunter liegt, diese Felder
+    // sind nur für die genauere Erklärung in der UI (siehe StatsView).
+    let avgDailyVolume: Double
+    let recommendedObservationDays: Int
+    let observedDays: Int
+    let readyForReject: Bool
+
+    var id: String { domain }
+
+    enum CodingKeys: String, CodingKey {
+        case domain
+        case currentPolicy = "current_policy"
+        case currentPct = "current_pct"
+        case totalCount = "total_count"
+        case unknownIpFailures = "unknown_ip_failures"
+        case ownIpAuthFailures = "own_ip_auth_failures"
+        case avgDailyVolume = "avg_daily_volume"
+        case recommendedObservationDays = "recommended_observation_days"
+        case observedDays = "observed_days"
+        case readyForReject = "ready_for_reject"
+    }
+}
+
+struct MTASTSReadinessEntry: Decodable {
+    let totalFailureCount: Int
+    let hasData: Bool
+    let avgDailyVolume: Double
+    let recommendedObservationDays: Int
+    let observedDays: Int
+    let readyForEnforce: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case totalFailureCount = "total_failure_count"
+        case hasData = "has_data"
+        case avgDailyVolume = "avg_daily_volume"
+        case recommendedObservationDays = "recommended_observation_days"
+        case observedDays = "observed_days"
+        case readyForEnforce = "ready_for_enforce"
     }
 }
 

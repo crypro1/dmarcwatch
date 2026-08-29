@@ -14,8 +14,11 @@ from unittest.mock import MagicMock, patch
 from dmarcwatch import cli, keychain, notify
 from dmarcwatch.config import read_dns_check_result, read_last_fetch_date, read_skipped_items, write_config, write_dns_check_result
 from dmarcwatch.dns_verify import (
+    BIMICheckResult,
+    DANECheckResult,
     DKIMCheckResult,
     DMARCCheckResult,
+    DNSSECCheckResult,
     DomainVerification,
     MTASTSCheckResult,
     MXBlacklistCheckResult,
@@ -36,6 +39,9 @@ def _clean_dns_result(domain: str) -> DomainVerification:
         tlsrpt_dns=TLSRPTDNSCheckResult(configured=False),
         wildcard_spf=WildcardSPFCheckResult(configured=False),
         mx_blacklist=MXBlacklistCheckResult(checked=False),
+        dnssec=DNSSECCheckResult(configured=False),
+        dane=DANECheckResult(configured=False),
+        bimi=BIMICheckResult(configured=False),
     )
 
 

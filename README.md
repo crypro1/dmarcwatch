@@ -118,7 +118,8 @@ Icon, da eine bloße Mach-O-Datei keine Icon-Ressource mitbringt) und
 signiert es ad-hoc (rein lokal, kein Developer-ID nötig). Das Icon selbst
 kommt aus `generate_icon.swift` - nur bei Bedarf neu auszuführen, falls
 sich das Icon mal ändern soll (siehe Kommentar im Skript). Erfordert
-macOS 13 (Ventura) oder neuer.
+macOS 14 (Sonoma) oder neuer (für Swift Charts' Kreisdiagramm im
+Statistik-Fenster, siehe unten).
 
 Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
 
@@ -158,7 +159,8 @@ Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   zur Wahl gerade dieser einen Liste.
 - **DNS prüfen…** öffnet nach Bestätigung im Dialog ein Fenster mit dem
   Ergebnis von `dmarcwatch verify-dns --json` für alle konfigurierten
-  `own_domains` - DMARC/SPF/DKIM/MTA-STS/TLS-RPT-DNS/Wildcard-SPF-Gültigkeit
+  `own_domains` - DMARC/SPF/DKIM/MTA-STS/TLS-RPT-DNS/Wildcard-SPF/DNSSEC/
+  DANE/BIMI-Gültigkeit
   und Fehlkonfigurationen sowie eine Spamhaus-Prüfung der eigenen
   MX-Server, siehe [`verify-dns`](#befehle) unten. Reine Diagnose,
   verändert nichts. Die Unterzeile unter "DNS prüfen…" zeigt immer
@@ -172,17 +174,20 @@ Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   Unterzeile "keine Auffälligkeiten" reicht dafür. Der Bestätigungsdialog
   selbst erklärt beim ersten Klick, was geprüft wird und wann rot erscheint,
   und lässt sich über "Nicht mehr fragen" dauerhaft überspringen.
-- **TLS-RPT-Bericht…** öffnet ein Fenster mit den bereits lokal gespeicherten
-  SMTP-TLS-RPT-Reports (`dmarcwatch tls-report --json`, siehe
-  [Konfiguration](#konfiguration) und [`tls-report`](#befehle) unten) - pro
-  Domain Policy-Typ, erfolgreiche/fehlgeschlagene TLS-Sitzungen und
-  gemeldete Fehlertypen. Reines Lesen der lokalen DB wie die
-  Haupt-Menüleiste, deshalb ohne Bestätigungsdialog (anders als "DNS
-  prüfen…"/"WHOIS abrufen…", die tatsächlich nach außen gehen). Nur
-  aussagekräftig, wenn `enable_tls_rpt` aktiviert ist.
+- **Statistik…** öffnet ein Fenster mit Tagestrend (sauber/auffällig) und
+  einer Einschätzung, ob eine Verschärfung von DMARC (Richtung `reject`)
+  bzw. MTA-STS (Richtung `enforce`) im gewählten Zeitraum sicher gewesen
+  wäre (`dmarcwatch stats --json`, siehe [`stats`](#befehle) unten) - reine
+  Einschätzung auf Basis bereits vorhandener Reports, nichts wird
+  automatisch geändert. Reines Lesen der lokalen DB, deshalb ohne
+  Bestätigungsdialog.
 
-Drei Kopfzeilen im Hauptmenü - DMARC, TLS-RPT und "Übersprungen" - erscheinen
-jeweils nur dann, wenn es dazu tatsächlich etwas anzuzeigen gibt: die
+Die SMTP-TLS-RPT-Reports selbst erscheinen nicht in einem eigenen Fenster,
+sondern als eigene Kopfzeile direkt im Hauptmenü, gleiches Muster wie die
+DMARC-Kopfzeile (pro Domain Policy-Typ, erfolgreiche/fehlgeschlagene
+TLS-Sitzungen und gemeldete Fehlertypen zum Aufklappen). Drei Kopfzeilen im
+Hauptmenü - DMARC, TLS-RPT und "Übersprungen" - erscheinen jeweils nur dann,
+wenn es dazu tatsächlich etwas anzuzeigen gibt: die
 TLS-RPT-Sektion nur bei aktivem `enable_tls_rpt` **und** mindestens einem
 gespeicherten Report, "Übersprungen" nur, wenn beim letzten `fetch`-Lauf
 tatsächlich eine Nachricht oder ein Anhang abgelehnt wurde (z. B. eine
@@ -192,8 +197,8 @@ leere Sektion nur zur Vollständigkeit.
 
 Abgesehen von **"WHOIS abrufen…"**, **"Blacklist abrufen…"**, **"Aus SPF
 ermitteln…"** und **"DNS prüfen…"** macht die App selbst **keine**
-Netzwerkanfrage von sich aus - alles andere (inklusive
-**"TLS-RPT-Bericht…"**) liest ausschließlich aus der lokalen
+Netzwerkanfrage von sich aus - alles andere (inklusive der TLS-RPT-Sektion
+und **"Statistik…"**) liest ausschließlich aus der lokalen
 SQLite-Datenbank, die `fetch` befüllt. Das sind die einzigen vier Stellen,
 an denen ein Klick tatsächlich nach außen geht (RDAP bzw. DNS), und alle
 vier immer erst nach expliziter Bestätigung im Dialog, nie automatisch im
@@ -390,11 +395,35 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   (RFC 8460) für die letzten N Tage - pro Domain Policy-Typ, erfolgreiche/
   fehlgeschlagene TLS-Sitzungen und gemeldete Fehlertypen. Exit-Code `1` bei
   mindestens einem Fehlschlag im Zeitraum, sonst `0`. `--json` gibt
-  strukturierte Ausgabe statt der Tabelle aus - für das
-  "TLS-RPT-Bericht…"-Fenster in der Menüleisten-App gedacht, funktioniert
-  aber genauso von Hand im Terminal. Nur aussagekräftig, wenn
-  `enable_tls_rpt` aktiv ist und `fetch` schon mindestens einmal danach
-  gelaufen ist.
+  strukturierte Ausgabe statt der Tabelle aus - für die TLS-RPT-Sektion im
+  Hauptmenü der Menüleisten-App gedacht, funktioniert aber genauso von Hand
+  im Terminal. Nur aussagekräftig, wenn `enable_tls_rpt` aktiv ist und
+  `fetch` schon mindestens einmal danach gelaufen ist.
+- `dmarcwatch stats [--days N] [--json]`
+  Tagestrend (sauber/auffällig, chronologisch) sowie eine Einschätzung, ob
+  eine Verschärfung von DMARC (Richtung `p=reject`) bzw. MTA-STS (Richtung
+  `mode=enforce`) im Zeitraum sicher gewesen wäre - reiner lokaler
+  Lesebefehl wie `report`/`tls-report`, keine Live-DNS-/HTTPS-Abfrage.
+  Default 30 statt 7 Tage - für eine sinnvolle Einschätzung braucht es mehr
+  als eine Woche Beobachtungszeitraum. **DMARC-Bereitschaft** prüft pro
+  Domain die aktuelle Policy (aus dem jüngsten Report) und zählt bewusst
+  nur Fehlschläge bekannter, eigener Sende-IPs (`own_ip_auth_fail`) gegen
+  die Bereitschaft - unbekannte IPs (`unknown_ip`, potenzielle
+  Spoofing-Versuche) zählen nicht dagegen, genau die soll eine schärfere
+  Policy ja blockieren. **MTA-STS-Bereitschaft** prüft, ob im Zeitraum
+  überhaupt TLS-RPT-Fehlschläge gemeldet wurden. Beide Einschätzungen
+  verlangen zusätzlich eine nach Sendevolumen gestaffelte
+  Mindestbeobachtungsdauer, bevor `ready_for_reject`/`ready_for_enforce`
+  auf `true` steht - selbst bei null Fehlschlägen: unter 1 Eintrag/Sitzung
+  pro Tag im Schnitt mindestens 60 Tage, bei 1 bis unter 5 pro Tag
+  mindestens 30 Tage, ab 5 pro Tag mindestens 14 Tage
+  ([`_recommended_observation_days`](src/dmarcwatch/report.py)) - bei sehr
+  wenig Volumen reicht ein kurzer Zeitraum sonst nicht aus, um
+  sicherzustellen, dass seltene, aber legitime Absender (z. B. monatliche
+  Rechnungen) im Beobachtungsfenster überhaupt schon aufgetaucht wären.
+  `--json` gibt strukturierte Ausgabe statt der Tabelle aus - für das
+  "Statistik…"-Fenster in der Menüleisten-App gedacht, funktioniert aber
+  genauso von Hand im Terminal.
 - `dmarcwatch inspect <ip-oder-cidr> [--days N] [--whois] [--blacklist]`
   Vollständige Details zu einer IP oder einem Netz (z. B. `2a01:111::/32`),
   ohne von Hand SQL gegen die Datenbank zu schreiben. `--whois` fragt
@@ -438,7 +467,7 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   RSA- und Ed25519-Schlüssel, folgt CNAME-Delegation (viele Anbieter,
   z. B. mailbox.org, verweisen den DKIM-Eintrag per CNAME auf sich
   selbst, damit Kund:innen bei einer Schlüsselrotation nichts ändern
-  müssen). Verlässt das Gerät (DNS). Zusätzlich drei rein optionale Checks -
+  müssen). Verlässt das Gerät (DNS). Zusätzlich sechs rein optionale Checks -
   **fehlen** sie ganz, erzeugt das keine Warnung, nur ein angefangenes/kaputtes
   Setup fällt auf: **MTA-STS** (RFC 8461) prüft `mta-sts.<domain>`
   (CNAME/A/AAAA) und die Policy-TXT unter `_mta-sts.<domain>`, ruft
@@ -450,7 +479,32 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   prüft den `_smtp._tls.<domain>`-TXT-Eintrag (`v=TLSRPTv1; rua=...`), der
   ankündigt, wohin TLS-RPT-Reports gehen sollen. **Wildcard-SPF** prüft einen
   `*.<domain>`-TXT-Eintrag als Schutz vor Phishing über nicht existierende
-  Subdomains. Zusätzlich, unabhängig von den drei optionalen Checks oben:
+  Subdomains. **DNSSEC** prüft DNSKEY (Zone signiert) und DS (Vertrauenskette
+  bei der übergeordneten Zone hinterlegt) für `domain`, dazu eine echte
+  Validierung über einen extern bekannt validierenden Resolver
+  ([Quad9](https://www.quad9.net/), Schweizer Non-Profit-Stiftung - der
+  lokale System-Resolver validiert DNSSEC in der Praxis meist gar nicht,
+  ein Ergebnis darüber wäre bedeutungslos) statt nur "Einträge vorhanden":
+  ein DS-Eintrag ohne passenden DNSKEY (oder umgekehrt) liefert leere
+  oder SERVFAIL-Antworten beim eigentlichen Abruf, obwohl beide Records für
+  sich genommen existieren können. Ohne DNSSEC gibt es für DMARC/SPF/DKIM/
+  MTA-STS/TLS-RPT-DNS keine kryptografische Garantie gegen eine gefälschte
+  Antwort zwischen Resolver und Abfrage. **DANE/TLSA** (RFC 6698) löst die
+  eigenen MX-Einträge auf und prüft, ob mindestens einer eine TLSA-Antwort
+  unter `_25._tcp.<mx-host>` hat - Absender können damit das TLS-Zertifikat
+  der eigenen Mailserver zusätzlich per DNS verifizieren. DANEs Sicherheit
+  hängt vollständig von DNSSEC ab: eine TLSA-Antwort ohne validiertes
+  DNSSEC für genau diesen MX-Host kann unbemerkt gefälscht sein und bietet
+  dann keinen echten Schutz, deshalb wird das hier zusätzlich zur reinen
+  Existenz geprüft (dieselbe Quad9-Validierung wie beim DNSSEC-Check oben,
+  nur für den MX-Host statt die Domain selbst). **BIMI** prüft
+  `default._bimi.<domain>` - zeigt bei unterstützenden Mail-Clients
+  (Gmail, Yahoo, ...) ein verifiziertes Logo neben eingehender Mail an.
+  Die meisten Anbieter zeigen das Logo aber nur bei durchgesetzter
+  DMARC-Policy (`p=quarantine`/`p=reject`, `pct=100`) - ein technisch
+  korrekter BIMI-Eintrag ohne das erzeugt trotzdem kein sichtbares Logo,
+  deshalb eine eigene Warnung dafür statt nur "Eintrag gefunden". Zusätzlich,
+  unabhängig von den sechs optionalen Checks oben:
   **Mailserver-Blacklist** löst die eigenen MX-Einträge auf und prüft deren
   IP(s) gegen **Spamhaus ZEN** - ein gelisteter eigener Mailserver ist ein
   ernstzunehmendes Problem (viele Empfänger lehnen Mail von dort direkt ab).
@@ -534,7 +588,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-234 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+287 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
