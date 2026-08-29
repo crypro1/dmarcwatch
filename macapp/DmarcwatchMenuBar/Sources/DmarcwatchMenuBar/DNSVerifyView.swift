@@ -65,7 +65,7 @@ struct DNSVerifyView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 640, height: 720)
+        .frame(width: 700, height: 920)
     }
 
     @ViewBuilder
