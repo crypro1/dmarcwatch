@@ -4,11 +4,10 @@ Alle nennenswerten Änderungen an dmarcwatch werden hier festgehalten.
 Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
-## [0.9.0] - 2026-08-29
+## [1.0.0] - 2026-08-29
 
-Erster versionierter Stand vor dem geplanten 1.0-Release. Bündelt die
-gesamte bisherige Entwicklung (siehe `git log` für die vollständige
-Historie) sowie zuletzt:
+Erster versionierter Release. Bündelt die gesamte bisherige Entwicklung
+(siehe `git log` für die vollständige Historie) sowie zuletzt:
 
 ### Hinzugefügt
 - DNSSEC-Prüfung (`dig +dnssec` gegen einen validierenden Resolver) und
@@ -37,8 +36,11 @@ Historie) sowie zuletzt:
 ### Geändert
 - Minimale macOS-Version für die Menüleisten-App auf macOS 14 (Sonoma)
   angehoben (erforderlich für Swift Charts' `SectorMark`).
+- "DNS-Prüfung…"- und "Statistik…"-Fenster vergrößert, damit die
+  erweiterten Inhalte (DNSSEC/DANE/BIMI bzw. Tagestrend/Verschärfung)
+  ohne Scrollen passen.
 
 ## Davor
 
-Die Entwicklung vor 0.9.0 wurde nicht einzeln versioniert - siehe
+Die Entwicklung vor 1.0.0 wurde nicht einzeln versioniert - siehe
 `git log` für den vollständigen Verlauf ab dem Initial-Commit.
