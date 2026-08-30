@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmarcwatch"
-version = "1.0.1"
+version = "1.1.0"
 description = "Lokaler DMARC-Monitor für macOS: IMAP-Abruf, Auswertung, Menüleiste. Keine Cloud."
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

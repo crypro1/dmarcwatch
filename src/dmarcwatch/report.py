@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .anomaly import REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
 from .sanitize import sanitize_field
@@ -201,6 +201,10 @@ class TLSPolicyRow:
     successful_session_count: int
     failure_count: int
     failure_result_types: list[str]
+    # Nach Fehlertyp gewichtet mit failed_session_count (nicht einfach die
+    # Anzahl der failure-details-Einträge) - ein einzelner Eintrag kann
+    # hunderte Sitzungen abdecken, siehe compute_mta_sts_readiness.
+    failure_type_counts: dict[str, int] = field(default_factory=dict)
 
 
 def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list[TLSPolicyRow]:
@@ -208,10 +212,14 @@ def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> 
     result = []
     for r in rows:
         failure_result_types: list[str] = []
+        failure_type_counts: dict[str, int] = {}
         if r["failure_count"] > 0:
-            failure_result_types = [
-                fd["result_type"] for fd in query_tls_failure_details(conn, r["id"])
-            ]
+            details = query_tls_failure_details(conn, r["id"])
+            failure_result_types = [fd["result_type"] for fd in details]
+            for fd in details:
+                failure_type_counts[fd["result_type"]] = (
+                    failure_type_counts.get(fd["result_type"], 0) + fd["failed_session_count"]
+                )
         result.append(
             TLSPolicyRow(
                 tls_policy_id=r["id"],
@@ -222,6 +230,7 @@ def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> 
                 successful_session_count=r["successful_session_count"],
                 failure_count=r["failure_count"],
                 failure_result_types=failure_result_types,
+                failure_type_counts=failure_type_counts,
             )
         )
     return result
@@ -342,41 +351,10 @@ def collect_tls_daily_stats(tls_rows: list[TLSPolicyRow]) -> list[TLSDayStat]:
     return result
 
 
-@dataclass
-class DMARCReadiness:
-    """Einschätzung pro Domain, ob eine Verschärfung der DMARC-Policy
-    (Richtung reject) im Beobachtungszeitraum sicher gewesen wäre - keine
-    Empfehlung, nur ein Blick auf bereits vorhandene Reports, nichts wird
-    automatisch geändert.
-
-    ready_for_reject prüft bewusst NICHT auf unbekannte IPs (unknown_ip) -
-    das sind potenzielle Spoofing-Versuche, genau die soll eine schärfere
-    Policy ja blockieren. Blockierend ist own_ip_auth_failures: bekannte,
-    eigene Sende-IPs, die an SPF/DKIM scheitern - die würde eine
-    schärfere Policy zusätzlich zu den eigentlichen Spoofing-Versuchen mit
-    ausblenden. Zusätzlich muss der Beobachtungszeitraum zum tatsächlichen
-    Sendevolumen passen (siehe _recommended_observation_days) - bei sehr
-    wenig Sendevolumen tauchen seltene, aber echte eigene Absender
-    (monatliche Rechnungen, Newsletter, ...) in einem kurzen Fenster u. U.
-    gar nicht auf, ein "0 Fehlschläge"-Ergebnis wäre dann nicht wirklich
-    aussagekräftig, auch wenn es technisch stimmt.
-
-    observed_days ist bewusst NICHT das angefragte --days-Fenster selbst,
-    sondern das tatsächliche Alter des ältesten Reports darin (bis
-    until_ts) - sonst würde ein einfaches `stats --days 90` sofort "90
-    Tage beobachtet" behaupten, selbst wenn die Domain real erst seit
-    wenigen Tagen überhaupt Reports liefert."""
-
-    domain: str
-    current_policy: str | None
-    current_pct: int | None
-    total_count: int
-    unknown_ip_failures: int
-    own_ip_auth_failures: int
-    avg_daily_volume: float
-    recommended_observation_days: int
-    observed_days: int
-    ready_for_reject: bool
+MIN_SAMPLE_SIZE = 10
+_RECENT_VOLUME_WINDOW_DAYS = 30
+_REPORTING_GAP_MIN_DAYS = 7
+_REPORTING_GAP_RATIO = 4
 
 
 def _recommended_observation_days(avg_daily_volume: float) -> int:
@@ -392,6 +370,128 @@ def _recommended_observation_days(avg_daily_volume: float) -> int:
     return 14
 
 
+def _detect_reporting_gap(day_indices: list[int]) -> tuple[bool, int]:
+    """Erkennt eine auffällig große Lücke ZWISCHEN Tagen mit mindestens
+    einem Report - keine Reports bedeutet nicht dasselbe wie "geprüft und
+    sauber", es kann genauso gut heißen, dass `fetch` zwischenzeitlich
+    ausgefallen ist (abgelaufene IMAP-Zugangsdaten, kaputte Filterregel,
+    ...) und schlicht nichts abgerufen wurde.
+
+    Bewusst NUR Lücken zwischen tatsächlich vorhandenen Report-Tagen,
+    nicht die Zeit vom letzten Report bis "jetzt" - reine Funkstille bis
+    heute kann genauso gut bedeuten, dass eine Domain aktuell einfach
+    wenig oder nichts verschickt (kein Alarmsignal, passiert nach einer
+    Migration oder bei geringem Volumen ständig), während eine Lücke
+    MITTEN in einer sonst regelmäßigen Historie (Reports davor und danach
+    vorhanden) ein deutlich eindeutigeres Anzeichen für einen
+    zwischenzeitlich ausgefallenen fetch ist.
+
+    Kein fester Schwellenwert wie "7 Tage ohne Report", weil das bei
+    ohnehin seltenem, aber völlig normalem Sendevolumen ständig falsch
+    anschlagen würde - stattdessen relativ zum MEDIAN der sonst üblichen
+    Lücken dieser Domain. Median statt Mittelwert ist hier wichtig: der
+    Mittelwert wird durch genau die Ausreißer-Lücke verzerrt, die erkannt
+    werden soll (eine einzelne 40-Tage-Lücke neben mehreren 1-Tage-Lücken
+    hebt den Mittelwert schon so stark an, dass sie sich selbst
+    unauffällig macht - der Median bleibt davon unbeeinflusst)."""
+    unique_days = sorted(set(day_indices))
+    if len(unique_days) < 3:
+        return False, 0
+    gaps = sorted(b - a for a, b in zip(unique_days, unique_days[1:]))
+    mid = len(gaps) // 2
+    median_gap = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
+    max_gap = gaps[-1]
+    if max_gap >= max(_REPORTING_GAP_MIN_DAYS, median_gap * _REPORTING_GAP_RATIO):
+        return True, max_gap
+    return False, 0
+
+
+def _next_dmarc_rollout_step(current_policy: str | None, current_pct: int | None) -> tuple[str, int] | None:
+    """Nächster Schritt einer vorsichtigen, gestaffelten DMARC-Verschärfung
+    in 25%-Schritten (p=none -> quarantine 25/50/75/100 -> reject
+    25/50/75/100) statt eines einzigen Sprungs direkt auf p=reject;
+    pct=100 - dem in der Praxis üblichen, empfohlenen Rollout-Ablauf.
+    None, wenn bereits am Ziel (p=reject, pct=100) - current_pct zählt
+    dafür genauso wie current_policy, ein Eintrag mit p=reject; pct=10
+    ist NICHT fertig, auch wenn die Policy schon "reject" heißt."""
+    policy = current_policy or "none"
+    pct = current_pct if current_pct is not None else 0
+    if policy not in ("quarantine", "reject"):
+        return "quarantine", 25
+    if policy == "quarantine":
+        if pct < 100:
+            return "quarantine", min(100, pct + 25)
+        return "reject", 25
+    if pct < 100:
+        return "reject", min(100, pct + 25)
+    return None
+
+
+@dataclass
+class DMARCReadiness:
+    """Einschätzung pro Domain, ob der nächste Schritt einer gestaffelten
+    DMARC-Verschärfung (siehe _next_dmarc_rollout_step) im
+    Beobachtungszeitraum sicher gewesen wäre - keine automatische
+    Änderung, nur ein Blick auf bereits vorhandene Reports.
+
+    own_ip_auth_failures (bekannte, eigene Sende-IPs, die an SPF/DKIM
+    scheitern) blockiert den nächsten Schritt, unknown_ip_failures
+    (potenzielle Spoofing-Versuche) bewusst nicht - genau die soll eine
+    schärfere Policy ja abfangen.
+
+    Statt "keine einzige own_ip_auth_fail irgendwo im gewählten Fenster"
+    zählt die Zeit seit dem JÜNGSTEN own_ip_auth_fail (clean_days) - ein
+    einzelner alter Vorfall blockiert nicht unbegrenzt, sobald seitdem
+    genug Zeit und Volumen vergangen sind (= observed_days, wenn nie
+    einer auftrat). avg_daily_volume und damit
+    recommended_observation_days basieren auf einem jüngeren Teilfenster
+    (_RECENT_VOLUME_WINDOW_DAYS) statt dem gesamten beobachteten
+    Zeitraum - sonst würde eine frühere, ruhigere Phase die nötige
+    Wartezeit für eine Domain verzerren, die inzwischen deutlich mehr
+    Post verschickt.
+
+    total_count/unknown_ip_failures/own_ip_auth_failures zählen echte
+    Nachrichten (Summe von ReportRow.count), nicht Report-Zeilen - eine
+    Zeile kann hunderte Nachrichten derselben IP zusammenfassen.
+
+    ready_for_next_step verlangt zusätzlich eine Mindest-Stichprobengröße
+    (MIN_SAMPLE_SIZE echte Nachrichten) und keine auffällige
+    Report-Lücke (has_reporting_gap) - viele verstrichene Tage mit kaum
+    echten Nachrichten, oder eine Lücke, in der `fetch` vermutlich
+    ausgefallen war, rechtfertigen kein "bereit".
+
+    needs_recheck warnt unabhängig davon, wenn eine Domain BEREITS bei
+    p=reject steht, aber ein own_ip_auth_fail jünger ist als
+    recommended_observation_days - typischerweise ein Zeichen für einen
+    neuen, noch nicht erfassten legitimen Absender oder ein kaputtes
+    SPF/DKIM-Setup. own_ip_networks nachträglich anzupassen ändert nichts
+    an bereits gespeicherten alten Reports, das zählt erst ab neuen.
+
+    Wichtige Grenze, die dieses Feld NICHT auflöst: DMARC-Aggregate-
+    Reporting ist branchenweit lückenhaft - nicht jeder Empfänger sendet
+    Reports, manche nur stichprobenartig. "0 Fehlschläge" heißt immer nur
+    "0 Fehlschläge unter dem, was uns gemeldet wurde", nie eine Garantie."""
+
+    domain: str
+    current_policy: str | None
+    current_pct: int | None
+    total_count: int
+    unknown_ip_failures: int
+    own_ip_auth_failures: int
+    avg_daily_volume: float
+    recommended_observation_days: int
+    observed_days: int
+    clean_days: int
+    last_failure_date: str | None
+    has_reporting_gap: bool
+    reporting_gap_days: int
+    next_recommended_policy: str | None
+    next_recommended_pct: int | None
+    fully_enforced: bool
+    ready_for_next_step: bool
+    needs_recheck: bool
+
+
 def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> list[DMARCReadiness]:
     by_domain: dict[str, list[ReportRow]] = {}
     for r in rows:
@@ -402,30 +502,67 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
     for domain, domain_rows in by_domain.items():
         latest = max(domain_rows, key=lambda r: r.date_begin)
         earliest = min(domain_rows, key=lambda r: r.date_begin)
-        unknown_ip = sum(1 for r in domain_rows if REASON_UNKNOWN_IP in r.flag_reasons)
-        own_ip_fail = sum(1 for r in domain_rows if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons)
+        total_count = sum(r.count for r in domain_rows)
+        unknown_ip = sum(r.count for r in domain_rows if REASON_UNKNOWN_IP in r.flag_reasons)
+        own_ip_fail_rows = [r for r in domain_rows if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons]
+        own_ip_fail = sum(r.count for r in own_ip_fail_rows)
+
         # Tatsächlich beobachteter Zeitraum = Alter des ältesten Reports
         # innerhalb des Fensters, NICHT das angefragte --days selbst - sonst
         # würde ein einfaches "stats --days 90" sofort "90 Tage beobachtet"
         # behaupten, selbst wenn das Postfach real erst seit 10 Tagen
         # überhaupt Reports liefert.
         observed_days = max(1, (until_ts - earliest.date_begin) // 86400)
-        avg_daily = len(domain_rows) / observed_days
+
+        if own_ip_fail_rows:
+            last_failure_ts = max(r.date_begin for r in own_ip_fail_rows)
+            clean_days = max(0, (until_ts - last_failure_ts) // 86400)
+            last_failure_date = time.strftime("%Y-%m-%d", time.gmtime(last_failure_ts))
+        else:
+            clean_days = observed_days
+            last_failure_date = None
+
+        recent_window = min(observed_days, _RECENT_VOLUME_WINDOW_DAYS)
+        recent_since = until_ts - recent_window * 86400
+        recent_count = sum(r.count for r in domain_rows if r.date_begin >= recent_since)
+        avg_daily = recent_count / recent_window
         recommended_days = _recommended_observation_days(avg_daily)
+
+        has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in domain_rows])
+
+        next_policy, next_pct = _next_dmarc_rollout_step(latest.policy_p or None, latest.policy_pct) or (None, None)
+        fully_enforced = next_policy is None
+
+        ready_for_next_step = (
+            not fully_enforced
+            and clean_days >= recommended_days
+            and total_count >= MIN_SAMPLE_SIZE
+            and not has_gap
+        )
+        needs_recheck = bool(
+            (latest.policy_p or None) == "reject" and own_ip_fail and clean_days < recommended_days
+        )
+
         result.append(
             DMARCReadiness(
                 domain=domain,
                 current_policy=latest.policy_p or None,
                 current_pct=latest.policy_pct,
-                total_count=len(domain_rows),
+                total_count=total_count,
                 unknown_ip_failures=unknown_ip,
                 own_ip_auth_failures=own_ip_fail,
                 avg_daily_volume=avg_daily,
                 recommended_observation_days=recommended_days,
                 observed_days=observed_days,
-                ready_for_reject=(
-                    own_ip_fail == 0 and latest.policy_p != "reject" and observed_days >= recommended_days
-                ),
+                clean_days=clean_days,
+                last_failure_date=last_failure_date,
+                has_reporting_gap=has_gap,
+                reporting_gap_days=gap_days,
+                next_recommended_policy=next_policy,
+                next_recommended_pct=next_pct,
+                fully_enforced=fully_enforced,
+                ready_for_next_step=ready_for_next_step,
+                needs_recheck=needs_recheck,
             )
         )
     return result
@@ -433,58 +570,114 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
 
 @dataclass
 class MTASTSReadiness:
-    """Einschätzung, ob eine Verschärfung von MTA-STS (mode=testing auf
-    mode=enforce) im Beobachtungszeitraum sicher gewesen wäre, basierend
-    auf bereits gespeicherten TLS-RPT-Reports - keine Live-DNS-/HTTPS-
-    Abfrage, `stats` bleibt dadurch ein reiner, lokaler Lesebefehl wie
-    `report`/`tls-report`. has_data ist False, wenn im Zeitraum gar keine
-    TLS-RPT-Reports vorliegen (z. B. enable_tls_rpt aus) - dann lässt sich
-    nichts einschätzen, das ist kein "bereit". Gleiche
-    Sendevolumen-Staffelung wie bei DMARC (siehe
-    _recommended_observation_days) - wenige TLS-Sitzungen pro Tag
-    bedeuten, dass ein kurzes "0 Fehlschläge"-Fenster noch nicht viele
-    verschiedene empfangende Mailserver tatsächlich durchlaufen hat.
-    observed_days ist wie bei DMARCReadiness das tatsächliche Alter des
-    ältesten TLS-RPT-Reports, nicht das angefragte --days-Fenster."""
+    """Pendant zu DMARCReadiness für MTA-STS (mode=testing auf
+    mode=enforce), jetzt pro Domain statt über alle konfigurierten
+    Domains hinweg zu einer einzigen Einschätzung zusammengefasst - sonst
+    hätte eine zweite, komplett unabhängige Domain mit eigenen
+    TLS-RPT-Reports die Einschätzung der ersten verwässert oder
+    verfälscht.
 
+    Basiert ausschließlich auf bereits gespeicherten TLS-RPT-Reports -
+    keine Live-DNS-/HTTPS-Abfrage, `stats` bleibt dadurch ein reiner,
+    lokaler Lesebefehl. Kann deshalb NICHT wissen, ob mode=enforce in der
+    Zone bereits tatsächlich aktiv ist (das weiß nur der Live-Check in
+    `verify-dns`) - anders als bei DMARC (policy_published in jedem
+    Report) gibt es hier also kein fully_enforced/needs_recheck-Pendant.
+
+    clean_days/observed_days/avg_daily_volume/has_reporting_gap folgen
+    denselben Prinzipien wie bei DMARCReadiness (siehe dort): Zeit seit
+    dem letzten TLS-Fehlschlag statt "keiner irgendwo im Fenster",
+    Sendevolumen aus einem jüngeren Teilfenster, Report-Lücken-Erkennung,
+    dieselbe Mindest-Stichprobengröße (jetzt auf echte TLS-Sitzungen
+    bezogen). failure_types schlüsselt die gemeldeten Fehlschläge nach
+    RFC-8460-Ergebnistyp auf, gewichtet mit den tatsächlich
+    fehlgeschlagenen Sitzungen pro Eintrag (nicht nach Anzahl der
+    failure-details-Einträge) - nicht jeder Typ bedeutet dasselbe (z. B.
+    ein abgelaufenes eigenes Zertifikat vs. ein möglicherweise nur beim
+    Empfänger aufgetretener Abrieffehler der Policy-Datei); eine
+    automatische Bewertung wäre hier zu unsicher, deshalb nur die
+    Aufschlüsselung statt einer eigenen Einstufung.
+
+    Gleiche Grenze wie bei DMARC: TLS-RPT-Reporting ist ebenfalls
+    branchenweit lückenhaft, "0 Fehlschläge" ist keine Garantie."""
+
+    domain: str
+    total_sessions: int
     total_failure_count: int
-    has_data: bool
+    failure_types: dict[str, int]
     avg_daily_volume: float
     recommended_observation_days: int
     observed_days: int
+    clean_days: int
+    last_failure_date: str | None
+    has_reporting_gap: bool
+    reporting_gap_days: int
     ready_for_enforce: bool
 
 
-def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts: int) -> MTASTSReadiness:
-    if not tls_rows:
-        recommended_days = _recommended_observation_days(0.0)
-        return MTASTSReadiness(
-            total_failure_count=0, has_data=False, avg_daily_volume=0.0,
-            recommended_observation_days=recommended_days, observed_days=0, ready_for_enforce=False,
+def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts: int) -> list[MTASTSReadiness]:
+    by_domain: dict[str, list[TLSPolicyRow]] = {}
+    for r in tls_rows:
+        if r.policy_domain:
+            by_domain.setdefault(r.policy_domain, []).append(r)
+
+    result = []
+    for domain, domain_rows in by_domain.items():
+        earliest_ts = min(r.date_begin for r in domain_rows)
+        observed_days = max(1, (until_ts - earliest_ts) // 86400)
+
+        failing_rows = [r for r in domain_rows if r.failure_count > 0]
+        total_failures = sum(r.failure_count for r in domain_rows)
+        failure_types: dict[str, int] = {}
+        for r in domain_rows:
+            for ftype, count in r.failure_type_counts.items():
+                failure_types[ftype] = failure_types.get(ftype, 0) + count
+
+        if failing_rows:
+            last_failure_ts = max(r.date_begin for r in failing_rows)
+            clean_days = max(0, (until_ts - last_failure_ts) // 86400)
+            last_failure_date = time.strftime("%Y-%m-%d", time.gmtime(last_failure_ts))
+        else:
+            clean_days = observed_days
+            last_failure_date = None
+
+        recent_window = min(observed_days, _RECENT_VOLUME_WINDOW_DAYS)
+        recent_since = until_ts - recent_window * 86400
+        recent_sessions = sum(
+            r.successful_session_count + r.failure_count for r in domain_rows if r.date_begin >= recent_since
         )
-    # Siehe compute_dmarc_readiness oben: tatsächlich beobachteter Zeitraum
-    # statt des bloß angefragten --days.
-    earliest_ts = min(r.date_begin for r in tls_rows)
-    observed_days = max(1, (until_ts - earliest_ts) // 86400)
-    total_failures = sum(r.failure_count for r in tls_rows)
-    total_sessions = sum(r.successful_session_count + r.failure_count for r in tls_rows)
-    avg_daily = total_sessions / observed_days
-    recommended_days = _recommended_observation_days(avg_daily)
-    return MTASTSReadiness(
-        total_failure_count=total_failures,
-        has_data=True,
-        avg_daily_volume=avg_daily,
-        recommended_observation_days=recommended_days,
-        observed_days=observed_days,
-        ready_for_enforce=total_failures == 0 and observed_days >= recommended_days,
-    )
+        avg_daily = recent_sessions / recent_window
+        recommended_days = _recommended_observation_days(avg_daily)
+
+        has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in domain_rows])
+
+        total_sessions = sum(r.successful_session_count + r.failure_count for r in domain_rows)
+        ready_for_enforce = clean_days >= recommended_days and total_sessions >= MIN_SAMPLE_SIZE and not has_gap
+
+        result.append(
+            MTASTSReadiness(
+                domain=domain,
+                total_sessions=total_sessions,
+                total_failure_count=total_failures,
+                failure_types=failure_types,
+                avg_daily_volume=avg_daily,
+                recommended_observation_days=recommended_days,
+                observed_days=observed_days,
+                clean_days=clean_days,
+                last_failure_date=last_failure_date,
+                has_reporting_gap=has_gap,
+                reporting_gap_days=gap_days,
+                ready_for_enforce=ready_for_enforce,
+            )
+        )
+    return result
 
 
 def to_stats_json_dict(
     days: int,
     daily: list[DayStat],
     dmarc_readiness: list[DMARCReadiness],
-    mta_sts_readiness: MTASTSReadiness,
+    mta_sts_readiness: list[MTASTSReadiness],
     tls_daily: list[TLSDayStat] | None = None,
 ) -> dict:
     return {
@@ -505,16 +698,35 @@ def to_stats_json_dict(
                 "avg_daily_volume": r.avg_daily_volume,
                 "recommended_observation_days": r.recommended_observation_days,
                 "observed_days": r.observed_days,
-                "ready_for_reject": r.ready_for_reject,
+                "clean_days": r.clean_days,
+                "last_failure_date": r.last_failure_date,
+                "has_reporting_gap": r.has_reporting_gap,
+                "reporting_gap_days": r.reporting_gap_days,
+                "next_recommended_policy": r.next_recommended_policy,
+                "next_recommended_pct": r.next_recommended_pct,
+                "fully_enforced": r.fully_enforced,
+                "ready_for_next_step": r.ready_for_next_step,
+                "needs_recheck": r.needs_recheck,
             }
             for r in dmarc_readiness
         ],
-        "mta_sts_readiness": {
-            "total_failure_count": mta_sts_readiness.total_failure_count,
-            "has_data": mta_sts_readiness.has_data,
-            "avg_daily_volume": mta_sts_readiness.avg_daily_volume,
-            "recommended_observation_days": mta_sts_readiness.recommended_observation_days,
-            "observed_days": mta_sts_readiness.observed_days,
-            "ready_for_enforce": mta_sts_readiness.ready_for_enforce,
-        },
+        "mta_sts_readiness": [
+            {
+                "domain": sanitize_field(r.domain, max_len=_MAX_JSON_FIELD_LEN),
+                "total_sessions": r.total_sessions,
+                "total_failure_count": r.total_failure_count,
+                "failure_types": {
+                    sanitize_field(k, max_len=_MAX_JSON_FIELD_LEN): v for k, v in r.failure_types.items()
+                },
+                "avg_daily_volume": r.avg_daily_volume,
+                "recommended_observation_days": r.recommended_observation_days,
+                "observed_days": r.observed_days,
+                "clean_days": r.clean_days,
+                "last_failure_date": r.last_failure_date,
+                "has_reporting_gap": r.has_reporting_gap,
+                "reporting_gap_days": r.reporting_gap_days,
+                "ready_for_enforce": r.ready_for_enforce,
+            }
+            for r in mta_sts_readiness
+        ],
     }
