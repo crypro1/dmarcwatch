@@ -400,7 +400,7 @@ struct StatsResponse: Decodable {
     let daily: [DayStatEntry]
     let tlsDaily: [TLSDayStatEntry]
     let dmarcReadiness: [DMARCReadinessEntry]
-    let mtaStsReadiness: MTASTSReadinessEntry
+    let mtaStsReadiness: [MTASTSReadinessEntry]
 
     enum CodingKeys: String, CodingKey {
         case days, daily
@@ -464,10 +464,18 @@ struct TLSDayStatEntry: Decodable, Identifiable {
     }
 }
 
-/// Einschätzung pro Domain, ob eine DMARC-Verschärfung (Richtung reject)
-/// im Beobachtungszeitraum sicher gewesen wäre - siehe
-/// report.py:compute_dmarc_readiness zur genauen Begründung
-/// (unknownIpFailures zählt bewusst NICHT gegen die Bereitschaft).
+/// Einschätzung pro Domain, ob der nächste Schritt einer gestaffelten
+/// DMARC-Verschärfung (p=none -> quarantine 25/50/75/100 -> reject
+/// 25/50/75/100, siehe report.py:_next_dmarc_rollout_step) im
+/// Beobachtungszeitraum sicher gewesen wäre - unknownIpFailures zählt
+/// bewusst NICHT gegen die Bereitschaft (potenzielle Spoofing-Versuche,
+/// genau die soll eine schärfere Policy ja abfangen). cleanDays ist die
+/// Zeit seit dem JÜNGSTEN ownIpAuthFailures-Vorfall (nicht "keiner
+/// irgendwo im Fenster") - ein alter Vorfall heilt, sobald seitdem genug
+/// Zeit vergangen ist. needsRecheck warnt unabhängig davon, wenn eine
+/// bereits bei p=reject stehende Domain einen FRISCHEN own_ip_auth_fail
+/// bekommt (siehe report.py:DMARCReadiness-Docstring für die volle
+/// Begründung inkl. der own_ip_networks-Einschränkung).
 struct DMARCReadinessEntry: Decodable, Identifiable {
     let domain: String
     let currentPolicy: String?
@@ -475,14 +483,18 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
     let totalCount: Int
     let unknownIpFailures: Int
     let ownIpAuthFailures: Int
-    // Sendevolumen-abhängige Mindestbeobachtungsdauer (siehe
-    // report.py:_recommended_observation_days) - readyForReject ist
-    // bereits FALSE, solange observedDays darunter liegt, diese Felder
-    // sind nur für die genauere Erklärung in der UI (siehe StatsView).
     let avgDailyVolume: Double
     let recommendedObservationDays: Int
     let observedDays: Int
-    let readyForReject: Bool
+    let cleanDays: Int
+    let lastFailureDate: String?
+    let hasReportingGap: Bool
+    let reportingGapDays: Int
+    let nextRecommendedPolicy: String?
+    let nextRecommendedPct: Int?
+    let fullyEnforced: Bool
+    let readyForNextStep: Bool
+    let needsRecheck: Bool
 
     var id: String { domain }
 
@@ -496,24 +508,52 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
         case avgDailyVolume = "avg_daily_volume"
         case recommendedObservationDays = "recommended_observation_days"
         case observedDays = "observed_days"
-        case readyForReject = "ready_for_reject"
+        case cleanDays = "clean_days"
+        case lastFailureDate = "last_failure_date"
+        case hasReportingGap = "has_reporting_gap"
+        case reportingGapDays = "reporting_gap_days"
+        case nextRecommendedPolicy = "next_recommended_policy"
+        case nextRecommendedPct = "next_recommended_pct"
+        case fullyEnforced = "fully_enforced"
+        case readyForNextStep = "ready_for_next_step"
+        case needsRecheck = "needs_recheck"
     }
 }
 
-struct MTASTSReadinessEntry: Decodable {
+/// Pendant zu DMARCReadinessEntry für MTA-STS, jetzt pro Domain (siehe
+/// report.py:MTASTSReadiness-Docstring) - kein fullyEnforced/needsRecheck-
+/// Pendant, da `stats` nicht wissen kann, ob mode=enforce live in der Zone
+/// aktiv ist (nur der Live-Check in verify-dns weiß das). failureTypes
+/// schlüsselt gemeldete TLS-Fehlschläge nach RFC-8460-Ergebnistyp auf,
+/// gewichtet mit echten fehlgeschlagenen Sitzungen.
+struct MTASTSReadinessEntry: Decodable, Identifiable {
+    let domain: String
+    let totalSessions: Int
     let totalFailureCount: Int
-    let hasData: Bool
+    let failureTypes: [String: Int]
     let avgDailyVolume: Double
     let recommendedObservationDays: Int
     let observedDays: Int
+    let cleanDays: Int
+    let lastFailureDate: String?
+    let hasReportingGap: Bool
+    let reportingGapDays: Int
     let readyForEnforce: Bool
 
+    var id: String { domain }
+
     enum CodingKeys: String, CodingKey {
+        case domain
+        case totalSessions = "total_sessions"
         case totalFailureCount = "total_failure_count"
-        case hasData = "has_data"
+        case failureTypes = "failure_types"
         case avgDailyVolume = "avg_daily_volume"
         case recommendedObservationDays = "recommended_observation_days"
         case observedDays = "observed_days"
+        case cleanDays = "clean_days"
+        case lastFailureDate = "last_failure_date"
+        case hasReportingGap = "has_reporting_gap"
+        case reportingGapDays = "reporting_gap_days"
         case readyForEnforce = "ready_for_enforce"
     }
 }

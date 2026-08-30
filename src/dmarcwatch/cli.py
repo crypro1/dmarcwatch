@@ -41,6 +41,7 @@ from .report import (
     format_tls_table,
     has_findings,
     has_tls_failures,
+    MIN_SAMPLE_SIZE,
     to_json_dict,
     to_stats_json_dict,
     to_tls_json_dict,
@@ -422,36 +423,83 @@ def cmd_stats(args: argparse.Namespace) -> int:
     for day in daily:
         print(f"{day.date}  {day.clean_count:>6}  {day.flagged_count:>9}")
     print()
+    print(
+        "Hinweis: basiert nur auf bisher gemeldeten Reports - DMARC-/TLS-RPT-Reporting ist"
+    )
+    print(
+        "branchenweit lückenhaft (nicht jeder Empfänger meldet), keine Garantie."
+    )
+    print()
     if not dmarc_readiness:
         print("DMARC: keine Reports im Zeitraum, keine Einschätzung möglich.")
     for r in dmarc_readiness:
         print(f"DMARC ({r.domain}): aktuelle Policy p={r.current_policy or '?'}, pct={r.current_pct}")
-        print(f"  {r.total_count} Einträge, davon {r.unknown_ip_failures} von unbekannten IPs")
-        if r.own_ip_auth_failures:
-            print(f"  ⚠ {r.own_ip_auth_failures} Fehlschläge von bekannten eigenen IPs - noch nicht bereit für p=reject")
-        elif r.current_policy == "reject":
-            print("  Bereits bei p=reject.")
-        elif r.observed_days < r.recommended_observation_days:
+        print(f"  {r.total_count} E-Mails, davon {r.unknown_ip_failures} von unbekannten IPs")
+        if r.has_reporting_gap:
             print(
-                f"  Noch nicht bereit: bei {r.avg_daily_volume:.1f} Einträgen/Tag werden mindestens "
-                f"{r.recommended_observation_days} Tage Beobachtung empfohlen, bisher nur "
-                f"{r.observed_days} Tage betrachtet."
+                f"  ⚠ Lücke von {r.reporting_gap_days} Tagen ohne jeden Report erkannt - "
+                "vermutlich zwischenzeitlich ausgefallener Abruf, Einschätzung unten mit Vorsicht behandeln."
             )
+        if r.needs_recheck:
+            print(
+                f"  ⚠ Bereits bei p=reject, aber own_ip_auth_fail zuletzt am {r.last_failure_date} - "
+                "own_ip_networks/SPF/DKIM prüfen (ändert nichts an bereits gespeicherten alten "
+                "Reports, zählt erst ab neuen)."
+            )
+        if r.fully_enforced:
+            print("  Bereits vollständig durchgesetzt (p=reject, pct=100).")
+        elif r.ready_for_next_step:
+            print(f"  Bereit für nächsten Schritt: p={r.next_recommended_policy}, pct={r.next_recommended_pct}.")
         else:
-            print("  Bereit für p=reject (keine eigenen IPs mit Fehlschlägen, ausreichend Beobachtungszeit).")
+            reasons = []
+            if r.own_ip_auth_failures and r.clean_days < r.recommended_observation_days:
+                reasons.append(f"own_ip_auth_fail zuletzt am {r.last_failure_date}")
+            elif r.clean_days < r.recommended_observation_days:
+                reasons.append(
+                    f"bei {r.avg_daily_volume:.1f} E-Mails/Tag werden mindestens "
+                    f"{r.recommended_observation_days} Tage seit dem letzten Fehlschlag empfohlen, "
+                    f"bisher {r.clean_days} Tage sauber"
+                )
+            if r.total_count < MIN_SAMPLE_SIZE:
+                reasons.append(f"erst {r.total_count} E-Mails insgesamt beobachtet (mind. {MIN_SAMPLE_SIZE} empfohlen)")
+            if r.has_reporting_gap:
+                reasons.append("Report-Lücke erkannt")
+            print(
+                f"  Noch nicht bereit für p={r.next_recommended_policy}, pct={r.next_recommended_pct}: "
+                + "; ".join(reasons) + "."
+            )
     print()
-    if not mta_sts_readiness.has_data:
+    if not mta_sts_readiness:
         print("MTA-STS: keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")
-    elif mta_sts_readiness.total_failure_count:
-        print(f"MTA-STS: {mta_sts_readiness.total_failure_count} TLS-Fehlschläge im Zeitraum - noch nicht bereit für mode=enforce.")
-    elif mta_sts_readiness.observed_days < mta_sts_readiness.recommended_observation_days:
-        print(
-            f"MTA-STS: noch nicht bereit - bei {mta_sts_readiness.avg_daily_volume:.1f} TLS-Sitzungen/Tag "
-            f"werden mindestens {mta_sts_readiness.recommended_observation_days} Tage Beobachtung empfohlen, "
-            f"bisher nur {mta_sts_readiness.observed_days} Tage betrachtet."
-        )
-    else:
-        print("MTA-STS: 0 TLS-Fehlschläge, ausreichend Beobachtungszeit - bereit für mode=enforce, falls noch nicht aktiv.")
+    for m in mta_sts_readiness:
+        print(f"MTA-STS ({m.domain}):")
+        if m.total_failure_count:
+            types = ", ".join(f"{k} ({v})" for k, v in sorted(m.failure_types.items()))
+            print(f"  {m.total_failure_count} TLS-Fehlschläge im Zeitraum" + (f" - {types}" if types else ""))
+        if m.has_reporting_gap:
+            print(
+                f"  ⚠ Lücke von {m.reporting_gap_days} Tagen ohne jeden Report erkannt - "
+                "vermutlich zwischenzeitlich ausgefallener Abruf, Einschätzung unten mit Vorsicht behandeln."
+            )
+        if m.ready_for_enforce:
+            print("  Bereit für mode=enforce, falls noch nicht aktiv.")
+        else:
+            reasons = []
+            if m.total_failure_count and m.clean_days < m.recommended_observation_days:
+                reasons.append(f"letzter TLS-Fehlschlag am {m.last_failure_date}")
+            elif m.clean_days < m.recommended_observation_days:
+                reasons.append(
+                    f"bei {m.avg_daily_volume:.1f} TLS-Sitzungen/Tag werden mindestens "
+                    f"{m.recommended_observation_days} Tage seit dem letzten Fehlschlag empfohlen, "
+                    f"bisher {m.clean_days} Tage sauber"
+                )
+            if m.total_sessions < MIN_SAMPLE_SIZE:
+                reasons.append(
+                    f"erst {m.total_sessions} TLS-Sitzungen insgesamt beobachtet (mind. {MIN_SAMPLE_SIZE} empfohlen)"
+                )
+            if m.has_reporting_gap:
+                reasons.append("Report-Lücke erkannt")
+            print("  Noch nicht bereit: " + "; ".join(reasons) + ".")
     return 0
 
 

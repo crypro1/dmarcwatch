@@ -4,6 +4,51 @@ Alle nennenswerten Änderungen an dmarcwatch werden hier festgehalten.
 Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
+## [1.1.0] - 2026-08-30
+
+### Hinzugefügt
+- `dmarcwatch stats`/"Statistik…": deutlich intelligentere
+  Verschärfungs-Einschätzung statt der bisherigen starren
+  "keine einzige Zeile mit Fehlschlag im Fenster"-Regel:
+  - Zeit seit dem JÜNGSTEN Fehlschlag statt "keiner irgendwo im
+    gewählten Fenster" - ein einzelner alter Vorfall blockiert nicht
+    mehr unbegrenzt, sobald seitdem genug Zeit und Sendevolumen
+    vergangen sind.
+  - Gestaffelter DMARC-Rollout in 25 %-Schritten (`p=none` →
+    `quarantine` 25/50/75/100 → `reject` 25/50/75/100) statt eines
+    einzigen Sprungs auf `p=reject; pct=100` - eine bereits bei
+    `p=reject` stehende Domain mit `pct<100` gilt nicht mehr
+    fälschlich als fertig.
+  - Regression-Warnung (`needs_recheck`): eine bereits bei `p=reject`
+    stehende Domain mit einem frischen `own_ip_auth_fail` wird jetzt
+    explizit gemeldet statt stillschweigend als "erledigt" zu gelten.
+  - Mindest-Stichprobengröße (10 echte Nachrichten/Sitzungen) zusätzlich
+    zur Mindestbeobachtungsdauer - viele verstrichene Tage mit kaum
+    echtem Volumen ergeben kein "bereit".
+  - Sendevolumen wird aus einem jüngeren, rollierenden 30-Tage-Fenster
+    berechnet statt aus der gesamten Historie - eine frühere, ruhigere
+    Phase verzerrt nicht mehr die nötige Wartezeit für eine inzwischen
+    deutlich aktivere Domain.
+  - Erkennung auffällig großer Lücken zwischen Tagen mit Reports
+    (relativ zur sonst üblichen Lücke dieser Domain) - blockiert die
+    Bereitschaft zusätzlich, da eine Lücke genauso gut ein
+    zwischenzeitlich ausgefallener `fetch` sein kann wie echte Stille.
+  - TLS-RPT-Fehlschläge werden zusätzlich nach RFC-8460-Ergebnistyp
+    aufgeschlüsselt, gewichtet mit echten fehlgeschlagenen Sitzungen.
+  - Ein expliziter Hinweis in jeder Ausgabe, dass DMARC-/TLS-RPT-
+    Reporting branchenweit lückenhaft ist - "0 Fehlschläge" war nie
+    eine Garantie, das steht jetzt auch so da.
+  - Zählungen (Gesamtzahl, Fehlschläge, Sendevolumen) basieren jetzt auf
+    den echten `count`-Werten der Reports statt auf der Anzahl der
+    Report-Zeilen.
+
+### Behoben
+- MTA-STS-Bereitschaft wurde über alle konfigurierten Domains hinweg zu
+  einer einzigen Einschätzung zusammengefasst statt (wie bei DMARC) pro
+  Domain berechnet - bei mehreren Domains mit TLS-RPT hätte eine
+  Domain die Einschätzung der anderen verfälscht. Läuft jetzt wie
+  DMARC unabhängig pro Domain.
+
 ## [1.0.1] - 2026-08-30
 
 ### Behoben

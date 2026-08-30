@@ -401,30 +401,71 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   `fetch` schon mindestens einmal danach gelaufen ist.
 - `dmarcwatch stats [--days N] [--json]`
   Tagestrend (sauber/auffällig, chronologisch) sowie eine Einschätzung, ob
-  eine Verschärfung von DMARC (Richtung `p=reject`) bzw. MTA-STS (Richtung
-  `mode=enforce`) im Zeitraum sicher gewesen wäre - reiner lokaler
-  Lesebefehl wie `report`/`tls-report`, keine Live-DNS-/HTTPS-Abfrage.
-  Default 30 statt 7 Tage - für eine sinnvolle Einschätzung braucht es mehr
-  als eine Woche Beobachtungszeitraum. **DMARC-Bereitschaft** prüft pro
-  Domain die aktuelle Policy (aus dem jüngsten Report) und zählt bewusst
-  nur Fehlschläge bekannter, eigener Sende-IPs (`own_ip_auth_fail`) gegen
-  die Bereitschaft - unbekannte IPs (`unknown_ip`, potenzielle
-  Spoofing-Versuche) zählen nicht dagegen, genau die soll eine schärfere
-  Policy ja blockieren. **MTA-STS-Bereitschaft** prüft, ob im Zeitraum
-  überhaupt TLS-RPT-Fehlschläge gemeldet wurden. Beide Einschätzungen
-  verlangen zusätzlich eine nach Sendevolumen gestaffelte
-  Mindestbeobachtungsdauer, bevor `ready_for_reject`/`ready_for_enforce`
-  auf `true` steht - selbst bei null Fehlschlägen: unter 1 Eintrag/Sitzung
-  pro Tag im Schnitt mindestens 60 Tage, bei 1 bis unter 5 pro Tag
-  mindestens 30 Tage, ab 5 pro Tag mindestens 14 Tage
-  ([`_recommended_observation_days`](src/dmarcwatch/report.py)) - bei sehr
-  wenig Volumen reicht ein kurzer Zeitraum sonst nicht aus, um
-  sicherzustellen, dass seltene, aber legitime Absender (z. B. monatliche
-  Rechnungen) im Beobachtungsfenster überhaupt schon aufgetaucht wären.
-  Die tatsächlich beobachtete Dauer richtet sich dabei nach dem Alter des
-  ältesten Reports im Fenster, nicht nach dem bloß angefragten `--days` -
-  `stats --days 90` behauptet also keine 90 Tage Beobachtung, wenn eine
+  der nächste Schritt einer gestaffelten Verschärfung von DMARC (Richtung
+  `p=reject`) bzw. MTA-STS (Richtung `mode=enforce`) im Zeitraum sicher
+  gewesen wäre - reiner lokaler Lesebefehl wie `report`/`tls-report`, keine
+  Live-DNS-/HTTPS-Abfrage. Default 30 statt 7 Tage - für eine sinnvolle
+  Einschätzung braucht es mehr als eine Woche Beobachtungszeitraum. Die
+  Ausgabe beginnt immer mit einem Hinweis, dass sie ausschließlich auf
+  bisher gemeldeten Reports basiert - DMARC-/TLS-RPT-Reporting ist
+  branchenweit lückenhaft (nicht jeder Empfänger sendet Reports, manche nur
+  stichprobenartig), "0 Fehlschläge" ist deshalb nie eine Garantie, egal
+  wie ausgefeilt die folgende Berechnung ist.
+
+  **DMARC-Bereitschaft** zählt bewusst nur Fehlschläge bekannter, eigener
+  Sende-IPs (`own_ip_auth_fail`) gegen die Bereitschaft - unbekannte IPs
+  (`unknown_ip`, potenzielle Spoofing-Versuche) zählen nicht dagegen, genau
+  die soll eine schärfere Policy ja blockieren. Modelliert einen
+  gestaffelten Rollout in 25 %-Schritten (`p=none` → `quarantine`
+  25/50/75/100 → `reject` 25/50/75/100 - [`_next_dmarc_rollout_step`](src/dmarcwatch/report.py))
+  statt eines einzigen Sprungs direkt auf `p=reject; pct=100`: eine bereits
+  bei `p=reject` stehende Domain mit `pct=10` gilt NICHT als fertig, es
+  wird weiterhin der nächste `pct`-Schritt empfohlen. **MTA-STS-Bereitschaft**
+  läuft pro Domain unabhängig (eine zweite, unabhängige Domain verwässert
+  nicht mehr die Einschätzung der ersten) und schlüsselt gemeldete
+  TLS-Fehlschläge zusätzlich nach RFC-8460-Ergebnistyp auf, gewichtet mit
+  den tatsächlich fehlgeschlagenen Sitzungen - MTA-STS kennt keinen
+  `pct`-Rollout, nur `testing`/`enforce`.
+
+  Statt "keine einzige Zeile mit Fehlschlag irgendwo im gewählten Fenster"
+  zählt die Zeit seit dem JÜNGSTEN Fehlschlag: ein einzelner alter Vorfall
+  blockiert nicht unbegrenzt, sobald seitdem genug Zeit *und* genug
+  Sendevolumen vergangen sind. Umgekehrt gilt für eine Domain, die
+  BEREITS bei `p=reject` steht: erscheint dort ein frischer
+  `own_ip_auth_fail`, meldet `needs_recheck` das explizit statt
+  stillschweigend "erledigt" zu bleiben - typischerweise ein Zeichen für
+  einen neuen, noch nicht erfassten legitimen Absender oder ein kaputtes
+  SPF/DKIM-Setup (`own_ip_networks` nachträglich anzupassen wirkt dabei
+  nur auf künftige Reports, bereits gespeicherte alte werden nicht
+  rückwirkend neu eingestuft).
+
+  Das nötige Sendevolumen/Zeitfenster-Verhältnis bleibt nach Sendevolumen
+  gestaffelt (unter 1 Nachricht/Sitzung pro Tag im Schnitt mindestens 60
+  Tage seit dem letzten Fehlschlag, bei 1 bis unter 5 pro Tag mindestens
+  30 Tage, ab 5 pro Tag mindestens 14 Tage -
+  [`_recommended_observation_days`](src/dmarcwatch/report.py)), berechnet
+  aus einem jüngeren, rollierenden 30-Tage-Teilfenster statt dem
+  gesamten (potenziell viel längeren) beobachteten Zeitraum - eine frühere,
+  ruhigere Phase soll die nötige Wartezeit für eine Domain, die inzwischen
+  deutlich mehr Post verschickt, nicht künstlich verlängern. Zusätzlich:
+  eine Mindest-Stichprobengröße von 10 echten Nachrichten/Sitzungen
+  (`MIN_SAMPLE_SIZE`) - viele verstrichene Tage mit kaum echtem Volumen
+  rechtfertigen kein "bereit", selbst wenn rechnerisch genug Zeit vergangen
+  wäre. Zählungen (Gesamtzahl, unbekannte/eigene-IP-Fehlschläge,
+  Sendevolumen) basieren auf den echten `count`-Werten der Reports, nicht
+  auf der Anzahl der Report-Zeilen - eine Zeile kann hunderte Nachrichten
+  derselben IP zusammenfassen.
+
+  Eine auffällig große Lücke zwischen Tagen mit mindestens einem Report
+  (deutlich größer als die sonst übliche Lücke dieser Domain) blockiert die
+  Bereitschaft zusätzlich: keine Reports bedeutet nicht "geprüft und
+  sauber", es kann genauso gut heißen, dass `fetch` zwischenzeitlich
+  ausgefallen ist (abgelaufene IMAP-Zugangsdaten, kaputte Filterregel, ...).
+  Die tatsächlich beobachtete Dauer richtet sich generell nach dem Alter
+  des ältesten Reports im Fenster, nicht nach dem bloß angefragten `--days`
+  - `stats --days 90` behauptet also keine 90 Tage Beobachtung, wenn eine
   Domain real erst seit Kürzerem überhaupt Reports liefert.
+
   `--json` gibt strukturierte Ausgabe statt der Tabelle aus - für das
   "Statistik…"-Fenster in der Menüleisten-App gedacht, funktioniert aber
   genauso von Hand im Terminal.
@@ -592,7 +633,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-287 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+312 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**

@@ -48,10 +48,15 @@ struct StatsView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
                             dmarcOverviewCard(response)
-                            if response.mtaStsReadiness.hasData {
+                            if !response.mtaStsReadiness.isEmpty {
                                 tlsOverviewCard(response)
                             }
                             trendCard(response)
+                            Text(
+                                "Hinweis: basiert nur auf bisher gemeldeten Reports - DMARC-/TLS-RPT-Reporting "
+                                + "ist branchenweit lückenhaft (nicht jeder Empfänger meldet), keine Garantie."
+                            )
+                            .font(.caption2).foregroundStyle(.secondary)
                             dmarcReadinessCard(response)
                             mtaStsReadinessCard(response)
                         }
@@ -70,7 +75,7 @@ struct StatsView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 600, height: 860)
+        .frame(width: 640, height: 1000)
     }
 
     private func dmarcOverviewCard(_ response: StatsResponse) -> some View {
@@ -186,6 +191,12 @@ struct StatsView: View {
         }
     }
 
+    // Mindest-Stichprobengröße - gespiegelt aus report.py:MIN_SAMPLE_SIZE
+    // (kein JSON-Feld, da nur für die Erklärtexte hier gebraucht, nicht
+    // Teil der eigentlichen Berechnung, die immer schon serverseitig
+    // passiert ist).
+    private static let minSampleSize = 10
+
     @ViewBuilder
     private func dmarcReadinessCard(_ response: StatsResponse) -> some View {
         card {
@@ -199,56 +210,97 @@ struct StatsView: View {
                     Text(r.domain).font(.callout.bold())
                     Text("Aktuelle Policy: p=\(r.currentPolicy ?? "?"), pct=\(r.currentPct.map(String.init) ?? "?")")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("\(r.totalCount) Einträge, davon \(r.unknownIpFailures) von unbekannten IPs")
+                    Text("\(r.totalCount) E-Mails, davon \(r.unknownIpFailures) von unbekannten IPs")
                         .font(.caption).foregroundStyle(.secondary)
-                    if r.ownIpAuthFailures > 0 {
+                    if r.hasReportingGap {
+                        Text("⚠ Lücke von \(r.reportingGapDays) Tagen ohne jeden Report - vermutlich zwischenzeitlich ausgefallener Abruf.")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                    if r.needsRecheck {
+                        Text("⚠ Bereits bei p=reject, aber own_ip_auth_fail zuletzt am \(r.lastFailureDate ?? "?") - own_ip_networks/SPF/DKIM prüfen (zählt erst ab neuen Reports).")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                    if r.fullyEnforced {
+                        readinessPill(label: "Vollständig durchgesetzt (p=reject, pct=100)", isReady: true)
+                    } else if r.readyForNextStep {
                         readinessPill(
-                            label: "\(r.ownIpAuthFailures) Fehlschläge von eigenen IPs - noch nicht bereit",
-                            isReady: false
+                            label: "Bereit für p=\(r.nextRecommendedPolicy ?? "?"), pct=\(r.nextRecommendedPct.map(String.init) ?? "?")",
+                            isReady: true
                         )
-                    } else if r.currentPolicy == "reject" {
-                        readinessPill(label: "Bereits bei p=reject", isReady: true)
-                    } else if r.observedDays < r.recommendedObservationDays {
-                        VStack(alignment: .leading, spacing: 2) {
-                            readinessPill(label: "Noch nicht bereit - Beobachtungszeit zu kurz", isReady: false)
-                            Text(
-                                String(
-                                    format: "Bei %.1f Einträgen/Tag werden mind. %d Tage empfohlen, bisher nur %d Tage betrachtet.",
-                                    r.avgDailyVolume, r.recommendedObservationDays, r.observedDays
-                                )
-                            )
-                            .font(.caption2).foregroundStyle(.secondary)
-                        }
                     } else {
-                        readinessPill(label: "Bereit für p=reject", isReady: true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            readinessPill(
+                                label: "Noch nicht bereit für p=\(r.nextRecommendedPolicy ?? "?"), pct=\(r.nextRecommendedPct.map(String.init) ?? "?")",
+                                isReady: false
+                            )
+                            if r.ownIpAuthFailures > 0 && r.cleanDays < r.recommendedObservationDays {
+                                Text("Own-IP-Fehlschlag zuletzt am \(r.lastFailureDate ?? "?").")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            } else if r.cleanDays < r.recommendedObservationDays {
+                                Text(
+                                    String(
+                                        format: "Bei %.1f E-Mails/Tag werden mind. %d Tage seit dem letzten Fehlschlag empfohlen, bisher %d Tage sauber.",
+                                        r.avgDailyVolume, r.recommendedObservationDays, r.cleanDays
+                                    )
+                                )
+                                .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            if r.totalCount < Self.minSampleSize {
+                                Text("Erst \(r.totalCount) E-Mails insgesamt beobachtet (mind. \(Self.minSampleSize) empfohlen).")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
+    @ViewBuilder
     private func mtaStsReadinessCard(_ response: StatsResponse) -> some View {
         card {
             Text("MTA-STS-Verschärfung").font(.subheadline.bold()).foregroundStyle(.secondary)
-            let r = response.mtaStsReadiness
-            if !r.hasData {
+            if response.mtaStsReadiness.isEmpty {
                 Text("Keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")
                     .font(.callout).foregroundStyle(.secondary)
-            } else if r.totalFailureCount > 0 {
-                readinessPill(label: "\(r.totalFailureCount) TLS-Fehlschläge - noch nicht bereit", isReady: false)
-            } else if r.observedDays < r.recommendedObservationDays {
-                VStack(alignment: .leading, spacing: 2) {
-                    readinessPill(label: "Noch nicht bereit - Beobachtungszeit zu kurz", isReady: false)
-                    Text(
-                        String(
-                            format: "Bei %.1f TLS-Sitzungen/Tag werden mind. %d Tage empfohlen, bisher nur %d Tage betrachtet.",
-                            r.avgDailyVolume, r.recommendedObservationDays, r.observedDays
-                        )
-                    )
-                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            ForEach(response.mtaStsReadiness) { m in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(m.domain).font(.callout.bold())
+                    if m.totalFailureCount > 0 {
+                        let types = m.failureTypes.sorted { $0.key < $1.key }
+                            .map { "\($0.key) (\($0.value))" }.joined(separator: ", ")
+                        Text("\(m.totalFailureCount) TLS-Fehlschläge" + (types.isEmpty ? "" : " - \(types)"))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if m.hasReportingGap {
+                        Text("⚠ Lücke von \(m.reportingGapDays) Tagen ohne jeden Report - vermutlich zwischenzeitlich ausgefallener Abruf.")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                    if m.readyForEnforce {
+                        readinessPill(label: "Bereit für mode=enforce", isReady: true)
+                    } else {
+                        VStack(alignment: .leading, spacing: 2) {
+                            readinessPill(label: "Noch nicht bereit", isReady: false)
+                            if m.totalFailureCount > 0 && m.cleanDays < m.recommendedObservationDays {
+                                Text("Letzter TLS-Fehlschlag am \(m.lastFailureDate ?? "?").")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            } else if m.cleanDays < m.recommendedObservationDays {
+                                Text(
+                                    String(
+                                        format: "Bei %.1f TLS-Sitzungen/Tag werden mind. %d Tage seit dem letzten Fehlschlag empfohlen, bisher %d Tage sauber.",
+                                        m.avgDailyVolume, m.recommendedObservationDays, m.cleanDays
+                                    )
+                                )
+                                .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            if m.totalSessions < Self.minSampleSize {
+                                Text("Erst \(m.totalSessions) TLS-Sitzungen insgesamt beobachtet (mind. \(Self.minSampleSize) empfohlen).")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
-            } else {
-                readinessPill(label: "Bereit für mode=enforce", isReady: true)
             }
         }
     }
