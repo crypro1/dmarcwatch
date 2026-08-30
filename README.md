@@ -421,6 +421,10 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   wenig Volumen reicht ein kurzer Zeitraum sonst nicht aus, um
   sicherzustellen, dass seltene, aber legitime Absender (z. B. monatliche
   Rechnungen) im Beobachtungsfenster überhaupt schon aufgetaucht wären.
+  Die tatsächlich beobachtete Dauer richtet sich dabei nach dem Alter des
+  ältesten Reports im Fenster, nicht nach dem bloß angefragten `--days` -
+  `stats --days 90` behauptet also keine 90 Tage Beobachtung, wenn eine
+  Domain real erst seit Kürzerem überhaupt Reports liefert.
   `--json` gibt strukturierte Ausgabe statt der Tabelle aus - für das
   "Statistik…"-Fenster in der Menüleisten-App gedacht, funktioniert aber
   genauso von Hand im Terminal.

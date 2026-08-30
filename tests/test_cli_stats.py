@@ -70,7 +70,12 @@ def test_json_output_structure(tmp_path, monkeypatch, capsys):
     # unknown_ip - zählt nicht gegen die Bereitschaft.
     assert readiness["unknown_ip_failures"] == 1
     assert readiness["own_ip_auth_failures"] == 0
-    assert readiness["ready_for_reject"] is True
+    # Der Report ist real erst ~2 Stunden alt, obwohl --days 90 angefragt
+    # wurde - observed_days muss das tatsächliche Alter widerspiegeln
+    # (hier < 1 Tag, auf 1 gerundet), nicht das angefragte Fenster selbst,
+    # deshalb noch nicht bereit trotz 0 own_ip_auth_failures.
+    assert readiness["observed_days"] == 1
+    assert readiness["ready_for_reject"] is False
     assert output["mta_sts_readiness"]["has_data"] is False
 
 
@@ -82,7 +87,7 @@ def test_table_output_when_json_not_set(tmp_path, monkeypatch, capsys):
     assert result == 0
     out = capsys.readouterr().out
     assert "example.com" in out
-    assert "Bereit für p=reject" in out
+    assert "Noch nicht bereit" in out
 
 
 def test_no_reports_returns_empty_structure(tmp_path, monkeypatch, capsys):

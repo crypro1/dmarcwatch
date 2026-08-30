@@ -4,6 +4,20 @@ Alle nennenswerten Änderungen an dmarcwatch werden hier festgehalten.
 Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
+## [1.0.1] - 2026-08-30
+
+### Behoben
+- `dmarcwatch stats`/"Statistik…": die für die Verschärfungs-Einschätzung
+  nötige Mindestbeobachtungsdauer (`observed_days`) wurde bisher direkt
+  aus dem angefragten `--days`-Wert übernommen statt aus dem tatsächlichen
+  Alter des ältesten Reports im Fenster - `stats --days 90` konnte dadurch
+  fälschlich "90 Tage beobachtet" anzeigen, obwohl eine Domain real erst
+  seit deutlich kürzerer Zeit überhaupt Reports lieferte, und so eine
+  Verschärfung als sicher ausweisen, ohne dass zusätzliche Zeit vergangen
+  oder zusätzliche Daten hinzugekommen wären. `observed_days` (und darauf
+  aufbauend `avg_daily_volume`) wird jetzt aus der tatsächlichen
+  Reporthistorie berechnet.
+
 ## [1.0.0] - 2026-08-29
 
 Erster versionierter Release. Bündelt die gesamte bisherige Entwicklung

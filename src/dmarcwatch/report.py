@@ -359,7 +359,13 @@ class DMARCReadiness:
     wenig Sendevolumen tauchen seltene, aber echte eigene Absender
     (monatliche Rechnungen, Newsletter, ...) in einem kurzen Fenster u. U.
     gar nicht auf, ein "0 Fehlschläge"-Ergebnis wäre dann nicht wirklich
-    aussagekräftig, auch wenn es technisch stimmt."""
+    aussagekräftig, auch wenn es technisch stimmt.
+
+    observed_days ist bewusst NICHT das angefragte --days-Fenster selbst,
+    sondern das tatsächliche Alter des ältesten Reports darin (bis
+    until_ts) - sonst würde ein einfaches `stats --days 90` sofort "90
+    Tage beobachtet" behaupten, selbst wenn die Domain real erst seit
+    wenigen Tagen überhaupt Reports liefert."""
 
     domain: str
     current_policy: str | None
@@ -386,7 +392,7 @@ def _recommended_observation_days(avg_daily_volume: float) -> int:
     return 14
 
 
-def compute_dmarc_readiness(rows: list[ReportRow], days: int) -> list[DMARCReadiness]:
+def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> list[DMARCReadiness]:
     by_domain: dict[str, list[ReportRow]] = {}
     for r in rows:
         if r.domain:
@@ -395,9 +401,16 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int) -> list[DMARCReadi
     result = []
     for domain, domain_rows in by_domain.items():
         latest = max(domain_rows, key=lambda r: r.date_begin)
+        earliest = min(domain_rows, key=lambda r: r.date_begin)
         unknown_ip = sum(1 for r in domain_rows if REASON_UNKNOWN_IP in r.flag_reasons)
         own_ip_fail = sum(1 for r in domain_rows if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons)
-        avg_daily = len(domain_rows) / days if days > 0 else 0.0
+        # Tatsächlich beobachteter Zeitraum = Alter des ältesten Reports
+        # innerhalb des Fensters, NICHT das angefragte --days selbst - sonst
+        # würde ein einfaches "stats --days 90" sofort "90 Tage beobachtet"
+        # behaupten, selbst wenn das Postfach real erst seit 10 Tagen
+        # überhaupt Reports liefert.
+        observed_days = max(1, (until_ts - earliest.date_begin) // 86400)
+        avg_daily = len(domain_rows) / observed_days
         recommended_days = _recommended_observation_days(avg_daily)
         result.append(
             DMARCReadiness(
@@ -409,9 +422,9 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int) -> list[DMARCReadi
                 own_ip_auth_failures=own_ip_fail,
                 avg_daily_volume=avg_daily,
                 recommended_observation_days=recommended_days,
-                observed_days=days,
+                observed_days=observed_days,
                 ready_for_reject=(
-                    own_ip_fail == 0 and latest.policy_p != "reject" and days >= recommended_days
+                    own_ip_fail == 0 and latest.policy_p != "reject" and observed_days >= recommended_days
                 ),
             )
         )
@@ -430,7 +443,9 @@ class MTASTSReadiness:
     Sendevolumen-Staffelung wie bei DMARC (siehe
     _recommended_observation_days) - wenige TLS-Sitzungen pro Tag
     bedeuten, dass ein kurzes "0 Fehlschläge"-Fenster noch nicht viele
-    verschiedene empfangende Mailserver tatsächlich durchlaufen hat."""
+    verschiedene empfangende Mailserver tatsächlich durchlaufen hat.
+    observed_days ist wie bei DMARCReadiness das tatsächliche Alter des
+    ältesten TLS-RPT-Reports, nicht das angefragte --days-Fenster."""
 
     total_failure_count: int
     has_data: bool
@@ -440,24 +455,28 @@ class MTASTSReadiness:
     ready_for_enforce: bool
 
 
-def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int) -> MTASTSReadiness:
+def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts: int) -> MTASTSReadiness:
     if not tls_rows:
         recommended_days = _recommended_observation_days(0.0)
         return MTASTSReadiness(
             total_failure_count=0, has_data=False, avg_daily_volume=0.0,
-            recommended_observation_days=recommended_days, observed_days=days, ready_for_enforce=False,
+            recommended_observation_days=recommended_days, observed_days=0, ready_for_enforce=False,
         )
+    # Siehe compute_dmarc_readiness oben: tatsächlich beobachteter Zeitraum
+    # statt des bloß angefragten --days.
+    earliest_ts = min(r.date_begin for r in tls_rows)
+    observed_days = max(1, (until_ts - earliest_ts) // 86400)
     total_failures = sum(r.failure_count for r in tls_rows)
     total_sessions = sum(r.successful_session_count + r.failure_count for r in tls_rows)
-    avg_daily = total_sessions / days if days > 0 else 0.0
+    avg_daily = total_sessions / observed_days
     recommended_days = _recommended_observation_days(avg_daily)
     return MTASTSReadiness(
         total_failure_count=total_failures,
         has_data=True,
         avg_daily_volume=avg_daily,
         recommended_observation_days=recommended_days,
-        observed_days=days,
-        ready_for_enforce=total_failures == 0 and days >= recommended_days,
+        observed_days=observed_days,
+        ready_for_enforce=total_failures == 0 and observed_days >= recommended_days,
     )
 
 
