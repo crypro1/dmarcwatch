@@ -406,8 +406,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
     daily = collect_daily_stats(rows)
     tls_daily = collect_tls_daily_stats(tls_rows)
-    dmarc_readiness = compute_dmarc_readiness(rows, args.days)
-    mta_sts_readiness = compute_mta_sts_readiness(tls_rows, args.days)
+    dmarc_readiness = compute_dmarc_readiness(rows, args.days, until_ts)
+    mta_sts_readiness = compute_mta_sts_readiness(tls_rows, args.days, until_ts)
 
     if args.json:
         json.dump(
