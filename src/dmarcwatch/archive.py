@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import io
 import zipfile
+import zlib
 
 _CHUNK_SIZE = 64 * 1024
 
@@ -45,7 +46,17 @@ def _extract_gz(data: bytes, max_size_bytes: int) -> bytes:
             return _read_bounded(gz, max_size_bytes)
     except ArchiveError:
         raise
-    except OSError as exc:
+    # Ein abgeschnittener gzip-Stream wirft EOFError (kein OSError-Subtyp,
+    # empirisch geprüft), ein bitweise beschädigter Stream kann direkt aus
+    # zlib ein zlib.error werfen statt eines von gzip gekapselten OSError -
+    # beides würde sonst am docstring-Vertrag "wirft ArchiveError bei jedem
+    # Problem" vorbei nach oben durchschlagen. In fetch.py fängt der
+    # Aufrufer gezielt nur (ArchiveError, ReportParseError) pro Anhang ab;
+    # ein entkommener EOFError/zlib.error würde den kompletten fetch-Lauf
+    # abbrechen, BEVOR die Nachricht als verarbeitet markiert wird - ein
+    # einzelner böswillig abgeschnittener Anhang an die rua-Adresse würde
+    # damit jeden künftigen Lauf erneut zum Absturz bringen.
+    except (OSError, EOFError, zlib.error) as exc:
         raise ArchiveError(f"Ungültiges gzip-Archiv: {exc}") from exc
 
 

@@ -7,6 +7,7 @@ import gzip
 import io
 import os
 import zipfile
+import zlib
 
 import pytest
 
@@ -101,6 +102,41 @@ def test_bad_zip_rejected():
 def test_bad_gz_rejected():
     with pytest.raises(ArchiveError):
         extract_report_xml("broken.xml.gz", b"not gzip data", MAX_ATTACHMENT, MAX_XML)
+
+
+def test_truncated_gz_rejected():
+    """Ein an beliebiger Stelle abgeschnittener (aber am Anfang gültiger)
+    gzip-Stream wirft empirisch EOFError statt OSError
+    ("Compressed file ended before the end-of-stream marker was reached") -
+    kein OSError-Subtyp, würde also am `except OSError` in _extract_gz
+    vorbei nach oben durchschlagen, wenn der nicht auch EOFError fängt.
+    Für einen Angreifer (jeder kann eine Mail an die rua-Adresse schicken,
+    siehe Sicherheitsentscheidungen) ist ein abgeschnittener Anhang
+    trivial zu erzeugen."""
+    payload = b"<feedback><record>hello world</record></feedback>" * 50
+    compressed = gzip.compress(payload)
+    for frac in (0.1, 0.5, 0.9, 0.99):
+        truncated = compressed[: int(len(compressed) * frac)]
+        with pytest.raises(ArchiveError):
+            extract_report_xml("broken.xml.gz", truncated, MAX_ATTACHMENT, MAX_XML)
+
+
+def test_corrupted_gz_zlib_error_rejected(monkeypatch):
+    """Bitweise Beschädigung mitten im komprimierten Datenteil kann direkt
+    aus zlib ein zlib.error werfen (z. B. "invalid code lengths set"),
+    nicht das von gzip gekapselte OSError/BadGzipFile - ebenfalls kein
+    OSError-Subtyp, empirisch mit echt korrumpierten Bytes nachgewiesen.
+    Hier wird GzipFile.read() direkt gepatcht statt eines echt
+    korrumpierten Streams, weil der exakte Byte-Offset, an dem zlib
+    tatsächlich zlib.error statt z. B. eines CRC-Fehlers wirft, von der
+    zlib-Version abhängt - für diesen Test zählt nur, dass _extract_gz
+    den Exception-Typ überhaupt behandelt, nicht die exakte Bytefolge."""
+    def raise_zlib_error(self, *args, **kwargs):
+        raise zlib.error("Error -3 while decompressing data: invalid code lengths set")
+
+    monkeypatch.setattr(gzip.GzipFile, "read", raise_zlib_error)
+    with pytest.raises(ArchiveError):
+        extract_report_xml("broken.xml.gz", gzip.compress(b"anything"), MAX_ATTACHMENT, MAX_XML)
 
 
 def test_json_plain_passthrough():

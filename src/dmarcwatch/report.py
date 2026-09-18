@@ -1,11 +1,12 @@
 """Tabellarische Zusammenfassung für die CLI (`dmarcwatch report`)."""
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
 
-from .anomaly import REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
+from .anomaly import REASON_DISPOSITION, REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
 from .sanitize import sanitize_field
 from .store import query_records, query_tls_failure_details, query_tls_policies
 
@@ -15,6 +16,115 @@ _MAX_JSON_FIELD_LEN = 120
 def day_range_to_ts(days: int) -> tuple[int, int]:
     now = int(time.time())
     return now - days * 86400, now
+
+
+# Metadaten-Konsistenzprüfung zwischen report_metadata/org_name und der
+# Absenderdomain der Report-Mail selbst (report_metadata/email bzw.
+# TLS-RPT contact_info) - siehe is_consistent_reporter() unten für die
+# vollständige Begründung und die dokumentierte Grenze (KEINE
+# Authentifizierung). Microsofts DMARC-Aggregate-Reports melden
+# org_name="Enterprise Outlook", nicht "Microsoft" - nach echten
+# Produktivdaten oft der mit Abstand größte einzelne Reporter, den die
+# generische Substring-Regel unten sonst fälschlich als inkonsistent
+# ausschließen würde. consistent_reporter_overrides in config.py erweitert
+# diese Liste ohne App-Update.
+DEFAULT_CONSISTENT_REPORTERS: dict[str, tuple[str, ...]] = {
+    "enterpriseoutlook": ("microsoft.com",),
+}
+
+
+def _normalize_for_consistency(value: str) -> str:
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+# Kürzere org_name-Wörter (Rechtsformen wie "Inc"/"LLC"/"Ltd", generische
+# Kürzel) sind zu unspezifisch, um für sich allein etwas über Konsistenz
+# auszusagen - siehe _org_name_words().
+_MIN_ORG_WORD_LEN = 4
+
+
+def _org_name_words(org_name: str) -> list[str]:
+    return [w for w in re.split(r"[^a-z0-9]+", (org_name or "").lower()) if len(w) >= _MIN_ORG_WORD_LEN]
+
+
+def _email_domain(email: str) -> str | None:
+    if "@" not in (email or ""):
+        return None
+    domain = email.rsplit("@", 1)[-1].strip().lower().rstrip(".")
+    return domain or None
+
+
+def _domain_matches_suffix(domain: str, suffix: str) -> bool:
+    domain = domain.strip().lower().rstrip(".")
+    suffix = suffix.strip().lower().rstrip(".")
+    return bool(suffix) and (domain == suffix or domain.endswith("." + suffix))
+
+
+def is_consistent_reporter(
+    org_name: str, email: str, overrides: dict[str, tuple[str, ...]] | None = None
+) -> bool:
+    """Prüft NUR Metadaten-Konsistenz zwischen org_name und der
+    Absenderdomain der Report-Mail (report_metadata/email bei DMARC,
+    contact_info bei TLS-RPT) - beide Felder stehen im selben,
+    unauthentifizierten XML/JSON und sind für einen Angreifer, der
+    ohnehin schon eine Mail an die rua-Adresse schicken kann, gemeinsam
+    trivial fälschbar (z. B. ein reales Google-Paar 1:1 kopieren). Das ist
+    bewusst KEINE Verifikation, nur ein Filter gegen Zero-Effort-
+    Fälschungen (zufälliger org_name ohne passende Mail-Domain) - eine
+    echte Kontrolle wäre erst eine DKIM-Prüfung der Report-Mail selbst
+    (nicht implementiert, würde DNS-Lookups brauchen und damit das
+    Versprechen "fetch spricht ausschließlich mit dem IMAP-Host"
+    verletzen - ein möglicher künftiger, ausdrücklich optionaler Schritt).
+
+    Für allowlisted org_names (DEFAULT_CONSISTENT_REPORTERS oder
+    consistent_reporter_overrides) ERSETZT der Domain-Suffix-Check
+    (_domain_matches_suffix, echte Zonen-Grenze) die generische
+    Substring-Regel unten, statt sie zu ergänzen - ein additives ODER
+    würde für bekannte org_names weiterhin die spoofbarste Regel
+    durchlassen (org_name="mimecast" + eine beliebige selbst kontrollierte
+    Domain mit "mimecast" irgendwo drin käme sonst durch). Jeder
+    Allowlist-Eintrag ist damit eine Verschärfung für diesen Reporter,
+    keine Reparatur.
+
+    Die generische Regel für alles außerhalb der Allowlist prüft, ob
+    IRGENDEIN eigenständiges Wort (mind. 4 Zeichen, siehe
+    _org_name_words()) aus org_name in der normalisierten Domain vorkommt -
+    nicht der gesamte org_name als ein Stück. Grund, empirisch an echten
+    TLS-RPT-Reports gefunden: derselbe Anbieter meldet je nach Report-Typ
+    unterschiedliche org_names ("google.com" bei DMARC, aber "Google Inc."
+    bei TLS-RPT; "Microsoft Corporation" bei TLS-RPT statt "Enterprise
+    Outlook" bei DMARC) - "Google Inc." als GANZE Zeichenkette ist kein
+    Substring von "google.com" (normalisiert "googlecom" vs. "googleinc"),
+    das Kernwort "google" aber schon. Kurze Wörter (Rechtsformen wie "Inc",
+    generische Kürzel) bleiben ausgeschlossen, um nicht rein zufällig zu
+    matchen; hat org_name gar kein Wort ab dieser Länge (z. B. "GMX"),
+    fällt die Regel auf den alten Ganzstring-Vergleich zurück.
+
+    Bleibt ausdrücklich spoofbar (reine Zeichenketten-Enthaltung nach
+    Normalisierung, keine Zonen-Grenze wie beim Suffix-Check oben) - z. B.
+    org_name="amazonses" + "amazonses.evil.example" käme durch, und die
+    Wort-Regel macht das eher großzügiger als strenger. Strukturell nur
+    mit einer Public-Suffix-Liste zu schließen, was gegen die ohnehin
+    dominierende Identitäts-Kopie (echtes Paar kopieren, siehe oben) kein
+    zusätzlicher Schutz wäre - deshalb hier bewusst nicht gebaut, nur
+    dokumentiert.
+
+    Fail-closed: eine fehlende oder nicht auswertbare E-Mail-Adresse zählt
+    als inkonsistent, keine Ausnahme."""
+    domain = _email_domain(email)
+    if domain is None:
+        return False
+    normalized_org = _normalize_for_consistency(org_name)
+    if not normalized_org:
+        return False
+    allowlist = {**DEFAULT_CONSISTENT_REPORTERS, **(overrides or {})}
+    if normalized_org in allowlist:
+        return any(_domain_matches_suffix(domain, suffix) for suffix in allowlist[normalized_org])
+    normalized_domain = _normalize_for_consistency(domain)
+    words = _org_name_words(org_name)
+    if not words:
+        return normalized_org in normalized_domain
+    return any(word in normalized_domain for word in words)
 
 
 @dataclass
@@ -35,13 +145,29 @@ class ReportRow:
     domain: str = ""
     policy_p: str = ""
     policy_pct: int = 100
+    # War bereits in der DB (query_records selektiert es), aber bis eben
+    # nicht bis hierher durchgereicht - für compute_dmarc_readiness gebraucht,
+    # um own_ip_auth_fail (dkim UND spf fail) von einem partiellen Auth-Fail
+    # auf einer eigenen IP zu unterscheiden (nur einer von beiden scheitert,
+    # aber disposition != none - typischerweise ein Zeichen für ein
+    # kaputtes/rotierendes SPF- oder DKIM-Setup).
+    is_own_ip: bool = False
+    # report_metadata/email - für is_consistent_reporter() gebraucht, siehe dort.
+    email: str = ""
+    is_consistent: bool = False
 
 
-def collect_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list[ReportRow]:
+def collect_rows(
+    conn: sqlite3.Connection,
+    since_ts: int,
+    until_ts: int,
+    consistent_reporter_overrides: dict[str, tuple[str, ...]] | None = None,
+) -> list[ReportRow]:
     rows = query_records(conn, since_ts, until_ts)
     result = []
     for r in rows:
         reasons = [x for x in (r["flag_reasons"] or "").split(",") if x]
+        email = r["email"] or ""
         result.append(
             ReportRow(
                 date_begin=r["date_begin"],
@@ -57,6 +183,9 @@ def collect_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list
                 domain=r["domain"],
                 policy_p=r["policy_p"],
                 policy_pct=r["policy_pct"],
+                is_own_ip=bool(r["is_own_ip"]),
+                email=email,
+                is_consistent=is_consistent_reporter(r["org_name"], email, consistent_reporter_overrides),
             )
         )
     return result
@@ -205,9 +334,19 @@ class TLSPolicyRow:
     # Anzahl der failure-details-Einträge) - ein einzelner Eintrag kann
     # hunderte Sitzungen abdecken, siehe compute_mta_sts_readiness.
     failure_type_counts: dict[str, int] = field(default_factory=dict)
+    # tls_reports.contact_info - laut RFC 8460 die Kontaktadresse des
+    # Reporters, meist eine E-Mail-Adresse, für is_consistent_reporter()
+    # analog zu ReportRow.email.
+    contact_info: str = ""
+    is_consistent: bool = False
 
 
-def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> list[TLSPolicyRow]:
+def collect_tls_rows(
+    conn: sqlite3.Connection,
+    since_ts: int,
+    until_ts: int,
+    consistent_reporter_overrides: dict[str, tuple[str, ...]] | None = None,
+) -> list[TLSPolicyRow]:
     rows = query_tls_policies(conn, since_ts, until_ts)
     result = []
     for r in rows:
@@ -220,6 +359,7 @@ def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> 
                 failure_type_counts[fd["result_type"]] = (
                     failure_type_counts.get(fd["result_type"], 0) + fd["failed_session_count"]
                 )
+        contact_info = r["contact_info"] or ""
         result.append(
             TLSPolicyRow(
                 tls_policy_id=r["id"],
@@ -231,6 +371,10 @@ def collect_tls_rows(conn: sqlite3.Connection, since_ts: int, until_ts: int) -> 
                 failure_count=r["failure_count"],
                 failure_result_types=failure_result_types,
                 failure_type_counts=failure_type_counts,
+                contact_info=contact_info,
+                is_consistent=is_consistent_reporter(
+                    r["organization_name"], contact_info, consistent_reporter_overrides
+                ),
             )
         )
     return result
@@ -435,9 +579,10 @@ class DMARCReadiness:
     Änderung, nur ein Blick auf bereits vorhandene Reports.
 
     own_ip_auth_failures (bekannte, eigene Sende-IPs, die an SPF/DKIM
-    scheitern) blockiert den nächsten Schritt, unknown_ip_failures
-    (potenzielle Spoofing-Versuche) bewusst nicht - genau die soll eine
-    schärfere Policy ja abfangen.
+    scheitern - vollständig, ODER nur teilweise mit disposition != none,
+    z. B. bei einem rotierenden/kaputten DKIM-Selector) blockiert den
+    nächsten Schritt, unknown_ip_failures (potenzielle Spoofing-Versuche)
+    bewusst nicht - genau die soll eine schärfere Policy ja abfangen.
 
     Statt "keine einzige own_ip_auth_fail irgendwo im gewählten Fenster"
     zählt die Zeit seit dem JÜNGSTEN own_ip_auth_fail (clean_days) - ein
@@ -470,7 +615,27 @@ class DMARCReadiness:
     Wichtige Grenze, die dieses Feld NICHT auflöst: DMARC-Aggregate-
     Reporting ist branchenweit lückenhaft - nicht jeder Empfänger sendet
     Reports, manche nur stichprobenartig. "0 Fehlschläge" heißt immer nur
-    "0 Fehlschläge unter dem, was uns gemeldet wurde", nie eine Garantie."""
+    "0 Fehlschläge unter dem, was uns gemeldet wurde", nie eine Garantie.
+
+    Zusätzliche, davon unabhängige Grenze: report_metadata/org_name und
+    /email stehen BEIDE im selben, unauthentifizierten Report-XML - ein
+    Angreifer, der ohnehin schon eine Mail an die rua-Adresse schicken
+    kann, könnte z. B. ein reales Google-Paar kopieren und damit einen
+    fingierten own_ip_auth_fail einschleusen, der clean_days beliebig oft
+    resettet, oder mit einem hohen count Volumen vortäuschen, um eine
+    frühere Verschärfung zu erzwingen. Alle readiness-relevanten Felder
+    (total_count, unknown_ip_failures, own_ip_auth_failures, clean_days,
+    avg_daily_volume, observed_days, has_reporting_gap, current_policy/pct
+    als Basis für next_recommended_*/fully_enforced/ready_for_next_step)
+    werden deshalb NUR aus Reports mit is_consistent_reporter()=True
+    berechnet - Reports mit inkonsistentem org_name/email fließen dort
+    nicht ein, auch wenn sie sonst wie einer der eigenen own_ip_networks
+    aussehen. excluded_count/excluded_reporters machen sichtbar, wie viel
+    und von wem dabei ausgeschlossen wurde, statt die Verschiebung
+    stillschweigend in der Mathematik verschwinden zu lassen - dieselbe
+    "keine stille Verhaltensänderung"-Logik wie bei has_reporting_gap.
+    is_consistent_reporter() ist ausdrücklich KEINE Authentifizierung, nur
+    ein Filter gegen Zero-Effort-Fälschungen, siehe deren Docstring."""
 
     domain: str
     current_policy: str | None
@@ -490,6 +655,8 @@ class DMARCReadiness:
     fully_enforced: bool
     ready_for_next_step: bool
     needs_recheck: bool
+    excluded_count: int
+    excluded_reporters: list[str]
 
 
 def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> list[DMARCReadiness]:
@@ -500,11 +667,71 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
 
     result = []
     for domain, domain_rows in by_domain.items():
-        latest = max(domain_rows, key=lambda r: r.date_begin)
-        earliest = min(domain_rows, key=lambda r: r.date_begin)
-        total_count = sum(r.count for r in domain_rows)
-        unknown_ip = sum(r.count for r in domain_rows if REASON_UNKNOWN_IP in r.flag_reasons)
-        own_ip_fail_rows = [r for r in domain_rows if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons]
+        # Alle readiness-relevanten Berechnungen unten laufen NUR über
+        # consistent_rows (siehe DMARCReadiness-Docstring) - domain_rows
+        # (alle, inklusive inkonsistenter) wird nur noch für
+        # excluded_count/excluded_reporters und den Anzeige-Fallback
+        # gebraucht, wenn gar keine konsistenten Reports vorliegen.
+        consistent_rows = [r for r in domain_rows if r.is_consistent]
+        excluded_rows = [r for r in domain_rows if not r.is_consistent]
+        excluded_count = sum(r.count for r in excluded_rows)
+        excluded_reporters = sorted({r.org_name for r in excluded_rows})
+
+        if not consistent_rows:
+            # Vollständig inkonsistent - Domain trotzdem sichtbar
+            # emittieren (sonst würde die Menüleiste stillschweigend von
+            # "1 Domain, noch nicht bereit" auf "keine Domains" springen),
+            # aber konservativ: kein clean_days/avg_daily_volume aus
+            # unverifizierbaren Daten behaupten. current_policy/pct kommt
+            # hier ausnahmsweise aus ALLEN Rows (reine Anzeige der eigenen,
+            # per DNS veröffentlichten Policy, kaum schädlich fälschbar) -
+            # geht aber nicht in ready_for_next_step ein, das bleibt False.
+            latest = max(domain_rows, key=lambda r: r.date_begin)
+            next_policy, next_pct = _next_dmarc_rollout_step(
+                latest.policy_p or None, latest.policy_pct
+            ) or (None, None)
+            result.append(
+                DMARCReadiness(
+                    domain=domain,
+                    current_policy=latest.policy_p or None,
+                    current_pct=latest.policy_pct,
+                    total_count=0,
+                    unknown_ip_failures=0,
+                    own_ip_auth_failures=0,
+                    avg_daily_volume=0.0,
+                    recommended_observation_days=_recommended_observation_days(0.0),
+                    observed_days=0,
+                    clean_days=0,
+                    last_failure_date=None,
+                    has_reporting_gap=False,
+                    reporting_gap_days=0,
+                    next_recommended_policy=next_policy,
+                    next_recommended_pct=next_pct,
+                    fully_enforced=next_policy is None,
+                    ready_for_next_step=False,
+                    needs_recheck=False,
+                    excluded_count=excluded_count,
+                    excluded_reporters=excluded_reporters,
+                )
+            )
+            continue
+
+        latest = max(consistent_rows, key=lambda r: r.date_begin)
+        earliest = min(consistent_rows, key=lambda r: r.date_begin)
+        total_count = sum(r.count for r in consistent_rows)
+        unknown_ip = sum(r.count for r in consistent_rows if REASON_UNKNOWN_IP in r.flag_reasons)
+        # own_ip_auth_fail (dkim UND spf fail) fängt nur den vollständigen
+        # Auth-Fail ab - ein PARTIELLER Fail auf einer eigenen IP (nur dkim
+        # oder nur spf, aber disposition != none, z. B. bei einer
+        # rotierenden/kaputten Selector-Konfiguration) würde sonst
+        # unsichtbar bleiben, obwohl er dieselbe Ursache haben kann: eigene,
+        # legitime Mail wird durchgesetzt abgelehnt.
+        own_ip_fail_rows = [
+            r
+            for r in consistent_rows
+            if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons
+            or (r.is_own_ip and REASON_DISPOSITION in r.flag_reasons)
+        ]
         own_ip_fail = sum(r.count for r in own_ip_fail_rows)
 
         # Tatsächlich beobachteter Zeitraum = Alter des ältesten Reports
@@ -524,11 +751,11 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
 
         recent_window = min(observed_days, _RECENT_VOLUME_WINDOW_DAYS)
         recent_since = until_ts - recent_window * 86400
-        recent_count = sum(r.count for r in domain_rows if r.date_begin >= recent_since)
+        recent_count = sum(r.count for r in consistent_rows if r.date_begin >= recent_since)
         avg_daily = recent_count / recent_window
         recommended_days = _recommended_observation_days(avg_daily)
 
-        has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in domain_rows])
+        has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in consistent_rows])
 
         next_policy, next_pct = _next_dmarc_rollout_step(latest.policy_p or None, latest.policy_pct) or (None, None)
         fully_enforced = next_policy is None
@@ -563,6 +790,8 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
                 fully_enforced=fully_enforced,
                 ready_for_next_step=ready_for_next_step,
                 needs_recheck=needs_recheck,
+                excluded_count=excluded_count,
+                excluded_reporters=excluded_reporters,
             )
         )
     return result
@@ -599,7 +828,14 @@ class MTASTSReadiness:
     Aufschlüsselung statt einer eigenen Einstufung.
 
     Gleiche Grenze wie bei DMARC: TLS-RPT-Reporting ist ebenfalls
-    branchenweit lückenhaft, "0 Fehlschläge" ist keine Garantie."""
+    branchenweit lückenhaft, "0 Fehlschläge" ist keine Garantie.
+
+    Ebenfalls wie bei DMARC: report_metadata/organization_name und
+    contact_info stehen beide im selben, unauthentifizierten Report - alle
+    Felder hier werden deshalb NUR aus Reports mit
+    is_consistent_reporter()=True berechnet, excluded_count/
+    excluded_reporters machen sichtbar, was dabei ausgeschlossen wurde.
+    Siehe DMARCReadiness-Docstring für die volle Begründung."""
 
     domain: str
     total_sessions: int
@@ -613,6 +849,8 @@ class MTASTSReadiness:
     has_reporting_gap: bool
     reporting_gap_days: int
     ready_for_enforce: bool
+    excluded_count: int
+    excluded_reporters: list[str]
 
 
 def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts: int) -> list[MTASTSReadiness]:
@@ -623,13 +861,39 @@ def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts:
 
     result = []
     for domain, domain_rows in by_domain.items():
-        earliest_ts = min(r.date_begin for r in domain_rows)
+        consistent_rows = [r for r in domain_rows if r.is_consistent]
+        excluded_rows = [r for r in domain_rows if not r.is_consistent]
+        excluded_count = sum(r.successful_session_count + r.failure_count for r in excluded_rows)
+        excluded_reporters = sorted({r.org_name for r in excluded_rows})
+
+        if not consistent_rows:
+            result.append(
+                MTASTSReadiness(
+                    domain=domain,
+                    total_sessions=0,
+                    total_failure_count=0,
+                    failure_types={},
+                    avg_daily_volume=0.0,
+                    recommended_observation_days=_recommended_observation_days(0.0),
+                    observed_days=0,
+                    clean_days=0,
+                    last_failure_date=None,
+                    has_reporting_gap=False,
+                    reporting_gap_days=0,
+                    ready_for_enforce=False,
+                    excluded_count=excluded_count,
+                    excluded_reporters=excluded_reporters,
+                )
+            )
+            continue
+
+        earliest_ts = min(r.date_begin for r in consistent_rows)
         observed_days = max(1, (until_ts - earliest_ts) // 86400)
 
-        failing_rows = [r for r in domain_rows if r.failure_count > 0]
-        total_failures = sum(r.failure_count for r in domain_rows)
+        failing_rows = [r for r in consistent_rows if r.failure_count > 0]
+        total_failures = sum(r.failure_count for r in consistent_rows)
         failure_types: dict[str, int] = {}
-        for r in domain_rows:
+        for r in consistent_rows:
             for ftype, count in r.failure_type_counts.items():
                 failure_types[ftype] = failure_types.get(ftype, 0) + count
 
@@ -644,14 +908,14 @@ def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts:
         recent_window = min(observed_days, _RECENT_VOLUME_WINDOW_DAYS)
         recent_since = until_ts - recent_window * 86400
         recent_sessions = sum(
-            r.successful_session_count + r.failure_count for r in domain_rows if r.date_begin >= recent_since
+            r.successful_session_count + r.failure_count for r in consistent_rows if r.date_begin >= recent_since
         )
         avg_daily = recent_sessions / recent_window
         recommended_days = _recommended_observation_days(avg_daily)
 
-        has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in domain_rows])
+        has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in consistent_rows])
 
-        total_sessions = sum(r.successful_session_count + r.failure_count for r in domain_rows)
+        total_sessions = sum(r.successful_session_count + r.failure_count for r in consistent_rows)
         ready_for_enforce = clean_days >= recommended_days and total_sessions >= MIN_SAMPLE_SIZE and not has_gap
 
         result.append(
@@ -666,6 +930,8 @@ def compute_mta_sts_readiness(tls_rows: list[TLSPolicyRow], days: int, until_ts:
                 clean_days=clean_days,
                 last_failure_date=last_failure_date,
                 has_reporting_gap=has_gap,
+                excluded_count=excluded_count,
+                excluded_reporters=excluded_reporters,
                 reporting_gap_days=gap_days,
                 ready_for_enforce=ready_for_enforce,
             )
@@ -690,7 +956,9 @@ def to_stats_json_dict(
         "dmarc_readiness": [
             {
                 "domain": sanitize_field(r.domain, max_len=_MAX_JSON_FIELD_LEN),
-                "current_policy": r.current_policy,
+                "current_policy": sanitize_field(r.current_policy, max_len=_MAX_JSON_FIELD_LEN)
+                if r.current_policy
+                else r.current_policy,
                 "current_pct": r.current_pct,
                 "total_count": r.total_count,
                 "unknown_ip_failures": r.unknown_ip_failures,
@@ -707,6 +975,10 @@ def to_stats_json_dict(
                 "fully_enforced": r.fully_enforced,
                 "ready_for_next_step": r.ready_for_next_step,
                 "needs_recheck": r.needs_recheck,
+                "excluded_count": r.excluded_count,
+                "excluded_reporters": [
+                    sanitize_field(name, max_len=_MAX_JSON_FIELD_LEN) for name in r.excluded_reporters
+                ],
             }
             for r in dmarc_readiness
         ],
@@ -726,6 +998,10 @@ def to_stats_json_dict(
                 "has_reporting_gap": r.has_reporting_gap,
                 "reporting_gap_days": r.reporting_gap_days,
                 "ready_for_enforce": r.ready_for_enforce,
+                "excluded_count": r.excluded_count,
+                "excluded_reporters": [
+                    sanitize_field(name, max_len=_MAX_JSON_FIELD_LEN) for name in r.excluded_reporters
+                ],
             }
             for r in mta_sts_readiness
         ],

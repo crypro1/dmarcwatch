@@ -24,8 +24,23 @@ SCHEMA_VERSION = 4
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
+    # BEGIN/COMMIT stehen bewusst IM Script, nicht nur im umgebenden
+    # `with conn:` in _migrate() - conn.executescript() committet laut
+    # sqlite3-Doku eine eventuell offene Transaktion sofort implizit und
+    # führt sonst KEINE eigene Transaktionskontrolle aus, das äußere
+    # `with conn:` wäre für das Script selbst also wirkungslos. Ohne dieses
+    # BEGIN/COMMIT bliebe ein mitten im Script abgebrochenes CREATE TABLE
+    # (Stromausfall, volle Platte, ...) dauerhaft halb angewendet, während
+    # PRAGMA user_version noch die alte Version zeigt - jeder künftige
+    # Start würde dieselbe Migration erneut versuchen und an "table already
+    # exists" scheitern (empirisch geprüft: genau dieses Verhalten tritt
+    # ein). PRAGMA user_version steht deshalb ebenfalls IM selben Script,
+    # direkt vor COMMIT - Schemaänderung und Versionssprung sind damit eine
+    # einzige atomare Einheit statt zweier getrennter Schritte.
     conn.executescript(
         """
+        BEGIN IMMEDIATE;
+
         CREATE TABLE reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             org_name TEXT NOT NULL,
@@ -64,6 +79,9 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
         CREATE INDEX idx_records_report ON records(report_id);
         CREATE INDEX idx_reports_date_end ON reports(date_end);
         CREATE INDEX idx_records_flagged ON records(is_flagged);
+
+        PRAGMA user_version = 1;
+        COMMIT;
         """
     )
 
@@ -76,11 +94,16 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     # rdap.org auf (kein Netzverkehr aus dem dauerhaft laufenden Prozess).
     conn.executescript(
         """
+        BEGIN IMMEDIATE;
+
         CREATE TABLE whois_cache (
             source_ip TEXT PRIMARY KEY,
             organization TEXT NOT NULL,
             looked_up_at INTEGER NOT NULL
         );
+
+        PRAGMA user_version = 2;
+        COMMIT;
         """
     )
 
@@ -94,6 +117,8 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     # Domain-Zugehörigkeit an tls_policies, nicht an tls_reports.
     conn.executescript(
         """
+        BEGIN IMMEDIATE;
+
         CREATE TABLE tls_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             organization_name TEXT NOT NULL,
@@ -132,6 +157,9 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
         CREATE INDEX idx_tls_policies_report ON tls_policies(tls_report_id);
         CREATE INDEX idx_tls_failure_details_policy ON tls_failure_details(tls_policy_id);
         CREATE INDEX idx_tls_reports_date_end ON tls_reports(date_end);
+
+        PRAGMA user_version = 3;
+        COMMIT;
         """
     )
 
@@ -143,12 +171,17 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     # whois_cache oben, gleiche "nie automatisch, nur auf Anfrage"-Regel.
     conn.executescript(
         """
+        BEGIN IMMEDIATE;
+
         CREATE TABLE blacklist_cache (
             source_ip TEXT PRIMARY KEY,
             listed INTEGER NOT NULL,
             reasons_json TEXT NOT NULL DEFAULT '[]',
             checked_at INTEGER NOT NULL
         );
+
+        PRAGMA user_version = 4;
+        COMMIT;
         """
     )
 
@@ -312,11 +345,34 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def _migrate(conn: sqlite3.Connection) -> None:
     current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current > SCHEMA_VERSION:
+        # Datenbank wurde zuvor von einer neueren dmarcwatch-Version
+        # geöffnet (z. B. nach einem Downgrade) - stillschweigend
+        # weiterzumachen würde auf einem Schema arbeiten, das diese
+        # Version nicht kennt (fehlende Spalten/Tabellen je nach künftiger
+        # Migration). Lieber laut abbrechen als still falsch laufen.
+        raise RuntimeError(
+            f"Datenbank-Schema v{current} ist neuer als die unterstützte Version "
+            f"v{SCHEMA_VERSION} - vermutlich wurde die Datenbank zuvor mit einer "
+            "neueren dmarcwatch-Version geöffnet."
+        )
     for version in range(current + 1, SCHEMA_VERSION + 1):
+        # PRAGMA user_version wird innerhalb jeder _migrate_vN-Funktion
+        # selbst gesetzt, im selben BEGIN/COMMIT wie die Schemaänderung -
+        # siehe Kommentar in _migrate_v1 zum executescript-Autocommit-
+        # Verhalten. Ein mitten im Script scheiterndes CREATE TABLE lässt
+        # die dadurch offene Transaktion auf `conn` hängen (sichtbar für
+        # diese eine Connection, aber nie durable geschrieben) - schließt
+        # der Aufrufer die Connection danach, verwirft SQLite das ohnehin;
+        # das explizite rollback() hier ist nur ein zusätzliches
+        # Sicherheitsnetz, falls dieselbe Connection nach einem
+        # Migrationsfehler doch weiterverwendet würde.
         migrate_fn = MIGRATIONS[version]
-        with conn:
+        try:
             migrate_fn(conn)
-            conn.execute(f"PRAGMA user_version = {int(version)}")
+        except Exception:
+            conn.rollback()
+            raise
 
 
 class IngestStatus(str, Enum):
@@ -378,7 +434,7 @@ def _ingest_report_inner(conn: sqlite3.Connection, report: AggregateReport, conf
         report_row_id = cur.lastrowid
         flagged_count = 0
         for record in report.records:
-            reasons = evaluate_record(record, config)
+            reasons = evaluate_record(record, config, report.policy_published.domain)
             is_flagged = len(reasons) > 0
             if is_flagged:
                 flagged_count += 1
@@ -543,7 +599,7 @@ def query_tls_policies(
         """
         SELECT p.id, p.policy_type, p.policy_domain, p.policy_strings_json, p.mx_host_json,
                p.successful_session_count, p.failure_count,
-               rep.organization_name, rep.report_id, rep.date_begin, rep.date_end
+               rep.organization_name, rep.report_id, rep.date_begin, rep.date_end, rep.contact_info
         FROM tls_policies p
         JOIN tls_reports rep ON rep.id = p.tls_report_id
         WHERE rep.date_end >= ? AND rep.date_begin <= ?
@@ -578,7 +634,7 @@ def query_records(
         SELECT r.id, r.source_ip, r.count, r.disposition, r.dkim_result, r.spf_result,
                r.header_from, r.envelope_to, r.envelope_from, r.is_own_ip, r.is_flagged,
                r.flag_reasons, rep.org_name, rep.report_id, rep.domain, rep.date_begin,
-               rep.date_end, rep.policy_p, rep.policy_pct
+               rep.date_end, rep.policy_p, rep.policy_pct, rep.email
         FROM records r
         JOIN reports rep ON rep.id = r.report_id
         WHERE rep.date_end >= ? AND rep.date_begin <= ?

@@ -4,6 +4,74 @@ Alle nennenswerten Änderungen an dmarcwatch werden hier festgehalten.
 Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
+## [1.2.0] - 2026-09-19
+
+### Hinzugefügt
+- Metadaten-Konsistenzprüfung für `stats`/"Statistik…"
+  (`is_consistent_reporter`, [report.py](src/dmarcwatch/report.py)):
+  `report_metadata/org_name` und `/email` (bzw. `contact_info` bei
+  TLS-RPT) stehen beide im selben, unauthentifizierten Report - jeder
+  kann eine Mail an die rua-Adresse schicken und damit z. B. einen
+  fingierten `own_ip_auth_fail` einschleusen, der die "Tage seit dem
+  letzten Fehlschlag"-Zählung beliebig oft zurücksetzt, oder mit einem
+  hohen `count` Sendevolumen vortäuschen, um eine frühere Verschärfung
+  nahezulegen. Nur Reports, deren `org_name` zur Absenderdomain der
+  Report-Mail passt, fließen jetzt in `total_count`/`clean_days`/
+  `avg_daily_volume`/`current_policy` ein - ausdrücklich KEINE
+  Authentifizierung, nur ein Filter gegen Zero-Effort-Fälschungen.
+  Ausgeschlossene Reports werden sichtbar gemacht
+  (`excluded_count`/`excluded_reporters`), nicht stillschweigend
+  verworfen. Neuer Config-Schlüssel `consistent_reporter_overrides` für
+  Reporter, deren `org_name` nicht zu ihrer Mail-Domain passt (z. B.
+  Microsofts "Enterprise Outlook"/"Microsoft Corporation").
+- Partielle Auth-Fail-Erkennung: `own_ip_auth_fail` (Regel 2 in
+  [anomaly.py](src/dmarcwatch/anomaly.py)) verlangt `dkim` UND `spf`
+  fail - ein PARTIELLER Fail auf einer eigenen IP (nur einer von beiden,
+  aber `disposition != none`, typisch bei einer rotierenden/kaputten
+  DKIM-Selector-Konfiguration) blockiert jetzt ebenfalls die
+  Verschärfungs-Empfehlung, statt unsichtbar zu bleiben.
+- Neue Auffälligkeit `foreign_header_from`
+  ([anomaly.py](src/dmarcwatch/anomaly.py)): `identifiers/header_from`
+  eines Records, das weder zur im selben Report veröffentlichten Domain
+  noch zu einer ihrer Subdomains gehört, wird jetzt markiert statt
+  kommentarlos durchzulaufen.
+
+### Behoben
+- `_extract_gz` ([archive.py](src/dmarcwatch/archive.py)) fing nur
+  `OSError` ab - ein abgeschnittener gzip-Stream wirft aber `EOFError`,
+  ein bitweise beschädigter kann `zlib.error` werfen, beides kein
+  `OSError`-Subtyp (empirisch geprüft). Ein entkommener Fehler hätte den
+  kompletten `fetch`-Lauf abgebrochen, bevor die auslösende Nachricht als
+  verarbeitet markiert wird - ein einzelner absichtlich abgeschnittener
+  Anhang an die rua-Adresse hätte jeden künftigen Lauf erneut zum
+  Absturz gebracht.
+- Schema-Migrationen ([store.py](src/dmarcwatch/store.py) `_migrate`)
+  waren durch `executescript()`s implizites Autocommit-Verhalten nicht
+  atomar - ein Absturz mitten in einer Migration ließ Tabellen halb
+  angelegt zurück, während `user_version` noch die alte Version zeigte;
+  jeder künftige Start scheiterte dann an "table already exists"
+  (dauerhafter Boot-Loop, empirisch nachgestellt). Jede Migration trägt
+  jetzt ihr eigenes `BEGIN`/`PRAGMA user_version`/`COMMIT`. Zusätzlich
+  ein Downgrade-Guard gegen eine Datenbank mit neuerer `user_version`
+  als unterstützt.
+- `config.json` und die Marker-Dateien wurden direkt in die Zieldatei
+  geschrieben - ein Absturz mitten im Schreiben hätte eine leere/halb
+  geschriebene `config.json` zurückgelassen und die App bis zum
+  manuellen Eingriff unbrauchbar gemacht (`load_config()` fing
+  `json.load()`-Fehler nicht ab). Jetzt atomares Schreiben über eine
+  temporäre Datei plus `os.replace()`.
+- `read_last_fetch_date` fing nur `OSError`, nicht `ValueError` (deckt
+  u. a. `UnicodeDecodeError` ab) - eine binär-kaputte Markerdatei hätte
+  `fetch` abstürzen statt gracefully degradieren lassen, anders als die
+  strukturell identischen `read_skipped_items`/`read_dns_check_result`.
+- Leere `own_domains` (z. B. vor dem ersten `setup`) ließen `fetch`
+  ausnahmslos jeden Report als `REJECTED_FOREIGN_DOMAIN` verwerfen - ein
+  technisch "erfolgreicher" Lauf, der die Datenbank für immer leer ließ,
+  ohne dass das je auffiel. `cmd_fetch` bricht jetzt mit einer klaren
+  Fehlermeldung ab, statt still zu "funktionieren".
+- `is_own_domain` baute ihr Vergleichs-Set bei jedem Aufruf neu statt
+  wie `is_own_ip` einmalig zu cachen - inkonsistent, jetzt einheitlich.
+
 ## [1.1.0] - 2026-08-30
 
 ### Hinzugefügt
