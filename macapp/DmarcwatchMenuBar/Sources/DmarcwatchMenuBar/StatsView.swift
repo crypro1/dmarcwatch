@@ -212,6 +212,10 @@ struct StatsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Text("\(r.totalCount) E-Mails, davon \(r.unknownIpFailures) von unbekannten IPs")
                         .font(.caption).foregroundStyle(.secondary)
+                    if r.excludedCount > 0 {
+                        Text("(\(r.excludedCount) E-Mails von Reportern mit inkonsistenten Metadaten ausgeschlossen: \(r.excludedReporters.joined(separator: ", ")))")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     if r.hasReportingGap {
                         Text("⚠ Lücke von \(r.reportingGapDays) Tagen ohne jeden Report - vermutlich zwischenzeitlich ausgefallener Abruf.")
                             .font(.caption2).foregroundStyle(.orange)
@@ -267,6 +271,10 @@ struct StatsView: View {
             ForEach(response.mtaStsReadiness) { m in
                 VStack(alignment: .leading, spacing: 4) {
                     Text(m.domain).font(.callout.bold())
+                    if m.excludedCount > 0 {
+                        Text("(\(m.excludedCount) TLS-Sitzungen von Reportern mit inkonsistenten Metadaten ausgeschlossen: \(m.excludedReporters.joined(separator: ", ")))")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     if m.totalFailureCount > 0 {
                         let types = m.failureTypes.sorted { $0.key < $1.key }
                             .map { "\($0.key) (\($0.value))" }.joined(separator: ", ")

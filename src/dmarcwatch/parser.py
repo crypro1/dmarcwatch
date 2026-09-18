@@ -33,6 +33,13 @@ from .models import (
 _MIN_TS = 946684800
 _MAX_TS = 4102444800
 
+# Plausibilitätsgrenze für row/count - weit über selbst sehr großen realen
+# Sendern hinaus (schützt legitime Hochvolumen-Reportzeilen), aber deutlich
+# unter Werten, die ein gefälschter Report frei behaupten könnte, um
+# avg_daily_volume und damit die Verschärfungs-Einschätzung in report.py
+# künstlich aufzublähen.
+_MAX_COUNT_PER_RECORD = 10_000_000
+
 
 class ReportParseError(ValueError):
     """Ein Report konnte nicht sicher geparst werden und wird übersprungen."""
@@ -99,12 +106,18 @@ def _parse_metadata(root: Element) -> ReportMetadata:
     date_range = _child(md, "date_range")
     if date_range is None:
         raise ReportParseError("<date_range> fehlt")
+    date_begin = _parse_timestamp(_require_text(date_range, "begin"), "date_range/begin")
+    date_end = _parse_timestamp(_require_text(date_range, "end"), "date_range/end")
+    if date_end < date_begin:
+        raise ReportParseError(
+            f"date_range/end ({date_end}) liegt vor date_range/begin ({date_begin})"
+        )
     return ReportMetadata(
         org_name=_require_text(md, "org_name"),
         report_id=_require_text(md, "report_id"),
         email=_text(md, "email", default="") or "",
-        date_begin=_parse_timestamp(_require_text(date_range, "begin"), "date_range/begin"),
-        date_end=_parse_timestamp(_require_text(date_range, "end"), "date_range/end"),
+        date_begin=date_begin,
+        date_end=date_end,
     )
 
 
@@ -148,6 +161,27 @@ def _parse_auth_results(record: Element) -> AuthResults:
     return AuthResults(dkim=tuple(dkim_results), spf=tuple(spf_results))
 
 
+def _normalize_disposition(value: str) -> str:
+    """DispositionType kennt laut RFC 7489 nur none/quarantine/reject -
+    Groß-/Kleinschreibung wird normalisiert (manche Implementierungen sind
+    da historisch nachlässig), ein unbekannter Wert bleibt unverändert und
+    zählt dadurch in anomaly.py automatisch als "!= none", also als
+    auffällig - fail-closed statt eine geratene Ersatz-Policy einzusetzen."""
+    return value.strip().lower()
+
+
+def _normalize_auth_result(value: str) -> str:
+    """policy_evaluated/dkim und policy_evaluated/spf sind laut RFC 7489
+    nur pass/fail (nicht die breitere Skala aus auth_results wie
+    temperror/softfail, die hier nicht relevant ist). Alles außer einem
+    eindeutigen "pass" wird konservativ als "fail" behandelt - ein
+    unbekannter oder falsch geschriebener Wert soll REASON_OWN_IP_AUTH_FAIL
+    in anomaly.py nicht stillschweigend verfehlen, nur weil er nicht exakt
+    "fail" lautet."""
+    normalized = value.strip().lower()
+    return normalized if normalized == "pass" else "fail"
+
+
 def _parse_record(record: Element) -> Record:
     row = _child(record, "row")
     if row is None:
@@ -163,14 +197,16 @@ def _parse_record(record: Element) -> Record:
     count = _parse_int(count_raw, "row/count")
     if count < 0:
         raise ReportParseError(f"row/count ist negativ: {count}")
+    if count > _MAX_COUNT_PER_RECORD:
+        raise ReportParseError(f"row/count ist unplausibel hoch: {count}")
 
     return Record(
         source_ip=_parse_ip(_require_text(row, "source_ip")),
         count=count,
         policy_evaluated=PolicyEvaluated(
-            disposition=_text(pe, "disposition", default="none") or "none",
-            dkim=_text(pe, "dkim", default="fail") or "fail",
-            spf=_text(pe, "spf", default="fail") or "fail",
+            disposition=_normalize_disposition(_text(pe, "disposition", default="none") or "none"),
+            dkim=_normalize_auth_result(_text(pe, "dkim", default="fail") or "fail"),
+            spf=_normalize_auth_result(_text(pe, "spf", default="fail") or "fail"),
         ),
         identifiers=Identifiers(
             header_from=_require_text(identifiers_elem, "header_from"),

@@ -245,6 +245,23 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             print(f"Heute ({today}) bereits erfolgreich abgerufen, überspringe.")
         return 0
 
+    if not config.own_domains:
+        # Erreichbar, wenn config.json fehlt/unvollständig ist (z. B. vor
+        # dem ersten 'setup' oder ein unvollständiges --from-stdin-json aus
+        # der Menüleisten-App) - der interaktive 'setup'-Dialog fragt
+        # own_domains zwingend ab, dieser Zustand ist über ihn nicht
+        # erreichbar. Ohne own_domains wird ausnahmslos jeder Report als
+        # REJECTED_FOREIGN_DOMAIN verworfen (siehe store.py ingest_report) -
+        # ein sonst technisch "erfolgreicher" Lauf, der die Datenbank aber
+        # für immer leer lässt, ohne dass das je auffällt. Sichtbar statt
+        # still, dieselbe README-Logik wie beim leeren own_ip_networks.
+        print(
+            "Fehler: keine own_domains konfiguriert - jeder Report würde als fremde Domain "
+            "verworfen. Bitte zuerst 'dmarcwatch setup' ausführen.",
+            file=sys.stderr,
+        )
+        return 2
+
     password = keychain.get_password(config.imap_user)
     if not password:
         print(
@@ -399,10 +416,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
     sicher gewesen wäre. Reiner lokaler Lesebefehl wie `report`/
     `tls-report`, keine Live-DNS-/HTTPS-Abfrage - siehe
     compute_dmarc_readiness/compute_mta_sts_readiness in report.py."""
+    config = load_config()
     db_conn = connect(db_path())
     since_ts, until_ts = day_range_to_ts(args.days)
-    rows = collect_rows(db_conn, since_ts, until_ts)
-    tls_rows = collect_tls_rows(db_conn, since_ts, until_ts)
+    rows = collect_rows(db_conn, since_ts, until_ts, config.consistent_reporter_overrides)
+    tls_rows = collect_tls_rows(db_conn, since_ts, until_ts, config.consistent_reporter_overrides)
     db_conn.close()
 
     daily = collect_daily_stats(rows)
@@ -435,6 +453,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
     for r in dmarc_readiness:
         print(f"DMARC ({r.domain}): aktuelle Policy p={r.current_policy or '?'}, pct={r.current_pct}")
         print(f"  {r.total_count} E-Mails, davon {r.unknown_ip_failures} von unbekannten IPs")
+        if r.excluded_count:
+            print(
+                f"  ({r.excluded_count} E-Mails von Reportern mit inkonsistenten Metadaten "
+                f"ausgeschlossen: {', '.join(r.excluded_reporters)})"
+            )
         if r.has_reporting_gap:
             print(
                 f"  ⚠ Lücke von {r.reporting_gap_days} Tagen ohne jeden Report erkannt - "
@@ -473,6 +496,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
         print("MTA-STS: keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")
     for m in mta_sts_readiness:
         print(f"MTA-STS ({m.domain}):")
+        if m.excluded_count:
+            print(
+                f"  ({m.excluded_count} TLS-Sitzungen von Reportern mit inkonsistenten Metadaten "
+                f"ausgeschlossen: {', '.join(m.excluded_reporters)})"
+            )
         if m.total_failure_count:
             types = ", ".join(f"{k} ({v})" for k, v in sorted(m.failure_types.items()))
             print(f"  {m.total_failure_count} TLS-Fehlschläge im Zeitraum" + (f" - {types}" if types else ""))

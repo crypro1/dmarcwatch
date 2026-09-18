@@ -495,6 +495,12 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
     let fullyEnforced: Bool
     let readyForNextStep: Bool
     let needsRecheck: Bool
+    // Reports mit inkonsistenten Metadaten (org_name/E-Mail-Domain ohne
+    // plausiblen Bezug zueinander, siehe report.py:is_consistent_reporter)
+    // fließen NICHT in die obigen Felder ein - sichtbar statt
+    // stillschweigend, dieselbe Logik wie hasReportingGap.
+    let excludedCount: Int
+    let excludedReporters: [String]
 
     var id: String { domain }
 
@@ -517,6 +523,8 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
         case fullyEnforced = "fully_enforced"
         case readyForNextStep = "ready_for_next_step"
         case needsRecheck = "needs_recheck"
+        case excludedCount = "excluded_count"
+        case excludedReporters = "excluded_reporters"
     }
 }
 
@@ -539,6 +547,8 @@ struct MTASTSReadinessEntry: Decodable, Identifiable {
     let hasReportingGap: Bool
     let reportingGapDays: Int
     let readyForEnforce: Bool
+    let excludedCount: Int
+    let excludedReporters: [String]
 
     var id: String { domain }
 
@@ -555,6 +565,8 @@ struct MTASTSReadinessEntry: Decodable, Identifiable {
         case hasReportingGap = "has_reporting_gap"
         case reportingGapDays = "reporting_gap_days"
         case readyForEnforce = "ready_for_enforce"
+        case excludedCount = "excluded_count"
+        case excludedReporters = "excluded_reporters"
     }
 }
 

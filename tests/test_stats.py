@@ -12,20 +12,31 @@ from dmarcwatch.report import (
     collect_tls_daily_stats,
     compute_dmarc_readiness,
     compute_mta_sts_readiness,
+    is_consistent_reporter,
     to_stats_json_dict,
 )
+
+# Konsistentes Standard-Absenderpaar für Fixtures, die NICHT gezielt die
+# Konsistenzprüfung selbst testen (own_ip_auth_fail-Timing, pct-Rollout,
+# Stichprobengröße, ...) - sonst würde jede Zeile mangels passender
+# email standardmäßig als inkonsistent gelten und aus der gesamten
+# Readiness-Berechnung herausfallen. is_consistent wird über die echte
+# is_consistent_reporter()-Logik berechnet, kein manueller Shortcut.
+_CONSISTENT_ORG = "google.com"
+_CONSISTENT_EMAIL = "noreply-dmarc-support@google.com"
 
 
 def _row(
     date_begin: int, is_flagged: bool = False, flag_reasons=None,
     domain: str = "example.com", policy_p: str = "quarantine", policy_pct: int = 100,
-    count: int = 1,
+    count: int = 1, is_own_ip: bool = False, org_name: str = _CONSISTENT_ORG, email: str = _CONSISTENT_EMAIL,
 ) -> ReportRow:
     return ReportRow(
-        date_begin=date_begin, org_name="google.com", source_ip="192.0.2.1", count=count,
+        date_begin=date_begin, org_name=org_name, source_ip="192.0.2.1", count=count,
         disposition="none", dkim="pass", spf="pass", envelope_to="",
         is_flagged=is_flagged, flag_reasons=flag_reasons or [],
-        domain=domain, policy_p=policy_p, policy_pct=policy_pct,
+        domain=domain, policy_p=policy_p, policy_pct=policy_pct, is_own_ip=is_own_ip,
+        email=email, is_consistent=is_consistent_reporter(org_name, email),
     )
 
 
@@ -58,9 +69,10 @@ def test_collect_daily_stats_empty_input():
 
 def _tls_row_at(date_begin: int, successful: int = 5, failures: int = 0, domain: str = "example.com") -> TLSPolicyRow:
     return TLSPolicyRow(
-        tls_policy_id=1, date_begin=date_begin, org_name="google.com", policy_domain=domain,
+        tls_policy_id=1, date_begin=date_begin, org_name=_CONSISTENT_ORG, policy_domain=domain,
         policy_type="sts", successful_session_count=successful, failure_count=failures,
-        failure_result_types=[],
+        failure_result_types=[], contact_info=_CONSISTENT_EMAIL,
+        is_consistent=is_consistent_reporter(_CONSISTENT_ORG, _CONSISTENT_EMAIL),
     )
 
 
@@ -255,6 +267,43 @@ def test_dmarc_readiness_old_own_ip_auth_failure_heals_after_enough_clean_time()
     assert result[0].ready_for_next_step is True
 
 
+def test_dmarc_readiness_partial_auth_fail_on_own_ip_also_blocks():
+    """Ein own_ip_auth_fail (Regel 2 in anomaly.py) verlangt dkim UND spf
+    fail - ein PARTIELLER Fail auf einer eigenen IP (nur einer von beiden,
+    aber disposition != none, typisch bei einer rotierenden/kaputten
+    DKIM-Selector-Konfiguration) blockiert sonst unsichtbar legitime Mail,
+    ohne dass own_ip_auth_failures das je zeigt. own_ip_fail_rows in
+    compute_dmarc_readiness fängt das zusätzlich über REASON_DISPOSITION
+    auf einer eigenen IP ab."""
+    rows = _SAMPLE_ROWS + [
+        _row(
+            DAY1 + 89 * _DAY_SECS, is_flagged=True, flag_reasons=["disposition_not_none"],
+            is_own_ip=True, policy_p="quarantine",
+        ),
+    ]
+    result = _readiness_for(rows)
+    assert result[0].own_ip_auth_failures >= 1
+    assert result[0].clean_days == 1
+    assert result[0].ready_for_next_step is False
+
+
+def test_dmarc_readiness_disposition_flag_on_unknown_ip_does_not_block():
+    """Zur Abgrenzung: dieselbe REASON_DISPOSITION auf einer NICHT eigenen
+    IP (z. B. ein Spoofing-Versuch, der nach einer Verschärfung korrekt
+    rejected wird) darf clean_days nicht resetten - das wäre wieder der
+    ursprünglich befürchtete "jeder Spoof-Versuch blockiert die
+    Verschärfung für immer"-Fall."""
+    rows = _SAMPLE_ROWS + [
+        _row(
+            DAY1, is_flagged=True, flag_reasons=["disposition_not_none"],
+            is_own_ip=False, policy_p="quarantine",
+        ),
+    ]
+    result = _readiness_for(rows)
+    assert result[0].own_ip_auth_failures == 0
+    assert result[0].ready_for_next_step is True
+
+
 def test_dmarc_readiness_already_at_reject_pct_100_is_fully_enforced():
     rows = [_row(DAY1 - i * _DAY_SECS, count=2, policy_p="reject", policy_pct=100) for i in range(6)]
     result = _readiness_for(rows)
@@ -309,6 +358,63 @@ def test_dmarc_readiness_groups_by_domain():
 
 def test_dmarc_readiness_empty_without_rows():
     assert compute_dmarc_readiness([], days=30, until_ts=DAY1) == []
+
+
+def test_dmarc_readiness_inconsistent_fake_own_ip_auth_fail_does_not_reset_clean_days():
+    """Kernregression für die Metadaten-Konsistenzprüfung (Stage 1): ein
+    gefälschter own_ip_auth_fail von einem Reporter mit inkonsistenten
+    Metadaten (org_name/email ohne plausiblen Bezug zueinander) darf
+    clean_days NICHT resetten - genau das wäre Attack A (DoS der
+    Verschärfungs-Empfehlung durch beliebig oft wiederholbare gefälschte
+    Reports). Ein konsistenter own_ip_auth_fail (siehe
+    test_dmarc_readiness_not_ready_with_recent_own_ip_auth_failure oben)
+    blockiert weiterhin korrekt."""
+    fake_row = _row(
+        DAY1 + 89 * _DAY_SECS, is_flagged=True, flag_reasons=["own_ip_auth_fail"],
+        org_name="Definitely Not Google", email="attacker@random-domain.example",
+    )
+    rows = _SAMPLE_ROWS + [fake_row]
+    result = _readiness_for(rows)
+    assert result[0].own_ip_auth_failures == 0  # der Fake zählt nicht mit
+    assert result[0].clean_days == result[0].observed_days  # ungestört, kein Reset
+    assert result[0].ready_for_next_step is True
+    assert result[0].excluded_count == 1
+    assert result[0].excluded_reporters == ["Definitely Not Google"]
+
+
+def test_dmarc_readiness_fake_report_cannot_override_current_policy():
+    """Attack A in schwacher Form: ein gefälschter Report mit frischem
+    date_begin und p=reject;pct=100 darf current_policy/fully_enforced
+    nicht überschreiben, solange er von einem inkonsistenten Reporter
+    stammt - sonst würde das Tool je nach Fake plötzlich "vollständig
+    durchgesetzt" behaupten oder einen Rückschritt gegenüber der echten,
+    konsistenten Policy anzeigen."""
+    fake_row = _row(
+        DAY1 + 89 * _DAY_SECS, policy_p="reject", policy_pct=100,
+        org_name="Fake Reporter", email="fake@attacker.example",
+    )
+    rows = _SAMPLE_ROWS + [fake_row]  # _SAMPLE_ROWS: policy_p="quarantine" (Default)
+    result = _readiness_for(rows)
+    assert result[0].current_policy == "quarantine"
+    assert result[0].fully_enforced is False
+
+
+def test_dmarc_readiness_all_inconsistent_still_emits_domain_with_zero_counts():
+    """Sichtbarkeit statt stiller Zustandsänderung (wie bei
+    has_reporting_gap): auch wenn ALLE Reports einer Domain inkonsistent
+    sind, muss die Domain im Ergebnis erscheinen, sonst würde eine "1
+    Domain, noch nicht bereit"-Anzeige stillschweigend auf "keine Domains"
+    springen."""
+    rows = [_row(DAY1, org_name="Fake Reporter", email="fake@attacker.example", count=5)]
+    result = _readiness_for(rows)
+    assert len(result) == 1
+    assert result[0].total_count == 0
+    assert result[0].excluded_count == 5
+    assert result[0].excluded_reporters == ["Fake Reporter"]
+    assert result[0].ready_for_next_step is False
+    # current_policy bleibt als reine Anzeige aus ALLEN Rows erhalten (die
+    # eigene, per DNS veröffentlichte Policy, kaum schädlich fälschbar).
+    assert result[0].current_policy == "quarantine"
 
 
 def test_dmarc_readiness_counts_real_messages_not_report_rows():
@@ -424,11 +530,15 @@ def test_dmarc_readiness_recent_volume_window_not_diluted_by_older_quiet_period(
 # --- compute_mta_sts_readiness() ---
 
 
-def _tls_row(failure_count: int, date_begin: int = DAY1, domain: str = "example.com", failure_type_counts=None) -> TLSPolicyRow:
+def _tls_row(
+    failure_count: int, date_begin: int = DAY1, domain: str = "example.com", failure_type_counts=None,
+    org_name: str = _CONSISTENT_ORG, contact_info: str = _CONSISTENT_EMAIL,
+) -> TLSPolicyRow:
     return TLSPolicyRow(
-        tls_policy_id=1, date_begin=date_begin, org_name="google.com", policy_domain=domain,
+        tls_policy_id=1, date_begin=date_begin, org_name=org_name, policy_domain=domain,
         policy_type="sts", successful_session_count=10, failure_count=failure_count,
         failure_result_types=[], failure_type_counts=failure_type_counts or {},
+        contact_info=contact_info, is_consistent=is_consistent_reporter(org_name, contact_info),
     )
 
 
@@ -470,6 +580,24 @@ def test_mta_sts_readiness_old_failure_heals_after_enough_clean_time():
     assert result[0].ready_for_enforce is True
 
 
+def test_mta_sts_readiness_inconsistent_fake_failure_does_not_reset_clean_days():
+    """Dasselbe Kernregression wie bei DMARC: ein gefälschter TLS-Fehlschlag
+    von einem Reporter mit inkonsistenten Metadaten darf clean_days nicht
+    resetten."""
+    fake_row = _tls_row(
+        3, date_begin=DAY1 + 89 * _DAY_SECS, org_name="Fake Reporter", contact_info="fake@attacker.example",
+    )
+    rows = [_tls_row(0, date_begin=DAY1)] * 10 + [fake_row]
+    result = compute_mta_sts_readiness(rows, days=90, until_ts=DAY1 + 90 * _DAY_SECS)
+    assert result[0].total_failure_count == 0
+    assert result[0].clean_days == result[0].observed_days
+    assert result[0].ready_for_enforce is True
+    # _tls_row() setzt successful_session_count=10 fest, also 10+3=13
+    # Sitzungen des ausgeschlossenen Fake-Eintrags.
+    assert result[0].excluded_count == 13
+    assert result[0].excluded_reporters == ["Fake Reporter"]
+
+
 def test_mta_sts_readiness_not_ready_when_observation_window_too_short_for_volume():
     # 1 Policy = 10 Sitzungen über 7 real beobachtete Tage -> ca. 1.4/Tag
     # ("mittleres Volumen", 30 Tage empfohlen) - 7 Tage reichen nicht.
@@ -490,8 +618,9 @@ def test_mta_sts_readiness_not_ready_below_minimum_sample_size():
     Fehlschlag reichen nicht, wenn insgesamt nur 5 echte Sitzungen
     beobachtet wurden."""
     result = compute_mta_sts_readiness(
-        [TLSPolicyRow(tls_policy_id=1, date_begin=DAY1, org_name="google.com", policy_domain="example.com",
-                      policy_type="sts", successful_session_count=5, failure_count=0, failure_result_types=[])],
+        [TLSPolicyRow(tls_policy_id=1, date_begin=DAY1, org_name=_CONSISTENT_ORG, policy_domain="example.com",
+                      policy_type="sts", successful_session_count=5, failure_count=0, failure_result_types=[],
+                      contact_info=_CONSISTENT_EMAIL, is_consistent=True)],
         days=90, until_ts=DAY1 + 90 * _DAY_SECS,
     )
     assert result[0].total_sessions == 5

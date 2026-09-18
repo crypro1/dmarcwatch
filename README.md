@@ -260,6 +260,7 @@ mit Defaults angelegt, Verzeichnis `0700`, Datei `0600`):
 | `max_tls_failure_details_per_policy` | Obergrenze für `failure-details`-Einträge pro Policy¹¹ | `200` |
 | `enable_auto_dns_check` | Periodische, automatische `verify-dns`-Prüfung während `fetch`¹² | `false` |
 | `auto_dns_check_interval_days` | Abstand zwischen zwei automatischen Prüfungen, falls obiges aktiv ist | `7` |
+| `consistent_reporter_overrides` | Erweiterung/Überschreibung der Metadaten-Konsistenzprüfung für `stats`¹³ | `{}` |
 
 Das IMAP-Passwort steht **nicht** in dieser Datei, sondern ausschließlich im
 Schlüsselbund (Dienst `dmarcwatch`, Account = `imap_user`).
@@ -376,6 +377,17 @@ Domain-Zeilen, siehe [Native Menüleisten-App](#native-menüleisten-app)) und
 löst bei Auffälligkeiten eine eigene Notification aus, hat aber **keinen**
 Einfluss auf den Exit-Code von `fetch` selbst - ein DNS-Konfigurationsproblem
 ist kein Anzeichen für einen fehlgeschlagenen Abruf.
+<br>
+<sup>13</sup> Erweitert/überschreibt
+[`DEFAULT_CONSISTENT_REPORTERS`](src/dmarcwatch/report.py) (org_name ->
+Liste erlaubter E-Mail-Domain-Suffixe) für `is_consistent_reporter` - die
+Metadaten-Konsistenzprüfung, die entscheidet, welche Reports in die
+`stats`-Verschärfungs-Einschätzung einfließen (siehe
+[Sicherheitsentscheidungen](#sicherheitsentscheidungen)). Neue legitime
+Reporter mit einem org_name, der zu ihrer Report-Mail-Domain nicht passt
+(wie Microsofts "Enterprise Outlook"/"Microsoft Corporation"), können so
+ohne App-Update ergänzt werden. Beispiel:
+`{"newlegitreporter": ["newreporter.example"]}`.
 
 ## Befehle
 
@@ -465,6 +477,20 @@ ist kein Anzeichen für einen fehlgeschlagenen Abruf.
   des ältesten Reports im Fenster, nicht nach dem bloß angefragten `--days`
   - `stats --days 90` behauptet also keine 90 Tage Beobachtung, wenn eine
   Domain real erst seit Kürzerem überhaupt Reports liefert.
+
+  Jeder kann eine Mail an die rua-Adresse schicken - alle bisherigen
+  Sicherungen gelten pro Report, ändern aber nichts daran, dass ein
+  fingierter Report mit einem beliebigen `own_ip_auth_fail` die
+  "Tage seit dem letzten Fehlschlag"-Zählung zurücksetzen oder mit einem
+  hohen `count` Sendevolumen vortäuschen könnte. Nur Reports, deren
+  `org_name` zur Absenderdomain der Report-Mail selbst passt
+  (`is_consistent_reporter`, siehe
+  [Sicherheitsentscheidungen](#sicherheitsentscheidungen) und
+  `consistent_reporter_overrides` in der [Konfiguration](#konfiguration)),
+  fließen in die Zählungen/Zeitfenster-Berechnung ein - ausdrücklich KEINE
+  Authentifizierung, nur ein Filter gegen Zero-Effort-Fälschungen.
+  Ausgeschlossene Reports verschwinden nicht stillschweigend:
+  `excluded_count`/`excluded_reporters` zeigen, wie viele und von wem.
 
   `--json` gibt strukturierte Ausgabe statt der Tabelle aus - für das
   "Statistik…"-Fenster in der Menüleisten-App gedacht, funktioniert aber
@@ -633,7 +659,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-312 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+351 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
@@ -820,6 +846,70 @@ nicht als vertrauenswürdige Eingabe:
 - **Gepinnte, minimale Abhängigkeiten**: `defusedxml` und `keyring`, sonst
   Standardbibliothek. Beide sind sicherheitsrelevant (nicht kosmetisch) und
   in `pyproject.toml` auf exakte Versionen gepinnt.
+- **Vollständige Exception-Behandlung beim gzip-Entpacken**
+  ([archive.py](src/dmarcwatch/archive.py) `_extract_gz`): ein
+  abgeschnittener gzip-Stream wirft `EOFError`, ein bitweise beschädigter
+  kann direkt `zlib.error` werfen - beides empirisch geprüft, beides KEIN
+  `OSError`-Subtyp. Ein zunächst nur auf `OSError` beschränktes Abfangen
+  hätte diese beiden Fälle ungefangen nach oben durchschlagen lassen und
+  damit den kompletten `fetch`-Lauf abgebrochen, BEVOR die auslösende
+  Nachricht als verarbeitet markiert wird - ein einzelner absichtlich
+  abgeschnittener Anhang an die rua-Adresse hätte so jeden künftigen Lauf
+  erneut zum Absturz gebracht.
+- **Atomare Schema-Migrationen** ([store.py](src/dmarcwatch/store.py)
+  `_migrate`): `sqlite3.Connection.executescript()` committet laut Doku
+  eine offene Transaktion sofort implizit und führt sonst KEINE eigene
+  Transaktionskontrolle aus - ein umgebendes `with conn:` ist für das
+  Script selbst wirkungslos. Jede Migration trägt deshalb ihr eigenes
+  `BEGIN`/`PRAGMA user_version`/`COMMIT` im Script selbst, empirisch
+  gegen einen simulierten Absturz mitten in einer Migration geprüft (ohne
+  den Fix bleibt eine halb angewendete Migration zurück, `user_version`
+  unverändert - jeder künftige Start scheitert dann an "table already
+  exists", ein dauerhafter Boot-Loop). Zusätzlich ein Downgrade-Guard:
+  eine Datenbank mit einer neueren `user_version` als von dieser Version
+  unterstützt bricht laut ab, statt still auf einem unbekannten Schema
+  weiterzuarbeiten.
+- **Atomare Schreibvorgänge für Zustandsdateien**
+  ([config.py](src/dmarcwatch/config.py) `_write_text_atomic`):
+  `config.json` und die Marker-Dateien werden zuerst in eine temporäre
+  Datei im selben Verzeichnis geschrieben und erst per `os.replace()`
+  (atomar auf POSIX) an ihren Zielort verschoben, statt direkt in die
+  Zieldatei. Ein Absturz mitten im Schreiben (Stromausfall, Systemabsturz)
+  hätte sonst eine leere oder halb geschriebene `config.json`
+  zurückgelassen - `load_config()` fängt `json.load()` nicht ab, die App
+  wäre bis zum manuellen Eingriff tot gewesen.
+- **Enum-Normalisierung statt Rohdurchlass** ([parser.py](src/dmarcwatch/parser.py)):
+  `disposition`/`dkim`/`spf` in `policy_evaluated` werden auf
+  Groß-/Kleinschreibung normalisiert; ein unbekannter oder falsch
+  geschriebener dkim-/spf-Wert wird konservativ als `"fail"` behandelt statt
+  als weder-pass-noch-fail durchgereicht zu werden - sonst hätte ein
+  Wert wie `"Fail"` `own_ip_auth_fail` (Regel 2, siehe
+  [anomaly.py](src/dmarcwatch/anomaly.py)) stillschweigend verfehlt, weil
+  der exakte String-Vergleich nicht mehr trifft. Dazu zwei
+  Plausibilitätsgrenzen nach demselben Muster wie die Zeitstempel-Grenzen
+  oben: `date_range/end` darf nicht vor `date_range/begin` liegen, und
+  `row/count` hat eine Obergrenze (10 Millionen) - ein gefälschter Report
+  könnte sonst mit einem einzelnen absurd hohen `count`-Wert die
+  Sendevolumen-Berechnung hinter der `stats`-Verschärfungs-Einschätzung
+  verzerren.
+- **Metadaten-Konsistenzprüfung für die Verschärfungs-Einschätzung**
+  ([report.py](src/dmarcwatch/report.py) `is_consistent_reporter`):
+  `report_metadata/org_name` und `/email` (bzw. `contact_info` bei
+  TLS-RPT) stehen beide im selben, unauthentifizierten Report - jeder
+  kann eine Mail an die rua-Adresse schicken und damit z. B. einen
+  fingierten `own_ip_auth_fail` einschleusen, der die "Tage seit dem
+  letzten Fehlschlag"-Zählung in `stats` beliebig oft zurücksetzt, oder
+  mit einem hohen `count` Sendevolumen vortäuschen, um eine frühere
+  Verschärfung nahezulegen. `is_consistent_reporter` prüft deshalb, ob
+  `org_name` (normalisiert, wort- oder ganzstring-basiert) zur
+  Absenderdomain der Report-Mail passt, bevor der Report in
+  `total_count`/`clean_days`/`avg_daily_volume`/`current_policy` einfließt
+  - ausdrücklich KEINE Authentifizierung (beide Felder bleiben für einen
+  Angreifer gemeinsam fälschbar, z. B. durch Kopieren eines echten
+  Google-Paars), nur ein Filter gegen Zero-Effort-Fälschungen. Wie viele
+  Reports dabei ausgeschlossen wurden und von wem steht sichtbar in der
+  Ausgabe (`excluded_count`/`excluded_reporters`), nicht stillschweigend
+  in der Mathematik verschwunden.
 
 ## Nicht-Ziele
 

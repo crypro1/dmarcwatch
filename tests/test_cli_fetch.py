@@ -78,6 +78,7 @@ def _run_fetch_with_mocks(tmp_path, monkeypatch, args):
 
 def test_skip_flag_without_prior_marker_still_fetches(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
     with patch.object(keychain, "get_password", return_value="secret") as mock_password:
         with patch.object(cli, "connect_imap", return_value=MagicMock()):
             with patch.object(cli, "connect", return_value=MagicMock()):
@@ -106,6 +107,7 @@ def test_skip_flag_with_stale_marker_fetches_anyway(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     from dmarcwatch.config import write_last_fetch_date
 
+    write_config({"own_domains": ["example.com"]})
     write_last_fetch_date("2020-01-01")
     result = _run_fetch_with_mocks(tmp_path, monkeypatch, _args(skip_if_already_run_today=True))
 
@@ -117,6 +119,7 @@ def test_without_skip_flag_always_fetches_even_with_todays_marker(tmp_path, monk
     monkeypatch.setenv("HOME", str(tmp_path))
     from dmarcwatch.config import write_last_fetch_date
 
+    write_config({"own_domains": ["example.com"]})
     write_last_fetch_date(time.strftime("%Y-%m-%d"))
 
     with patch.object(keychain, "get_password", return_value="secret") as mock_password:
@@ -137,7 +140,7 @@ def test_tls_rpt_failures_cause_exit_code_1_and_notification(tmp_path, monkeypat
     die Notification unterschlagen, nur weil flagged_count (DMARC) bei 0
     liegt."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    write_config({"enable_tls_rpt": True})
+    write_config({"own_domains": ["example.com"], "enable_tls_rpt": True})
     summary = FetchSummary(flagged_count=0, tls_failure_count=3)
 
     with patch.object(keychain, "get_password", return_value="secret"):
@@ -159,6 +162,7 @@ def test_skipped_items_are_persisted_sanitized_and_notified(tmp_path, monkeypatc
     Notification auslösen - sonst merkt man von einem abgelehnten
     Angriffsversuch nie etwas, ohne von Hand die Logdatei zu lesen."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
     # Der Dateiname kommt unverändert aus einem E-Mail-Anhang (unvertrauens-
     # würdig) - enthält hier absichtlich ein Steuerzeichen und ein "|", um
     # zu prüfen, dass sanitize_field() das vor dem Schreiben entfernt.
@@ -189,6 +193,7 @@ def test_skipped_items_marker_cleared_when_run_is_clean(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     from dmarcwatch.config import write_skipped_items
 
+    write_config({"own_domains": ["example.com"]})
     write_skipped_items(["alter Eintrag von einem früheren Lauf"])
 
     with patch.object(keychain, "get_password", return_value="secret"):
@@ -204,12 +209,33 @@ def test_failed_connection_does_not_write_marker(tmp_path, monkeypatch):
     from dmarcwatch.fetch import FetchError
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
     with patch.object(keychain, "get_password", return_value="secret"):
         with patch.object(cli, "connect_imap", side_effect=FetchError("nicht erreichbar")):
             result = cli.cmd_fetch(_args())
 
     assert result == 1
     assert read_last_fetch_date() is None
+
+
+def test_empty_own_domains_rejected_before_touching_keychain_or_imap(tmp_path, monkeypatch, capsys):
+    """Ohne own_domains würde ingest_report() ausnahmslos jeden Report als
+    REJECTED_FOREIGN_DOMAIN verwerfen - ein technisch "erfolgreicher" Lauf,
+    der die Datenbank für immer leer lässt, ohne dass das je auffällt.
+    Erreichbar z. B. vor dem ersten 'setup' oder durch ein unvollständiges
+    --from-stdin-json - der interaktive 'setup'-Dialog fragt own_domains
+    zwingend ab, dieser Zustand ist über ihn nicht erreichbar."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Kein own_domains gesetzt - Config.from_dict({}) liefert own_domains=().
+
+    with patch.object(keychain, "get_password") as mock_password:
+        with patch.object(cli, "connect_imap") as mock_connect:
+            result = cli.cmd_fetch(_args())
+
+    assert result == 2
+    mock_password.assert_not_called()
+    mock_connect.assert_not_called()
+    assert "own_domains" in capsys.readouterr().err
 
 
 # --- Automatischer periodischer DNS-Check (enable_auto_dns_check) ---

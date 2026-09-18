@@ -111,6 +111,14 @@ DEFAULT_CONFIG = {
     # DNS-Einträge ändern sich selten - wöchentlich reicht, um eine neue
     # Fehlkonfiguration zeitnah zu bemerken, ohne unnötigen DNS-Verkehr.
     "auto_dns_check_interval_days": 7,
+    # Erweiterung/Überschreibung von report.py:DEFAULT_CONSISTENT_REPORTERS
+    # (org_name -> Liste erlaubter E-Mail-Domain-Suffixe) für die
+    # Metadaten-Konsistenzprüfung der Verschärfungs-Einschätzung (siehe
+    # report.py:is_consistent_reporter). Neue legitime Reporter mit einem
+    # org_name, der zu ihrer Report-Mail-Domain nicht passt (wie
+    # Microsofts "Enterprise Outlook"), können so ohne App-Update ergänzt
+    # werden, statt auf den nächsten Release zu warten.
+    "consistent_reporter_overrides": {},
 }
 
 
@@ -146,16 +154,18 @@ def read_last_fetch_date(path: Path | None = None) -> str | None:
         return None
     try:
         return path.read_text(encoding="utf-8").strip() or None
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError deckt u. a. UnicodeDecodeError ab (z. B. eine mitten im
+        # Schreiben abgebrochene, binär-kaputte Markerdatei) - dieselbe
+        # Fehlerbehandlung wie read_skipped_items/read_dns_check_result,
+        # nicht nur OSError.
         return None
 
 
 def write_last_fetch_date(date_str: str, path: Path | None = None) -> Path:
     path = path or last_fetch_marker_path()
     _ensure_dir_secure(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(date_str)
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    _write_text_atomic(path, date_str)
     return path
 
 
@@ -185,9 +195,7 @@ def read_skipped_items(path: Path | None = None) -> list[str]:
 def write_skipped_items(items: list[str], path: Path | None = None) -> Path:
     path = path or skipped_items_marker_path()
     _ensure_dir_secure(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False)
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    _write_text_atomic(path, json.dumps(items, ensure_ascii=False))
     return path
 
 
@@ -215,15 +223,31 @@ def read_dns_check_result(path: Path | None = None) -> dict | None:
 def write_dns_check_result(data: dict, path: Path | None = None) -> Path:
     path = path or dns_check_marker_path()
     _ensure_dir_secure(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    _write_text_atomic(path, json.dumps(data, ensure_ascii=False))
     return path
 
 
 def _ensure_dir_secure(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, stat.S_IRWXU)  # 0700
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    """Schreibt zuerst in eine temporäre Datei im selben Verzeichnis und
+    ersetzt das Ziel danach per os.replace() (atomar auf POSIX) - ein
+    direktes `open(path, "w")` ließe bei einem mitten im Schreiben
+    abgebrochenen Prozess (Absturz, Systemneustart) eine leere oder halb
+    geschriebene Datei zurück. Für config.json wäre das ein Absturz beim
+    nächsten Start (json.load() auf kaputtem JSON, ungefangen in
+    load_config()) - "App startet nicht mehr nach einem Absturz mitten im
+    Setup-Dialog" ist billig zu verhindern. Temp-Datei im selben Verzeichnis
+    (nicht /tmp), damit os.replace() auf demselben Dateisystem bleibt -
+    über Dateisystemgrenzen hinweg ist das kein atomarer Rename mehr."""
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    os.replace(tmp_path, path)
 
 
 @dataclass
@@ -251,6 +275,7 @@ class Config:
     menubar_days: int
     enable_auto_dns_check: bool
     auto_dns_check_interval_days: int
+    consistent_reporter_overrides: dict[str, tuple[str, ...]]
 
     def __post_init__(self) -> None:
         networks = []
@@ -260,6 +285,13 @@ class Config:
             except ValueError as exc:
                 raise ValueError(f"Ungültiges Netz in own_ip_networks: {n!r}") from exc
         self._own_networks = tuple(networks)
+        # Analog zu _own_networks oben einmalig normalisiert statt bei
+        # jedem is_own_domain()-Aufruf neu gebaut - gefilterte leere
+        # Einträge verhindern außerdem, dass eine versehentliche Leerzeile
+        # in own_domains einen leeren Domain-String durchgehen ließe.
+        self._own_domains = {
+            d.strip().lower().rstrip(".") for d in self.own_domains if d.strip()
+        }
 
     @property
     def max_attachment_size_bytes(self) -> int:
@@ -279,7 +311,7 @@ class Config:
 
     def is_own_domain(self, domain: str) -> bool:
         domain = (domain or "").strip().lower().rstrip(".")
-        return domain in {d.strip().lower().rstrip(".") for d in self.own_domains}
+        return domain in self._own_domains
 
     def is_own_ip(self, ip: str) -> bool:
         # Netzzugehörigkeit über ipaddress, kein Zeichenkettenvergleich:
@@ -319,6 +351,9 @@ class Config:
             menubar_days=int(merged["menubar_days"]),
             enable_auto_dns_check=bool(merged["enable_auto_dns_check"]),
             auto_dns_check_interval_days=int(merged["auto_dns_check_interval_days"]),
+            consistent_reporter_overrides={
+                str(k): tuple(v) for k, v in dict(merged["consistent_reporter_overrides"]).items()
+            },
         )
 
 
@@ -335,9 +370,7 @@ def write_default_config_if_missing(path: Path | None = None) -> Path:
     path = path or config_path()
     _ensure_dir_secure(path.parent)
     if not path.exists():
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False, sort_keys=True)
-            f.write("\n")
+        _write_text_atomic(path, json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
     # Immer durchsetzen, nicht nur bei Neuanlage - falls die Datei aus einer
     # älteren Version oder von Hand mit laxeren Rechten entstanden ist.
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
@@ -358,8 +391,5 @@ def read_raw_config(path: Path | None = None) -> dict:
 def write_config(data: dict, path: Path | None = None) -> Path:
     path = path or config_path()
     _ensure_dir_secure(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
-        f.write("\n")
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
     return path

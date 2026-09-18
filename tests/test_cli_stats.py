@@ -20,7 +20,8 @@ def _xml() -> str:
     begin = end - 3600
     return f"""<?xml version="1.0"?>
 <feedback>
-<report_metadata><org_name>Enterprise Outlook</org_name><report_id>stats-test-1</report_id>
+<report_metadata><org_name>Enterprise Outlook</org_name><email>dmarcreport@microsoft.com</email>
+<report_id>stats-test-1</report_id>
 <date_range><begin>{begin}</begin><end>{end}</end></date_range></report_metadata>
 <policy_published><domain>example.com</domain><p>quarantine</p><pct>100</pct></policy_published>
 <record>
