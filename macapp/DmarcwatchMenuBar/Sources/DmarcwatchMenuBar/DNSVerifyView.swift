@@ -92,6 +92,17 @@ struct DNSVerifyView: View {
                         .foregroundColor(.orange)
                     changeEntries(result.changes, color: .orange)
                 }
+            } else if result.hasBaseline {
+                // Der häufigste Fall (nichts geändert) - ohne diese Zeile
+                // wäre der ganze Abschnitt bei einer unveränderten Domain
+                // unsichtbar, als gäbe es die Änderungserkennung gar nicht.
+                Text("Keine Änderungen seit letzter Prüfung.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Erste Prüfung dieser Domain - Vergleichsbasis für künftige Änderungen angelegt.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             group("DMARC") {
