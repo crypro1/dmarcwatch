@@ -121,3 +121,39 @@ def test_persisted_result_flags_warnings(tmp_path, monkeypatch):
 
     stored = read_dns_check_result()
     assert stored["domains"][0]["has_warnings"] is True
+
+
+def test_json_output_includes_dns_change_keys(tmp_path, monkeypatch, capsys):
+    """Regressionstest für die DNS-Änderungserkennung (siehe
+    dns_verify.diff_and_update_snapshot) - has_baseline/changes/
+    policy_weakened müssen genau wie die übrigen Felder in _verification_to_
+    dict() flach im --json-Ergebnis landen, die Menüleisten-App
+    (DomainVerificationResponse in Models.swift) erwartet sie dort."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("example.com")):
+        cli.cmd_verify_dns(_args(json=True))
+
+    entry = json.loads(capsys.readouterr().out)[0]
+    assert entry["has_baseline"] is False
+    assert entry["changes"] == []
+    assert entry["policy_weakened"] is False
+
+
+def test_repeated_run_with_unchanged_dns_reports_no_changes(tmp_path, monkeypatch, capsys):
+    """Zwei Läufe hintereinander gegen dieselbe, unveränderte DNS-Antwort:
+    der erste legt die Baseline an (noch keine Vergleichsbasis), der zweite
+    hat eine Baseline, aber keine Änderungen."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("example.com")):
+        cli.cmd_verify_dns(_args(json=True))
+        capsys.readouterr()  # ersten Lauf verwerfen, nur der zweite zählt hier
+        cli.cmd_verify_dns(_args(json=True))
+
+    entry = json.loads(capsys.readouterr().out)[0]
+    assert entry["has_baseline"] is True
+    assert entry["changes"] == []
+    assert entry["policy_weakened"] is False

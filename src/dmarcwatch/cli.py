@@ -26,7 +26,14 @@ from .config import (
     write_last_fetch_date,
     write_skipped_items,
 )
-from .dns_verify import _DNSSEC_VALIDATING_RESOLVER, DomainVerification, has_warnings, verify_domain
+from .dns_verify import (
+    _DNSSEC_VALIDATING_RESOLVER,
+    DNSChangeResult,
+    DomainVerification,
+    diff_and_update_snapshot,
+    has_warnings,
+    verify_domain,
+)
 from .fetch import FetchError, connect_imap, fetch_and_ingest
 from .logging_setup import setup_logging
 from .report import (
@@ -377,11 +384,23 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         due = last_check is None or days_since is None or days_since >= config.auto_dns_check_interval_days
         if due:
             dns_results = _run_dns_check_and_persist(list(config.own_domains))
-            warned_domains = [r.domain for r in dns_results if has_warnings(r)]
+            warned_domains = [r.domain for r, c in dns_results if has_warnings(r)]
             if config.notify_on_new_findings and warned_domains:
                 notify.send_notification(
                     title="DNS-Konfiguration auffällig",
                     message=f"Auffälligkeiten bei: {', '.join(warned_domains)}",
+                )
+
+            # Eigene, dringlichere Meldung für eine tatsächlich seit dem
+            # letzten Check zurückgestufte DMARC-Policy - unabhängig von der
+            # Meldung oben (die z. B. auch bei ohnehin schon bekanntem
+            # p=none feuert), beide können im selben Lauf zusammen auftreten.
+            weakened = [(r.domain, c.changes[0]) for r, c in dns_results if c.policy_weakened]
+            if config.notify_on_new_findings and weakened:
+                detail = "; ".join(f"{domain}: {entry.lstrip('⚠ ')}" for domain, entry in weakened)
+                notify.send_notification(
+                    title="DMARC-Policy geschwächt",
+                    message=detail,
                 )
 
     return 1 if (summary.flagged_count > 0 or summary.tls_failure_count > 0) else 0
@@ -473,6 +492,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
             print("  Bereits vollständig durchgesetzt (p=reject, pct=100).")
         elif r.ready_for_next_step:
             print(f"  Bereit für nächsten Schritt: p={r.next_recommended_policy}, pct={r.next_recommended_pct}.")
+            if r.next_step_pct_adjusted_for_sp:
+                print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={r.current_sp} nicht zu schwächen.")
         else:
             reasons = []
             if r.own_ip_auth_failures and r.clean_days < r.recommended_observation_days:
@@ -491,6 +512,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
                 f"  Noch nicht bereit für p={r.next_recommended_policy}, pct={r.next_recommended_pct}: "
                 + "; ".join(reasons) + "."
             )
+            if r.next_step_pct_adjusted_for_sp:
+                print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={r.current_sp} nicht zu schwächen.")
     print()
     if not mta_sts_readiness:
         print("MTA-STS: keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")
@@ -715,7 +738,7 @@ def cmd_resolve_spf(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_verify_result(result: DomainVerification) -> None:
+def _print_verify_result(result: DomainVerification, change: DNSChangeResult | None = None) -> None:
     print(f"Domain: {result.domain}")
     print()
 
@@ -821,6 +844,24 @@ def _print_verify_result(result: DomainVerification) -> None:
         for warning in result.mx_blacklist.warnings:
             print(f"  ⚠ {warning}")
 
+    if change is not None:
+        if not change.has_baseline:
+            print()
+            print("(erste Prüfung dieser Domain, keine Vergleichsbasis)")
+        elif change.changes:
+            print()
+            print("Änderungen seit letzter Prüfung:")
+            for entry in change.changes:
+                print(f"  {entry}")
+
+
+def _dns_change_to_dict(change: DNSChangeResult) -> dict:
+    return {
+        "has_baseline": change.has_baseline,
+        "changes": change.changes,
+        "policy_weakened": change.policy_weakened,
+    }
+
 
 def _verification_to_dict(result: DomainVerification) -> dict:
     """JSON-Repräsentation für den `--json`-Modus - von der Menüleisten-App
@@ -900,8 +941,10 @@ def _verification_to_dict(result: DomainVerification) -> dict:
     }
 
 
-def _run_dns_check_and_persist(domains: list[str]) -> list[DomainVerification]:
-    """Führt verify_domain() für alle domains aus und speichert das Ergebnis
+def _run_dns_check_and_persist(domains: list[str]) -> list[tuple[DomainVerification, DNSChangeResult]]:
+    """Führt verify_domain() für alle domains aus, vergleicht das Ergebnis
+    gegen den zuletzt gespeicherten DNS-Schnappschuss (siehe
+    dns_verify.diff_and_update_snapshot) und speichert das Ergebnis
     (überschreibt die vorherige Datei komplett, kein wachsendes Protokoll) -
     von cmd_verify_dns (Klick auf "DNS prüfen…" oder Terminal-Aufruf) UND
     vom periodischen automatischen Check in cmd_fetch genutzt, damit die
@@ -910,6 +953,7 @@ def _run_dns_check_and_persist(domains: list[str]) -> list[DomainVerification]:
     db_conn = connect(db_path())
     try:
         results = [verify_domain(db_conn, domain) for domain in domains]
+        changes = [diff_and_update_snapshot(db_conn, r) for r in results]
     finally:
         db_conn.close()
 
@@ -917,11 +961,12 @@ def _run_dns_check_and_persist(domains: list[str]) -> list[DomainVerification]:
         {
             "checked_at": time.strftime("%Y-%m-%d"),
             "domains": [
-                {**_verification_to_dict(r), "has_warnings": has_warnings(r)} for r in results
+                {**_verification_to_dict(r), "has_warnings": has_warnings(r), **_dns_change_to_dict(c)}
+                for r, c in zip(results, changes)
             ],
         }
     )
-    return results
+    return list(zip(results, changes))
 
 
 def cmd_verify_dns(args: argparse.Namespace) -> int:
@@ -945,16 +990,19 @@ def cmd_verify_dns(args: argparse.Namespace) -> int:
     results = _run_dns_check_and_persist(domains)
 
     if args.json:
-        json.dump([_verification_to_dict(r) for r in results], sys.stdout)
+        json.dump(
+            [{**_verification_to_dict(r), **_dns_change_to_dict(c)} for r, c in results],
+            sys.stdout,
+        )
         sys.stdout.write("\n")
     else:
         # Genau eine "="-Trennlinie vor jeder Domain (dient gleichzeitig als
         # Trenner zur vorherigen) statt einer schließenden pro Domain in
         # _print_verify_result selbst - sonst stehen bei mehreren Domains
         # zwei Trennlinien direkt hintereinander.
-        for result in results:
+        for result, change in results:
             print("=" * 60)
-            _print_verify_result(result)
+            _print_verify_result(result, change)
         print("=" * 60)
     return 0
 

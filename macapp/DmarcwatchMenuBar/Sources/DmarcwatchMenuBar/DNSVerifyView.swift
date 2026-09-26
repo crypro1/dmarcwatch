@@ -74,6 +74,26 @@ struct DNSVerifyView: View {
             Text(result.domain)
                 .font(.title3.bold())
 
+            // Vergleich gegen den zuletzt gespeicherten DNS-Schnappschuss
+            // (siehe dns_verify.diff_and_update_snapshot) - eine
+            // zurückgestufte DMARC-Policy bekommt eine eigene, auffälligere
+            // rote Warnung statt nur der normalen orangen Änderungsliste.
+            if result.policyWeakened {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("DMARC-Policy seit letzter Prüfung geschwächt")
+                        .font(.callout.bold())
+                        .foregroundColor(.red)
+                    changeEntries(result.changes, color: .red)
+                }
+            } else if !result.changes.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Änderungen seit letzter Prüfung:")
+                        .font(.callout.bold())
+                        .foregroundColor(.orange)
+                    changeEntries(result.changes, color: .orange)
+                }
+            }
+
             group("DMARC") {
                 if result.dmarc.exists {
                     detail("Policy", result.dmarc.policy ?? "-")
@@ -269,6 +289,16 @@ struct DNSVerifyView: View {
                 Capsule().fill(isUp ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
             )
             .foregroundStyle(isUp ? Color.green : Color.red)
+    }
+
+    @ViewBuilder
+    private func changeEntries(_ items: [String], color: Color) -> some View {
+        ForEach(items, id: \.self) { entry in
+            Text(entry)
+                .font(.caption)
+                .foregroundColor(color)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     @ViewBuilder

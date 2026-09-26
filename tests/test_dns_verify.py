@@ -25,6 +25,7 @@ from dmarcwatch.dns_verify import (
     WildcardSPFCheckResult,
     _fetch_bimi_logo,
     _fetch_mta_sts_policy,
+    _fingerprint,
     _validate_bimi_svg,
     check_bimi,
     check_dane,
@@ -35,10 +36,12 @@ from dmarcwatch.dns_verify import (
     check_mx_blacklist,
     check_tlsrpt_dns,
     check_wildcard_spf,
+    diff_and_update_snapshot,
     has_warnings,
 )
 from dmarcwatch.blacklist import BlacklistCheckError, BlacklistResult
 from dmarcwatch.spf import SPFCheckResult, SPFResolutionError
+from dmarcwatch.store import connect
 
 
 def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -825,3 +828,94 @@ def test_validate_bimi_svg_too_large_warns():
 
 def test_validate_bimi_svg_valid_has_no_warnings():
     assert _validate_bimi_svg(_VALID_BIMI_SVG) == []
+
+
+# --- _fingerprint() / diff_and_update_snapshot() ---
+
+
+def test_fingerprint_returns_expected_shape():
+    result = _clean_result()
+    result.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; rua=mailto:a@example.com",
+        policy="reject", subdomain_policy="quarantine", pct=100,
+    )
+    result.spf = SPFCheckResult(exists=True, record="v=spf1 -all", lookup_count=0, lookup_limit_ok=True)
+    result.dkim = [
+        DKIMCheckResult(selector="default", exists=True, key_type="rsa"),
+        DKIMCheckResult(selector="unused", exists=False),
+    ]
+    result.mta_sts = MTASTSCheckResult(configured=True, policy_txt="v=STSv1; id=1")
+    result.tlsrpt_dns = TLSRPTDNSCheckResult(configured=True, record="v=TLSRPTv1; rua=mailto:t@example.com")
+    result.dane = DANECheckResult(configured=True, mx_hosts_with_tlsa=["mail.example.com"])
+    result.bimi = BIMICheckResult(configured=True, record="v=BIMI1; l=https://example.com/logo.svg")
+
+    assert _fingerprint(result) == {
+        "dmarc_record": "v=DMARC1; p=reject; rua=mailto:a@example.com",
+        "dmarc_policy": "reject",
+        "dmarc_subdomain_policy": "quarantine",
+        "dmarc_pct": 100,
+        "spf_record": "v=spf1 -all",
+        # Nur exists=True-Selektoren zählen - "unused" existiert nicht.
+        "dkim": ["default:rsa"],
+        "mta_sts_policy_txt": "v=STSv1; id=1",
+        "tlsrpt_record": "v=TLSRPTv1; rua=mailto:t@example.com",
+        "dane_mx_hosts_with_tlsa": ["mail.example.com"],
+        "bimi_record": "v=BIMI1; l=https://example.com/logo.svg",
+    }
+
+
+def test_diff_and_update_snapshot_first_check_has_no_baseline_but_persists(tmp_path):
+    conn = connect(tmp_path / "dns.db")
+    result = _clean_result()
+
+    change = diff_and_update_snapshot(conn, result)
+    assert change.has_baseline is False
+    assert change.changes == []
+    assert change.policy_weakened is False
+
+    # Zweiter, identischer Lauf: die Baseline wurde beim ersten Mal bereits
+    # angelegt, jetzt gibt es etwas zum Vergleichen, aber nichts hat sich
+    # geändert.
+    change2 = diff_and_update_snapshot(conn, result)
+    assert change2.has_baseline is True
+    assert change2.changes == []
+    assert change2.policy_weakened is False
+    conn.close()
+
+
+def test_diff_and_update_snapshot_policy_regression_flags_weakened(tmp_path):
+    conn = connect(tmp_path / "dns.db")
+    reject_result = _clean_result()
+    reject_result.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; rua=mailto:a@example.com", policy="reject",
+    )
+    diff_and_update_snapshot(conn, reject_result)
+
+    none_result = _clean_result()
+    none_result.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=none; rua=mailto:a@example.com", policy="none",
+    )
+    change = diff_and_update_snapshot(conn, none_result)
+
+    assert change.has_baseline is True
+    assert change.policy_weakened is True
+    assert any("reject" in c and "none" in c for c in change.changes)
+    conn.close()
+
+
+def test_diff_and_update_snapshot_non_policy_change_does_not_flag_weakened(tmp_path):
+    """Ein geänderter DKIM-Key-Typ ist eine echte, meldenswerte Änderung -
+    aber keine DMARC-Policy-Rückstufung, also darf policy_weakened nicht
+    gesetzt werden."""
+    conn = connect(tmp_path / "dns.db")
+    rsa_result = _clean_result()
+    rsa_result.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa")]
+    diff_and_update_snapshot(conn, rsa_result)
+
+    ed25519_result = _clean_result()
+    ed25519_result.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="ed25519")]
+    change = diff_and_update_snapshot(conn, ed25519_result)
+
+    assert change.policy_weakened is False
+    assert change.changes != []
+    conn.close()

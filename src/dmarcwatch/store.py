@@ -20,7 +20,7 @@ from .anomaly import evaluate_record
 from .config import Config
 from .models import AggregateReport, TLSReport
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -186,7 +186,31 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3, 4: _migrate_v4}
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    # Ein Schnappschuss der zuletzt gesehenen DNS-Eintrags-Fingerprints pro
+    # Domain (siehe dns_verify.py:_fingerprint/diff_and_update_snapshot) -
+    # damit `verify-dns` nicht nur den AKTUELLEN Zustand nach statischen
+    # Regeln bewertet, sondern auch erkennt, dass sich seit der letzten
+    # Prüfung überhaupt etwas geändert hat (z. B. eine im Registrar-Panel
+    # zurückgestufte DMARC-Policy) - unabhängig davon, ob der neue Zustand
+    # für sich genommen schon als "schlecht" auffallen würde.
+    conn.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE dns_snapshots (
+            domain TEXT PRIMARY KEY,
+            fingerprint_json TEXT NOT NULL,
+            checked_at INTEGER NOT NULL
+        );
+
+        PRAGMA user_version = 5;
+        COMMIT;
+        """
+    )
+
+
+MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5}
 
 
 def get_cached_whois(conn: sqlite3.Connection, source_ip: str) -> tuple[str, int] | None:
@@ -252,6 +276,32 @@ def get_all_cached_blacklist(conn: sqlite3.Connection) -> dict[str, tuple[bool, 
     machen - reines Lesen aus der lokalen Datenbank."""
     rows = conn.execute("SELECT source_ip, listed, reasons_json FROM blacklist_cache").fetchall()
     return {row[0]: (bool(row[1]), json.loads(row[2])) for row in rows}
+
+
+def get_dns_snapshot(conn: sqlite3.Connection, domain: str) -> dict | None:
+    """Letzter gespeicherter DNS-Eintrags-Fingerprint für `domain` (siehe
+    dns_verify.py:_fingerprint), oder None bei der allerersten Prüfung."""
+    row = conn.execute(
+        "SELECT fingerprint_json FROM dns_snapshots WHERE domain = ?", (domain,)
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0])
+
+
+def set_dns_snapshot(conn: sqlite3.Connection, domain: str, fingerprint: dict) -> None:
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO dns_snapshots (domain, fingerprint_json, checked_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                fingerprint_json = excluded.fingerprint_json,
+                checked_at = excluded.checked_at
+            """,
+            (domain, json.dumps(fingerprint, sort_keys=True), int(time.time())),
+        )
+    secure_wal_sidecar_files(conn)
 
 
 def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]:
@@ -634,7 +684,7 @@ def query_records(
         SELECT r.id, r.source_ip, r.count, r.disposition, r.dkim_result, r.spf_result,
                r.header_from, r.envelope_to, r.envelope_from, r.is_own_ip, r.is_flagged,
                r.flag_reasons, rep.org_name, rep.report_id, rep.domain, rep.date_begin,
-               rep.date_end, rep.policy_p, rep.policy_pct, rep.email
+               rep.date_end, rep.policy_p, rep.policy_sp, rep.policy_pct, rep.email
         FROM records r
         JOIN reports rep ON rep.id = r.report_id
         WHERE rep.date_end >= ? AND rep.date_begin <= ?
