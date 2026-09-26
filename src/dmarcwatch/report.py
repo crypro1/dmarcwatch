@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
-from .anomaly import REASON_DISPOSITION, REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
+from .anomaly import REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
 from .sanitize import sanitize_field
 from .store import query_records, query_tls_failure_details, query_tls_policies
 
@@ -537,14 +537,24 @@ def _detect_reporting_gap(day_indices: list[int]) -> tuple[bool, int]:
     Mittelwert wird durch genau die Ausreißer-Lücke verzerrt, die erkannt
     werden soll (eine einzelne 40-Tage-Lücke neben mehreren 1-Tage-Lücken
     hebt den Mittelwert schon so stark an, dass sie sich selbst
-    unauffällig macht - der Median bleibt davon unbeeinflusst)."""
+    unauffällig macht - der Median bleibt davon unbeeinflusst).
+
+    Die größte Lücke fließt bewusst NICHT in ihre eigene Baseline ein -
+    bei nur zwei Lücken (drei Report-Tagen) würde der Median sonst genau
+    aus Ausreißer und Rest gemittelt und die Erkennung an dieser
+    Datengröße rechnerisch unmöglich machen (z. B. Lücken [1, 401]: alter
+    Median 201, Schwelle max(7, 201*4)=804 gegen max_gap=401 - die
+    401-Tage-Funkstille bliebe unentdeckt)."""
     unique_days = sorted(set(day_indices))
     if len(unique_days) < 3:
         return False, 0
     gaps = sorted(b - a for a, b in zip(unique_days, unique_days[1:]))
-    mid = len(gaps) // 2
-    median_gap = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
     max_gap = gaps[-1]
+    baseline_gaps = gaps[:-1]
+    mid = len(baseline_gaps) // 2
+    median_gap = (
+        baseline_gaps[mid] if len(baseline_gaps) % 2 else (baseline_gaps[mid - 1] + baseline_gaps[mid]) / 2
+    )
     if max_gap >= max(_REPORTING_GAP_MIN_DAYS, median_gap * _REPORTING_GAP_RATIO):
         return True, max_gap
     return False, 0
@@ -730,7 +740,7 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
             r
             for r in consistent_rows
             if REASON_OWN_IP_AUTH_FAIL in r.flag_reasons
-            or (r.is_own_ip and REASON_DISPOSITION in r.flag_reasons)
+            or (r.is_own_ip and (r.dkim == "fail" or r.spf == "fail"))
         ]
         own_ip_fail = sum(r.count for r in own_ip_fail_rows)
 

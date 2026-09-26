@@ -23,7 +23,18 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class FakeImap:
-    """Minimaler Stand-in für imaplib.IMAP4_SSL, nur die genutzten Methoden."""
+    """Minimaler Stand-in für imaplib.IMAP4_SSL, nur die genutzten Methoden.
+
+    Bildet zusätzlich nach, wie sich IMAP-Sequenznummern nach expunge()
+    verschieben (RFC 3501): search()/fetch()/copy()/store() OHNE uid()
+    adressieren eine Nachricht über ihre Position in der aktuellen
+    Mailbox (self._present), die bei jedem expunge() neu nummeriert wird -
+    das war der Bug in fetch.py. Die uid()-Varianten adressieren dagegen
+    direkt über die stabile UID (den messages/tlsrpt_messages-Key) und
+    bleiben davon unberührt; siehe
+    test_multiple_unseen_messages_are_each_processed_exactly_once_via_uid
+    unten.
+    """
 
     def __init__(
         self,
@@ -52,11 +63,25 @@ class FakeImap:
         self.expunged = False
         self.created_folders: list[str] = []
         self.full_body_fetched: list[bytes] = []
+        # Sequenznummer (Position + 1) -> UID je Ordner; nur von den
+        # Nicht-UID-Methoden gepflegt und von expunge() neu nummeriert.
+        self._present: dict[str, list[bytes]] = {}
+        self._deleted_uids: set[bytes] = set()
+        # Zeichnet auf, wenn eine der alten, sequenznummerbasierten
+        # Methoden benutzt wird - im gefixten fetch.py darf das leer
+        # bleiben, siehe Regressionstest unten.
+        self.plain_calls: list[str] = []
 
     def _current_messages(self) -> dict[bytes, bytes]:
         if self._current_folder == self._tlsrpt_folder:
             return self._tlsrpt_messages
         return self._messages
+
+    def _present_for_current_folder(self) -> list[bytes]:
+        folder = self._current_folder
+        if folder not in self._present:
+            self._present[folder] = sorted(self._current_messages().keys(), key=int)
+        return self._present[folder]
 
     def select(self, folder):
         self._current_folder = folder
@@ -66,28 +91,74 @@ class FakeImap:
         return "OK", self._list_response
 
     def search(self, charset, criteria):
-        ids = b" ".join(sorted(self._current_messages().keys()))
-        return "OK", [ids]
+        self.plain_calls.append("search")
+        present = self._present_for_current_folder()
+        seq_nums = [str(i + 1).encode() for i in range(len(present))]
+        return "OK", [b" ".join(seq_nums)]
 
-    def fetch(self, msg_id, spec):
+    def _fetch_by_uid(self, uid, spec):
         messages = self._current_messages()
         if "RFC822.SIZE" in spec:
-            if msg_id in self._fake_sizes and self._fake_sizes[msg_id] is None:
+            if uid in self._fake_sizes and self._fake_sizes[uid] is None:
                 return "NO", []  # simuliert einen Server, der die Größe nicht liefert
-            size = self._fake_sizes.get(msg_id, len(messages[msg_id]))
-            return "OK", [b"%d (RFC822.SIZE %d)" % (int(msg_id), size)]
-        self.full_body_fetched.append(msg_id)
-        return "OK", [(b"1 (RFC822 {n})", messages[msg_id])]
+            size = self._fake_sizes.get(uid, len(messages[uid]))
+            return "OK", [b"%d (RFC822.SIZE %d)" % (int(uid), size)]
+        self.full_body_fetched.append(uid)
+        return "OK", [(b"1 (RFC822 {n})", messages[uid])]
+
+    def fetch(self, msg_id, spec):
+        # msg_id ist hier eine Sequenznummer, keine UID - siehe Klassen-
+        # Docstring.
+        self.plain_calls.append("fetch")
+        present = self._present_for_current_folder()
+        seq = int(msg_id)
+        if seq < 1 or seq > len(present):
+            return "NO", []
+        return self._fetch_by_uid(present[seq - 1], spec)
 
     def store(self, msg_id, flags_cmd, flags):
-        self.stored_flags[msg_id] = flags
+        self.plain_calls.append("store")
+        present = self._present_for_current_folder()
+        seq = int(msg_id)
+        uid = present[seq - 1] if 1 <= seq <= len(present) else msg_id
+        self.stored_flags[uid] = flags
+        if "\\Deleted" in flags:
+            self._deleted_uids.add(uid)
 
     def copy(self, msg_id, folder):
-        self.copied_to.append((msg_id, folder))
+        self.plain_calls.append("copy")
+        present = self._present_for_current_folder()
+        seq = int(msg_id)
+        if seq < 1 or seq > len(present):
+            return "NO", []
+        self.copied_to.append((present[seq - 1], folder))
         return "OK", [b""]
+
+    def uid(self, command, *args):
+        command = command.lower()
+        if command == "search":
+            ids = b" ".join(sorted(self._current_messages().keys(), key=int))
+            return "OK", [ids]
+        if command == "fetch":
+            msg_uid, spec = args
+            return self._fetch_by_uid(msg_uid, spec)
+        if command == "store":
+            msg_uid, flags_cmd, flags = args
+            self.stored_flags[msg_uid] = flags
+            if "\\Deleted" in flags:
+                self._deleted_uids.add(msg_uid)
+            return "OK", [b""]
+        if command == "copy":
+            msg_uid, folder = args
+            self.copied_to.append((msg_uid, folder))
+            return "OK", [b""]
+        raise NotImplementedError(f"FakeImap.uid: unbekanntes Kommando {command!r}")
 
     def expunge(self):
         self.expunged = True
+        folder = self._current_folder
+        present = self._present_for_current_folder()
+        self._present[folder] = [uid for uid in present if uid not in self._deleted_uids]
 
     def create(self, folder):
         self.created_folders.append(folder)
@@ -207,6 +278,54 @@ def test_move_to_processed_folder_when_enabled(tmp_path):
     assert fake_imap.created_folders == ["DMARC/verarbeitet"]
     assert fake_imap.copied_to == [(b"1", "DMARC/verarbeitet")]
     assert fake_imap.expunged is True
+
+
+def test_multiple_unseen_messages_are_each_processed_exactly_once_via_uid(tmp_path):
+    """Regressionstest: Mit move_to_processed_folder=True ruft
+    _mark_processed() pro Nachricht copy()+store()+expunge() auf. Laut
+    RFC 3501 verschieben sich nach jedem expunge() sofort die
+    Sequenznummern aller höher nummerierten Nachrichten. Arbeitet die
+    Verarbeitungsschleife (wie früher) mit einer vorab abgerufenen, fixen
+    Liste von Sequenznummern statt mit UIDs, gerät die zweite bzw. dritte
+    von drei ungelesenen Nachrichten dadurch unter einer inzwischen
+    falschen Sequenznummer in die Schleife - eine Nachricht wird komplett
+    übersprungen, statt dass alle drei Reports einzeln landen."""
+    good_xml = (FIXTURES / "ses_single_pass.xml").read_bytes()
+    uids = (b"201", b"202", b"203")
+    report_ids = (b"ses-report-0001", b"ses-report-0002", b"ses-report-0003")
+    messages = {
+        uid: _make_message("report.xml.gz", gzip.compress(good_xml.replace(b"ses-report-0001", report_id)))
+        for uid, report_id in zip(uids, report_ids)
+    }
+
+    fake_imap = FakeImap(messages)
+    db_conn = connect(tmp_path / "dmarc.sqlite")
+    logger = logging.getLogger("dmarcwatch-test")
+    logger.addHandler(logging.NullHandler())
+
+    config = Config.from_dict(
+        {
+            "own_domains": ["example.com"],
+            "own_ip_networks": ["192.0.2.0/24", "2001:db8:1::/48"],
+            "move_to_processed_folder": True,
+            "processed_folder": "DMARC/verarbeitet",
+        }
+    )
+
+    summary = fetch_and_ingest(config, fake_imap, db_conn, logger)
+
+    assert summary.messages_seen == 3
+    assert summary.reports_inserted == 3
+    assert summary.reports_duplicate == 0
+    assert summary.messages_skipped_too_large == 0
+    assert fake_imap.full_body_fetched == list(uids)
+    assert fake_imap.copied_to == [(uid, "DMARC/verarbeitet") for uid in uids]
+    # Nur UID-Kommandos benutzt, keine sequenznummerbasierten - siehe
+    # FakeImap-Docstring.
+    assert fake_imap.plain_calls == []
+
+    rows = query_records(db_conn, since_ts=0, until_ts=2_000_000_000)
+    assert len(rows) == 3
 
 
 def test_oversized_message_is_skipped_without_fetching_full_body(tmp_path):

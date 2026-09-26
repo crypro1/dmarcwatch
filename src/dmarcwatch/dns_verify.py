@@ -232,7 +232,16 @@ def check_dmarc(domain: str) -> DMARCCheckResult:
     typische Fehlkonfigurationen (fehlende `rua` - keine Reports möglich;
     `p=none` - noch keine Durchsetzung; mehrere DMARC-Einträge - laut
     RFC 7489 komplett ungültig, nicht nur der erste zählt)."""
-    all_records = _txt_records(f"_dmarc.{domain}")
+    try:
+        all_records = _txt_records(f"_dmarc.{domain}")
+    except SPFResolutionError as exc:
+        # Anders als bei den optionalen Checks (MTA-STS, TLS-RPT-DNS, ...)
+        # darf ein fehlgeschlagener Lookup hier nicht mit "kein DMARC-Eintrag"
+        # gleichgesetzt werden - DMARC-Abwesenheit ist eine eigene, relevante
+        # Aussage, ein DNS-Fehler eine andere.
+        return DMARCCheckResult(
+            exists=False, warnings=[f"DMARC-Abfrage fehlgeschlagen: {exc}"]
+        )
     dmarc_records = [r for r in all_records if r.lower().startswith("v=dmarc1")]
 
     if not dmarc_records:

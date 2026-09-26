@@ -183,6 +183,18 @@ def test_negative_counts_default_to_zero():
     assert report.policy_results[0].failure_count == 0
 
 
+def test_absurdly_large_session_count_rejected():
+    """Regressionstest: json.loads() erlaubt beliebig große Ganzzahlen ohne
+    Obergrenze - store.py bindet total-failure-session-count aber in eine
+    SQLite-INTEGER-Spalte, was außerhalb des 64-Bit-Bereichs mit einem
+    OverflowError abbricht statt mit einem sauberen TLSReportParseError, der
+    vom Aufrufer abgefangen wird."""
+    sample = _sample()
+    sample["policies"][0]["summary"]["total-failure-session-count"] = 999999999999999999999999999999
+    with pytest.raises(TLSReportParseError):
+        parse_tls_report(_bytes(sample), MAX_SIZE)
+
+
 def test_rfc8460_appendix_b_example_report_parses_completely():
     """Der Beispielreport aus RFC 8460 Appendix B, wortwörtlich übernommen
     (nur Domainnamen/IPs unverändert aus dem RFC, die sind schon

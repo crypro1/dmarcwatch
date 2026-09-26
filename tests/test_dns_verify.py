@@ -119,6 +119,15 @@ def test_check_dmarc_missing_required_p_tag():
     assert any("Pflicht-Tag 'p'" in w for w in result.warnings)
 
 
+def test_check_dmarc_dns_failure_reports_warning_instead_of_raising():
+    with patch(
+        "dmarcwatch.dns_verify._txt_records", side_effect=SPFResolutionError("Zeitüberschreitung")
+    ):
+        result = check_dmarc("example.com")
+    assert result.exists is False
+    assert any("DMARC-Abfrage fehlgeschlagen" in w and "Zeitüberschreitung" in w for w in result.warnings)
+
+
 # --- check_dkim() ---
 
 

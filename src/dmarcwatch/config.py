@@ -322,7 +322,17 @@ class Config:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             return False
-        return any(addr in net for net in self._own_networks)
+        if any(addr in net for net in self._own_networks):
+            return True
+        # ipaddress wickelt IPv4-in-IPv6-Adressen (::ffff:a.b.c.d) nicht
+        # automatisch aus - `addr in net` liefert sonst still False, obwohl
+        # ein Dual-Stack-MTA damit denselben Host meint wie mit der reinen
+        # IPv4-Form. Ohne diese Entpackung würde ein eigener Absender mit
+        # Auth-Fehler in REASON_UNKNOWN_IP statt REASON_OWN_IP_AUTH_FAIL
+        # landen und so die Sicherheitssperre umgehen.
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return any(addr.ipv4_mapped in net for net in self._own_networks)
+        return False
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":

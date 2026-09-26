@@ -103,9 +103,13 @@ def _get_message_size(conn: imaplib.IMAP4_SSL, msg_id: bytes) -> int | None:
     nur ihre Anhänge. RFC822.SIZE lässt sich abfragen, ohne den Body über
     die Leitung zu holen, und erlaubt damit eine Obergrenze VOR dem
     eigentlichen Abruf.
+
+    UID- statt sequenznummerbasiert (siehe _search_unseen) - sonst würde
+    ein expunge() für eine andere Nachricht im selben Lauf diese Abfrage
+    auf die falsche Nachricht verschieben (RFC 3501).
     """
     try:
-        status, data = conn.fetch(msg_id, "(RFC822.SIZE)")
+        status, data = conn.uid("fetch", msg_id, "(RFC822.SIZE)")
     except imaplib.IMAP4.error:
         return None
     if status != "OK" or not data or not isinstance(data[0], bytes):
@@ -170,7 +174,16 @@ def _select_folder_or_raise(imap_conn: imaplib.IMAP4_SSL, folder: str) -> None:
 
 
 def _search_unseen(imap_conn: imaplib.IMAP4_SSL) -> list[bytes]:
-    status, data = imap_conn.search(None, "UNSEEN")
+    """Liefert UIDs statt Sequenznummern.
+
+    Plain SEARCH liefert Sequenznummern, die nur bis zum nächsten expunge()
+    gültig sind (RFC 3501) - _mark_processed() ruft aber pro Nachricht
+    expunge() auf, während diese Liste über mehrere Nachrichten hinweg
+    weiterverwendet wird. UID SEARCH liefert stattdessen UIDs, die
+    innerhalb der Session stabil bleiben; darauf bauen auch
+    _get_message_size, _fetch_message und _mark_processed auf.
+    """
+    status, data = imap_conn.uid("search", None, "UNSEEN")
     if status != "OK":
         raise FetchError("IMAP-Suche nach ungelesenen Nachrichten fehlgeschlagen")
     return data[0].split() if data and data[0] else []
@@ -178,7 +191,7 @@ def _search_unseen(imap_conn: imaplib.IMAP4_SSL) -> list[bytes]:
 
 def _fetch_message(imap_conn: imaplib.IMAP4_SSL, msg_id: bytes) -> Message | None:
     try:
-        status, msg_data = imap_conn.fetch(msg_id, "(RFC822)")
+        status, msg_data = imap_conn.uid("fetch", msg_id, "(RFC822)")
     except imaplib.IMAP4.error as exc:
         raise FetchError(f"Abruf von Nachricht {msg_id!r} fehlgeschlagen: {exc}") from exc
     if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
@@ -350,13 +363,13 @@ def _mark_processed(
 ) -> None:
     try:
         if move_to_processed_folder:
-            status, _ = conn.copy(msg_id, processed_folder)
+            status, _ = conn.uid("copy", msg_id, processed_folder)
             if status != "OK":
                 logger.warning("Nachricht %r konnte nicht nach %r kopiert werden", msg_id, processed_folder)
                 return
-            conn.store(msg_id, "+FLAGS", "(\\Seen \\Deleted)")
+            conn.uid("store", msg_id, "+FLAGS", "(\\Seen \\Deleted)")
             conn.expunge()
         else:
-            conn.store(msg_id, "+FLAGS", "(\\Seen)")
+            conn.uid("store", msg_id, "+FLAGS", "(\\Seen)")
     except imaplib.IMAP4.error as exc:
         logger.warning("Nachricht %r konnte nicht als verarbeitet markiert werden: %s", msg_id, exc)

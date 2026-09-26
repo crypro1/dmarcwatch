@@ -21,7 +21,7 @@ from __future__ import annotations
 import ipaddress
 from dataclasses import dataclass, field
 
-from .spf import SPFResolutionError, _dig
+from .spf import SPFResolutionError, _dig_checked
 
 DNSBL_ZONE = "zen.spamhaus.org"
 
@@ -66,7 +66,7 @@ def check_ip_blacklist(ip: str) -> BlacklistResult:
 
     reversed_ip = ".".join(reversed(ip.split(".")))
     try:
-        records = _dig("A", f"{reversed_ip}.{DNSBL_ZONE}")
+        records = _dig_checked("A", f"{reversed_ip}.{DNSBL_ZONE}")
     except SPFResolutionError as exc:
         raise BlacklistCheckError(str(exc)) from exc
 

@@ -61,3 +61,13 @@ def test_long_field_is_truncated():
     safe = sanitize_field("x" * 500, max_len=80)
     assert len(safe) == 80
     assert safe.endswith("…")
+
+
+def test_bidi_override_stripped_but_safe_text_preserved():
+    from dmarcwatch.sanitize import sanitize_field
+
+    evil = "Trusted-Bank\u202eevil.example"
+    safe = sanitize_field(evil, max_len=60)
+    assert "\u202e" not in safe
+    assert "Trusted-Bank" in safe
+    assert "evil.example" in safe

@@ -48,6 +48,51 @@ def _dig(record_type: str, name: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+def _dig_checked(record_type: str, name: str) -> list[str]:
+    """Wie _dig(), aber ohne `+short` und mit Prüfung des DNS-Antwortstatus:
+    `dig +short` liefert sowohl bei einer echten leeren Antwort (NXDOMAIN)
+    als auch bei einem Auflösungsfehler (z. B. SERVFAIL, etwa wenn Spamhaus
+    einen gemeinsam genutzten/öffentlichen Resolver drosselt) gleichermaßen
+    leeres stdout mit Exit-Code 0 - für Aufrufer, die das unterscheiden
+    müssen (siehe check_ip_blacklist() in blacklist.py), reicht der
+    Exit-Code allein nicht.
+
+    Wirft SPFResolutionError bei jedem Status außer NOERROR/NXDOMAIN."""
+    try:
+        result = subprocess.run(
+            ["dig", "+time=3", "+tries=1", record_type, name],
+            capture_output=True,
+            text=True,
+            timeout=DIG_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"dig beendete sich mit Code {result.returncode}"
+        raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): {detail}")
+
+    status = "SERVFAIL"
+    answers: list[str] = []
+    in_answer_section = False
+    for line in result.stdout.splitlines():
+        if line.startswith(";; ->>HEADER<<-") and "status:" in line:
+            status = line.split("status:", 1)[1].split(",", 1)[0].strip()
+        elif line.startswith(";; ANSWER SECTION:"):
+            in_answer_section = True
+        elif in_answer_section:
+            if not line.strip() or line.startswith(";;"):
+                in_answer_section = False
+            else:
+                fields = line.split()
+                if len(fields) >= 5:
+                    answers.append(fields[-1])
+
+    if status not in ("NOERROR", "NXDOMAIN"):
+        raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): Status {status}")
+    return answers
+
+
 def _txt_records(domain: str) -> list[str]:
     records = []
     for line in _dig("TXT", domain):

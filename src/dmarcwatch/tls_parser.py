@@ -20,6 +20,16 @@ from .models import TLSFailureDetail, TLSPolicy, TLSPolicyResult, TLSReport, TLS
 _MIN_TS = 946684800
 _MAX_TS = 4102444800
 
+# Plausibilitätsgrenze für Session-Counts (total-successful-session-count,
+# total-failure-session-count, failed-session-count) - json.loads erlaubt
+# beliebig große Ganzzahlen, store.py bindet die Werte aber in eine
+# SQLite-INTEGER-Spalte, was außerhalb des 64-Bit-Bereichs mit einem nicht
+# abgefangenen OverflowError abbricht (und bei jedem erneuten Lauf wieder,
+# da der Report vor dem Crash nicht als verarbeitet markiert wird). Deutlich
+# über realistischen SMTP-Session-Zahlen selbst sehr großer Absender, aber
+# weit unter der 64-Bit-Grenze von SQLite.
+_MAX_SESSION_COUNT = 1_000_000_000
+
 
 class TLSReportParseError(ValueError):
     """Ein TLS-RPT-Report konnte nicht sicher geparst werden und wird übersprungen."""
@@ -61,6 +71,8 @@ def _optional_int(d: dict, key: str, default: int = 0) -> int:
     val = d.get(key, default)
     if isinstance(val, bool) or not isinstance(val, int) or val < 0:
         return default
+    if val > _MAX_SESSION_COUNT:
+        raise TLSReportParseError(f"Feld {key!r} ist unplausibel hoch: {val}")
     return val
 
 

@@ -82,7 +82,7 @@ def _extract_zip(data: bytes, max_size_bytes: int) -> bytes:
             return _read_bounded(member, max_size_bytes)
     except ArchiveError:
         raise
-    except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+    except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error) as exc:
         raise ArchiveError(f"ZIP-Eintrag konnte nicht gelesen werden: {exc}") from exc
 
 

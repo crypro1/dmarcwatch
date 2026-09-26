@@ -102,6 +102,14 @@ def test_implausible_timestamp_rejected():
         parse_aggregate_report(xml, MAX_SIZE)
 
 
+def test_implausible_pct_rejected():
+    xml = _load("ses_single_pass.xml").decode("utf-8").replace(
+        "<pct>100</pct>", "<pct>99999999999999999999999999999999999999</pct>"
+    ).encode("utf-8")
+    with pytest.raises(ReportParseError):
+        parse_aggregate_report(xml, MAX_SIZE)
+
+
 def _build_report_with_n_records(n: int) -> bytes:
     record_tpl = (
         "<record><row><source_ip>192.0.2.{i}</source_ip><count>1</count>"
