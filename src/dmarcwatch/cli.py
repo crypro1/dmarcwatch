@@ -479,11 +479,12 @@ def cmd_stats(args: argparse.Namespace) -> int:
     )
     print()
     if spoofed_identities:
-        print("Auffällige Absender-Identitäten (header_from):")
+        print(f"Auffällige Absender-Identitäten (header_from) - letzte {args.days} Tage:")
         for s in spoofed_identities:
-            print(f"  {s.header_from}: {s.total_count} E-Mails, {s.record_count}x gemeldet, "
+            reporters = ", ".join(sanitize_field(r, 80) for r in s.reporters)
+            print(f"  {sanitize_field(s.header_from, 80)}: {s.total_count} E-Mails, {s.record_count}x gemeldet, "
                   f"zuerst am {s.first_seen_date}, zuletzt am {s.last_seen_date} "
-                  f"(gemeldet von: {', '.join(s.reporters)})")
+                  f"(gemeldet von: {reporters})")
         print()
     if not dmarc_readiness:
         print("DMARC: keine Reports im Zeitraum, keine Einschätzung möglich.")
@@ -624,11 +625,15 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     # in anomaly.py). Bei nur einer einzigen Identität wäre das nur eine
     # redundante Ein-Zeilen-Wiederholung des Details unten, deshalb erst ab
     # mehr als einem eindeutigen Wert anzeigen.
-    header_from_counts = Counter(sanitize_field(m["header_from"], 80) for m in matches if m["header_from"])
+    # Nach dem ROHEN Wert gruppieren, erst beim Anzeigen sanitisieren - sonst
+    # könnten zwei tatsächlich unterschiedliche header_from-Werte, die sich
+    # nur in von sanitize_field() entfernten Zeichen unterscheiden oder erst
+    # nach Zeichen 80 abweichen, fälschlich in einen Zähler zusammenfallen.
+    header_from_counts = Counter(m["header_from"] for m in matches if m["header_from"])
     if len(header_from_counts) > 1:
         print("Header-From-Verteilung für diese Abfrage:")
         for header_from, count in header_from_counts.most_common():
-            print(f"  {header_from}: {count}x")
+            print(f"  {sanitize_field(header_from, 80)}: {count}x")
         print()
 
     # Pro eindeutiger IP nur einmal nachschlagen, auch wenn mehrere
