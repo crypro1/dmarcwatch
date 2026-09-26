@@ -30,10 +30,11 @@ def _row(
     date_begin: int, is_flagged: bool = False, flag_reasons=None,
     domain: str = "example.com", policy_p: str = "quarantine", policy_pct: int = 100,
     count: int = 1, is_own_ip: bool = False, org_name: str = _CONSISTENT_ORG, email: str = _CONSISTENT_EMAIL,
+    dkim: str = "pass", spf: str = "pass",
 ) -> ReportRow:
     return ReportRow(
         date_begin=date_begin, org_name=org_name, source_ip="192.0.2.1", count=count,
-        disposition="none", dkim="pass", spf="pass", envelope_to="",
+        disposition="none", dkim=dkim, spf=spf, envelope_to="",
         is_flagged=is_flagged, flag_reasons=flag_reasons or [],
         domain=domain, policy_p=policy_p, policy_pct=policy_pct, is_own_ip=is_own_ip,
         email=email, is_consistent=is_consistent_reporter(org_name, email),
@@ -200,6 +201,21 @@ def test_detect_reporting_gap_needs_at_least_three_report_days():
     assert _detect_reporting_gap([]) == (False, 0)
 
 
+def test_detect_reporting_gap_flags_huge_gap_with_only_two_gaps():
+    """Degenerierter Spezialfall bei genau drei Report-Tagen (zwei Lücken):
+    der Median darf nicht aus Ausreißer und Rest gemittelt werden, sonst
+    hebt die Ausreißer-Lücke ihre eigene Baseline mit an und macht sich
+    dadurch rechnerisch unauffällig. Tage [0, 401, 402] (401 Tage
+    Funkstille, danach zwei Reports kurz hintereinander) müssen trotzdem
+    erkannt werden - mit dem alten, naiven Median aus [1, 401] (=201) wäre
+    die Schwelle max(7, 201*4)=804 und die Lücke bliebe unentdeckt."""
+    day0 = DAY1 // _DAY_SECS
+    days = [day0, day0 + 401, day0 + 402]
+    has_gap, gap_days = _detect_reporting_gap(days)
+    assert has_gap is True
+    assert gap_days == 401
+
+
 # --- compute_dmarc_readiness() ---
 #
 # until_ts simuliert "jetzt" - der tatsächlich beobachtete Zeitraum ist
@@ -273,18 +289,39 @@ def test_dmarc_readiness_partial_auth_fail_on_own_ip_also_blocks():
     aber disposition != none, typisch bei einer rotierenden/kaputten
     DKIM-Selector-Konfiguration) blockiert sonst unsichtbar legitime Mail,
     ohne dass own_ip_auth_failures das je zeigt. own_ip_fail_rows in
-    compute_dmarc_readiness fängt das zusätzlich über REASON_DISPOSITION
-    auf einer eigenen IP ab."""
+    compute_dmarc_readiness fängt das zusätzlich ab, wenn eine der beiden
+    Prüfungen (hier: dkim) auf einer eigenen IP tatsächlich fehlschlägt."""
     rows = _SAMPLE_ROWS + [
         _row(
             DAY1 + 89 * _DAY_SECS, is_flagged=True, flag_reasons=["disposition_not_none"],
-            is_own_ip=True, policy_p="quarantine",
+            is_own_ip=True, dkim="fail", spf="pass", policy_p="quarantine",
         ),
     ]
     result = _readiness_for(rows)
     assert result[0].own_ip_auth_failures >= 1
     assert result[0].clean_days == 1
     assert result[0].ready_for_next_step is False
+
+
+def test_dmarc_readiness_disposition_override_without_auth_fail_does_not_block():
+    """Gegenprobe zum Fall oben: eine Disposition-Verschärfung (RFC 7489
+    PolicyOverrideReason, z. B. local_policy) auf einer eigenen IP, bei der
+    SOWOHL dkim ALS AUCH spf passen, ist KEIN own_ip_auth_fail - ohne einen
+    tatsächlichen dkim- oder spf-Fehlschlag darf REASON_DISPOSITION allein
+    own_ip_fail_rows nicht auslösen, sonst würde jede unabhängige, mit
+    Authentifizierung völlig unzusammenhängende Disposition-Entscheidung
+    eine Domain mit 0 echten SPF/DKIM-Problemen dauerhaft als
+    'braucht Recheck' blockieren."""
+    rows = [_row(DAY1 - i * _DAY_SECS, count=2, policy_p="reject", policy_pct=100) for i in range(6)]
+    rows.append(
+        _row(
+            DAY1 + 89 * _DAY_SECS, is_flagged=True, flag_reasons=["disposition_not_none"],
+            is_own_ip=True, dkim="pass", spf="pass", policy_p="reject", policy_pct=100,
+        )
+    )
+    result = _readiness_for(rows, until_ts=DAY1 + 90 * _DAY_SECS)
+    assert result[0].own_ip_auth_failures == 0
+    assert result[0].needs_recheck is False
 
 
 def test_dmarc_readiness_disposition_flag_on_unknown_ip_does_not_block():

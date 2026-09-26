@@ -139,6 +139,35 @@ def test_corrupted_gz_zlib_error_rejected(monkeypatch):
         extract_report_xml("broken.xml.gz", gzip.compress(b"anything"), MAX_ATTACHMENT, MAX_XML)
 
 
+def test_zip_corrupted_deflate_stream_rejected():
+    """Bitweise Beschädigung mitten im komprimierten Datenteil eines ZIP-
+    Eintrags kann direkt aus zlib ein zlib.error werfen ("invalid distance
+    too far back"), nicht das von zipfile gekapselte BadZipFile/OSError -
+    kein Subtyp von (BadZipFile, OSError, RuntimeError), würde also am
+    `except` in _extract_zip vorbei nach oben durchschlagen und den
+    kompletten fetch-Lauf abbrechen (dieselbe Angriffsklasse wie bei
+    zlib.error/EOFError in _extract_gz). Die zentrale Verzeichnisstruktur
+    bleibt unangetastet, das Archiv lässt sich also weiterhin ganz normal
+    öffnen - nur das Lesen des Eintrags selbst schlägt fehl."""
+    payload = b"<feedback><record>hello world this is a dmarc report payload</record></feedback>" * 50
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("report.xml", payload)
+    data = bytearray(buf.getvalue())
+
+    lfh_offset = data.index(b"PK\x03\x04")
+    name_len = int.from_bytes(data[lfh_offset + 26 : lfh_offset + 28], "little")
+    extra_len = int.from_bytes(data[lfh_offset + 28 : lfh_offset + 30], "little")
+    data_offset = lfh_offset + 30 + name_len + extra_len
+    data[data_offset] ^= 0xFF  # erstes Byte des komprimierten Datenteils kippen
+
+    corrupted = bytes(data)
+    assert zipfile.ZipFile(io.BytesIO(corrupted)).namelist() == ["report.xml"]
+
+    with pytest.raises(ArchiveError):
+        extract_report_xml("report.zip", corrupted, MAX_ATTACHMENT, MAX_XML)
+
+
 def test_json_plain_passthrough():
     data = b'{"organization-name": "x"}'
     assert extract_report_json("report.json", data, MAX_ATTACHMENT, MAX_JSON) == data

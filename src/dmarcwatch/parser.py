@@ -92,6 +92,17 @@ def _parse_timestamp(value: str, field_name: str) -> int:
     return ts
 
 
+def _parse_pct(value: str, field_name: str) -> int:
+    # pct ist laut RFC 7489 eine Prozentangabe (0-100); ohne diese Prüfung
+    # ließe sich hier ein beliebig großer int einschleusen, der store.py
+    # beim Einfügen in die INTEGER-Spalte mit OverflowError zum Absturz
+    # bringt (unkatalogisiert von fetch.py, also persistenter DoS).
+    pct = _parse_int(value, field_name)
+    if not (0 <= pct <= 100):
+        raise ReportParseError(f"Feld {field_name}={pct} liegt außerhalb des gültigen Bereichs 0-100")
+    return pct
+
+
 def _parse_ip(value: str) -> str:
     try:
         return str(ipaddress.ip_address(value.strip()))
@@ -130,7 +141,7 @@ def _parse_policy_published(root: Element) -> PolicyPublished:
         domain=_require_text(pp, "domain"),
         p=_require_text(pp, "p"),
         sp=_text(pp, "sp", default="") or "",
-        pct=_parse_int(pct_raw, "policy_published/pct"),
+        pct=_parse_pct(pct_raw, "policy_published/pct"),
         adkim=_text(pp, "adkim", default="r") or "r",
         aspf=_text(pp, "aspf", default="r") or "r",
         np=_text(pp, "np", default="") or "",

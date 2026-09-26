@@ -1,6 +1,7 @@
 """Spamhaus-ZEN-Abfrage: rein informativ, siehe blacklist.py-Modul-Docstring.
 Tests mocken `dig` - gleiche Begründung wie bei test_spf.py/test_dns_verify.py:
 kein automatisierter Testlauf darf von echtem DNS abhängen."""
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -9,8 +10,12 @@ from dmarcwatch.blacklist import BlacklistCheckError, check_ip_blacklist
 from dmarcwatch.spf import SPFResolutionError
 
 
+def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
 def test_not_listed_ip_returns_clean_result():
-    with patch("dmarcwatch.blacklist._dig", return_value=[]) as mock_dig:
+    with patch("dmarcwatch.blacklist._dig_checked", return_value=[]) as mock_dig:
         result = check_ip_blacklist("192.0.2.1")
     assert result.listed is False
     assert result.reasons == []
@@ -19,21 +24,21 @@ def test_not_listed_ip_returns_clean_result():
 
 
 def test_listed_ip_returns_known_reason():
-    with patch("dmarcwatch.blacklist._dig", return_value=["127.0.0.2"]):
+    with patch("dmarcwatch.blacklist._dig_checked", return_value=["127.0.0.2"]):
         result = check_ip_blacklist("198.51.100.5")
     assert result.listed is True
     assert result.reasons == ["SBL - bekannte Spam-Quelle"]
 
 
 def test_multiple_return_codes_produce_multiple_reasons():
-    with patch("dmarcwatch.blacklist._dig", return_value=["127.0.0.2", "127.0.0.4"]):
+    with patch("dmarcwatch.blacklist._dig_checked", return_value=["127.0.0.2", "127.0.0.4"]):
         result = check_ip_blacklist("198.51.100.5")
     assert result.listed is True
     assert len(result.reasons) == 2
 
 
 def test_unknown_return_code_shown_without_crashing():
-    with patch("dmarcwatch.blacklist._dig", return_value=["127.0.0.99"]):
+    with patch("dmarcwatch.blacklist._dig_checked", return_value=["127.0.0.99"]):
         result = check_ip_blacklist("198.51.100.5")
     assert result.listed is True
     assert "Unbekannter Rückgabecode 127.0.0.99" in result.reasons[0]
@@ -50,6 +55,22 @@ def test_ipv6_raises_blacklist_check_error_not_supported():
 
 
 def test_dns_failure_raises_blacklist_check_error():
-    with patch("dmarcwatch.blacklist._dig", side_effect=SPFResolutionError("Zeitüberschreitung")):
+    with patch("dmarcwatch.blacklist._dig_checked", side_effect=SPFResolutionError("Zeitüberschreitung")):
+        with pytest.raises(BlacklistCheckError):
+            check_ip_blacklist("198.51.100.5")
+
+
+def test_servfail_raises_blacklist_check_error_instead_of_false_clean():
+    # `dig +short` liefert bei SERVFAIL (z. B. Drosselung eines
+    # gemeinsam genutzten Resolvers durch Spamhaus) genau wie bei einer
+    # echten Leerantwort Exit-Code 0 und leeres stdout - ohne die
+    # Status-Prüfung in _dig_checked() würde das fälschlich als
+    # listed=False ("IP sauber") durchgehen statt als fehlgeschlagener
+    # Check gemeldet zu werden.
+    servfail = _dig_result(
+        ";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n"
+        ";; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0\n"
+    )
+    with patch("dmarcwatch.spf.subprocess.run", return_value=servfail):
         with pytest.raises(BlacklistCheckError):
             check_ip_blacklist("198.51.100.5")

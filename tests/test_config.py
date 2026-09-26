@@ -46,6 +46,21 @@ def test_is_own_domain_result_is_consistent_across_repeated_calls():
     assert all(results)
 
 
+# --- is_own_ip() ---
+
+
+def test_is_own_ip_unwraps_ipv4_mapped_ipv6_address():
+    """Regression: ein Dual-Stack-MTA kann denselben Host als IPv4-in-IPv6
+    (::ffff:a.b.c.d) loggen. ipaddress entpackt das nicht automatisch, `addr
+    in net` gegen ein IPv4Network liefert dann still False, obwohl es sich
+    um dieselbe Adresse handelt."""
+    config = _config(own_ip_networks=["203.0.113.0/24"])
+    assert config.is_own_ip("203.0.113.5") is True
+    assert config.is_own_ip("::ffff:203.0.113.5") is True
+    assert config.is_own_ip("::ffff:198.51.100.5") is False
+    assert config.is_own_ip("2001:db8::1") is False
+
+
 # --- Atomare Schreibvorgänge ---
 
 
