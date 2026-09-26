@@ -302,13 +302,22 @@ struct DomainVerificationResponse: Decodable {
     let dnssec: DNSSECCheck
     let dane: DANECheck
     let bimi: BIMICheck
+    // Vergleich gegen den zuletzt gespeicherten DNS-Schnappschuss (siehe
+    // dns_verify.diff_and_update_snapshot) - flach im JSON, da
+    // _dns_change_to_dict() in cli.py per {**...} in dasselbe Dict gemischt
+    // wird statt ein eigenes Unterobjekt zu sein.
+    let hasBaseline: Bool
+    let changes: [String]
+    let policyWeakened: Bool
 
     enum CodingKeys: String, CodingKey {
-        case domain, dmarc, spf, dkim, dnssec, dane, bimi
+        case domain, dmarc, spf, dkim, dnssec, dane, bimi, changes
         case mtaSts = "mta_sts"
         case tlsrptDns = "tlsrpt_dns"
         case wildcardSpf = "wildcard_spf"
         case mxBlacklist = "mx_blacklist"
+        case hasBaseline = "has_baseline"
+        case policyWeakened = "policy_weakened"
     }
 }
 
@@ -475,11 +484,17 @@ struct TLSDayStatEntry: Decodable, Identifiable {
 /// Zeit vergangen ist. needsRecheck warnt unabhängig davon, wenn eine
 /// bereits bei p=reject stehende Domain einen FRISCHEN own_ip_auth_fail
 /// bekommt (siehe report.py:DMARCReadiness-Docstring für die volle
-/// Begründung inkl. der own_ip_networks-Einschränkung).
+/// Begründung inkl. der own_ip_networks-Einschränkung). pct gilt laut RFC
+/// 7489 gemeinsam für p UND sp - ist currentSp bereits strenger als p und
+/// selbst voll durchgesetzt (pct=100), überspringt die nächste empfohlene
+/// Stufe die übliche 25%-Zwischenstufe und geht direkt auf pct=100, um das
+/// bereits durchgesetzte sp nicht mit zurückzuwerfen;
+/// nextStepPctAdjustedForSp zeigt an, wann das passiert ist.
 struct DMARCReadinessEntry: Decodable, Identifiable {
     let domain: String
     let currentPolicy: String?
     let currentPct: Int?
+    let currentSp: String?
     let totalCount: Int
     let unknownIpFailures: Int
     let ownIpAuthFailures: Int
@@ -495,6 +510,7 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
     let fullyEnforced: Bool
     let readyForNextStep: Bool
     let needsRecheck: Bool
+    let nextStepPctAdjustedForSp: Bool
     // Reports mit inkonsistenten Metadaten (org_name/E-Mail-Domain ohne
     // plausiblen Bezug zueinander, siehe report.py:is_consistent_reporter)
     // fließen NICHT in die obigen Felder ein - sichtbar statt
@@ -508,6 +524,7 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
         case domain
         case currentPolicy = "current_policy"
         case currentPct = "current_pct"
+        case currentSp = "current_sp"
         case totalCount = "total_count"
         case unknownIpFailures = "unknown_ip_failures"
         case ownIpAuthFailures = "own_ip_auth_failures"
@@ -523,6 +540,7 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
         case fullyEnforced = "fully_enforced"
         case readyForNextStep = "ready_for_next_step"
         case needsRecheck = "needs_recheck"
+        case nextStepPctAdjustedForSp = "next_step_pct_adjusted_for_sp"
         case excludedCount = "excluded_count"
         case excludedReporters = "excluded_reporters"
     }

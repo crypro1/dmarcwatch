@@ -11,9 +11,15 @@ from dmarcwatch.store import SCHEMA_VERSION, _migrate, connect
 
 def test_fresh_database_migrates_to_current_schema_version(tmp_path):
     conn = connect(tmp_path / "fresh.db")
+    assert SCHEMA_VERSION == 5
     assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert {"reports", "records", "whois_cache", "tls_reports", "tls_policies", "blacklist_cache"} <= tables
+    assert {
+        "reports", "records", "whois_cache", "tls_reports", "tls_policies", "blacklist_cache", "dns_snapshots",
+    } <= tables
+    # Muss tatsächlich abfragbar sein, nicht nur als Tabellenname existieren -
+    # siehe dns_verify.py:diff_and_update_snapshot.
+    assert conn.execute("SELECT domain, fingerprint_json, checked_at FROM dns_snapshots").fetchall() == []
     conn.close()
 
 

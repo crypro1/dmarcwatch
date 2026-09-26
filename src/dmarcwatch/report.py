@@ -145,6 +145,9 @@ class ReportRow:
     domain: str = ""
     policy_p: str = ""
     policy_pct: int = 100
+    # Gemeinsam mit policy_pct (EIN Wert für p UND sp, siehe RFC 7489) für
+    # die sp-bewusste Rollout-Empfehlung in compute_dmarc_readiness gebraucht.
+    policy_sp: str = ""
     # War bereits in der DB (query_records selektiert es), aber bis eben
     # nicht bis hierher durchgereicht - für compute_dmarc_readiness gebraucht,
     # um own_ip_auth_fail (dkim UND spf fail) von einem partiellen Auth-Fail
@@ -183,6 +186,7 @@ def collect_rows(
                 domain=r["domain"],
                 policy_p=r["policy_p"],
                 policy_pct=r["policy_pct"],
+                policy_sp=r["policy_sp"],
                 is_own_ip=bool(r["is_own_ip"]),
                 email=email,
                 is_consistent=is_consistent_reporter(r["org_name"], email, consistent_reporter_overrides),
@@ -560,24 +564,50 @@ def _detect_reporting_gap(day_indices: list[int]) -> tuple[bool, int]:
     return False, 0
 
 
-def _next_dmarc_rollout_step(current_policy: str | None, current_pct: int | None) -> tuple[str, int] | None:
+_POLICY_RANK = {"none": 0, "quarantine": 1, "reject": 2}
+
+
+def _next_dmarc_rollout_step(
+    current_policy: str | None, current_pct: int | None, current_sp: str | None = None
+) -> tuple[str, int, bool] | None:
     """Nächster Schritt einer vorsichtigen, gestaffelten DMARC-Verschärfung
     in 25%-Schritten (p=none -> quarantine 25/50/75/100 -> reject
     25/50/75/100) statt eines einzigen Sprungs direkt auf p=reject;
     pct=100 - dem in der Praxis üblichen, empfohlenen Rollout-Ablauf.
     None, wenn bereits am Ziel (p=reject, pct=100) - current_pct zählt
     dafür genauso wie current_policy, ein Eintrag mit p=reject; pct=10
-    ist NICHT fertig, auch wenn die Policy schon "reject" heißt."""
+    ist NICHT fertig, auch wenn die Policy schon "reject" heißt.
+
+    pct ist laut RFC 7489 EIN gemeinsamer Wert für p UND sp - es gibt
+    keinen getrennten pct je Policy. Steht sp bereits strenger als p UND
+    mit pct=100 vollständig durchgesetzt (sp_ahead_and_enforced), würde
+    der sonst übliche erste Schritt einer Politikwechsel-Stufe (pct=25)
+    das bereits durchgesetzte sp beim Anwenden auf denselben,
+    gemeinsamen pct-Wert wieder auf 25% Durchsetzung zurückwerfen -
+    genau der Bug, der diesen Parameter nötig macht. In diesem Fall wird
+    der erste Schritt einer neuen Policy-Stufe daher direkt auf pct=100
+    gesetzt statt über die übliche 25%-Rampe zu laufen; einmal mitten in
+    der Rampe (pct bereits < 100) ist sp per Definition nicht mehr
+    "ahead and enforced" in diesem Sinn, dort greift die Sonderregel
+    deshalb nicht. adjusted_for_sp (dritter Rückgabewert) ist True genau
+    dann, wenn diese Sonderregel gegriffen hat."""
     policy = current_policy or "none"
     pct = current_pct if current_pct is not None else 0
+    sp_rank = _POLICY_RANK.get(current_sp, -1) if current_sp else -1
+    policy_rank = _POLICY_RANK.get(policy, 0)
+    sp_ahead_and_enforced = sp_rank > policy_rank and pct >= 100
     if policy not in ("quarantine", "reject"):
-        return "quarantine", 25
+        if sp_ahead_and_enforced:
+            return "quarantine", 100, True
+        return "quarantine", 25, False
     if policy == "quarantine":
         if pct < 100:
-            return "quarantine", min(100, pct + 25)
-        return "reject", 25
+            return "quarantine", min(100, pct + 25), False
+        if sp_ahead_and_enforced:
+            return "reject", 100, True
+        return "reject", 25, False
     if pct < 100:
-        return "reject", min(100, pct + 25)
+        return "reject", min(100, pct + 25), False
     return None
 
 
@@ -645,7 +675,14 @@ class DMARCReadiness:
     stillschweigend in der Mathematik verschwinden zu lassen - dieselbe
     "keine stille Verhaltensänderung"-Logik wie bei has_reporting_gap.
     is_consistent_reporter() ist ausdrücklich KEINE Authentifizierung, nur
-    ein Filter gegen Zero-Effort-Fälschungen, siehe deren Docstring."""
+    ein Filter gegen Zero-Effort-Fälschungen, siehe deren Docstring.
+
+    next_step_pct_adjusted_for_sp ist True, wenn next_recommended_pct
+    wegen current_sp direkt auf 100 statt auf die übliche 25%-Zwischenstufe
+    gesetzt wurde (siehe _next_dmarc_rollout_step) - pct gilt laut RFC 7489
+    gemeinsam für p UND sp, ein bereits bei pct=100 durchgesetztes,
+    strengeres sp würde durch die normale Rampe sonst mit auf 25%
+    zurückgesetzt."""
 
     domain: str
     current_policy: str | None
@@ -667,6 +704,8 @@ class DMARCReadiness:
     needs_recheck: bool
     excluded_count: int
     excluded_reporters: list[str]
+    current_sp: str | None
+    next_step_pct_adjusted_for_sp: bool
 
 
 def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> list[DMARCReadiness]:
@@ -697,9 +736,10 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
             # per DNS veröffentlichten Policy, kaum schädlich fälschbar) -
             # geht aber nicht in ready_for_next_step ein, das bleibt False.
             latest = max(domain_rows, key=lambda r: r.date_begin)
-            next_policy, next_pct = _next_dmarc_rollout_step(
-                latest.policy_p or None, latest.policy_pct
-            ) or (None, None)
+            current_sp = latest.policy_sp or None
+            next_policy, next_pct, adjusted_for_sp = _next_dmarc_rollout_step(
+                latest.policy_p or None, latest.policy_pct, current_sp
+            ) or (None, None, False)
             result.append(
                 DMARCReadiness(
                     domain=domain,
@@ -722,6 +762,8 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
                     needs_recheck=False,
                     excluded_count=excluded_count,
                     excluded_reporters=excluded_reporters,
+                    current_sp=current_sp,
+                    next_step_pct_adjusted_for_sp=adjusted_for_sp,
                 )
             )
             continue
@@ -767,7 +809,10 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
 
         has_gap, gap_days = _detect_reporting_gap([r.date_begin // 86400 for r in consistent_rows])
 
-        next_policy, next_pct = _next_dmarc_rollout_step(latest.policy_p or None, latest.policy_pct) or (None, None)
+        current_sp = latest.policy_sp or None
+        next_policy, next_pct, adjusted_for_sp = _next_dmarc_rollout_step(
+            latest.policy_p or None, latest.policy_pct, current_sp
+        ) or (None, None, False)
         fully_enforced = next_policy is None
 
         ready_for_next_step = (
@@ -802,6 +847,8 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
                 needs_recheck=needs_recheck,
                 excluded_count=excluded_count,
                 excluded_reporters=excluded_reporters,
+                current_sp=current_sp,
+                next_step_pct_adjusted_for_sp=adjusted_for_sp,
             )
         )
     return result
@@ -970,6 +1017,7 @@ def to_stats_json_dict(
                 if r.current_policy
                 else r.current_policy,
                 "current_pct": r.current_pct,
+                "current_sp": r.current_sp,
                 "total_count": r.total_count,
                 "unknown_ip_failures": r.unknown_ip_failures,
                 "own_ip_auth_failures": r.own_ip_auth_failures,
@@ -985,6 +1033,7 @@ def to_stats_json_dict(
                 "fully_enforced": r.fully_enforced,
                 "ready_for_next_step": r.ready_for_next_step,
                 "needs_recheck": r.needs_recheck,
+                "next_step_pct_adjusted_for_sp": r.next_step_pct_adjusted_for_sp,
                 "excluded_count": r.excluded_count,
                 "excluded_reporters": [
                     sanitize_field(name, max_len=_MAX_JSON_FIELD_LEN) for name in r.excluded_reporters

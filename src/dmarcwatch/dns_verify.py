@@ -35,7 +35,7 @@ from defusedxml.common import DefusedXmlException
 
 from .blacklist import BlacklistCheckError, check_ip_blacklist
 from .spf import DIG_TIMEOUT_SECONDS, SPFCheckResult, SPFResolutionError, _dig, _txt_records, validate_spf
-from .store import get_known_dkim_selectors
+from .store import get_dns_snapshot, get_known_dkim_selectors, set_dns_snapshot
 
 _HTTPS_TIMEOUT_SECONDS = 5.0
 
@@ -214,6 +214,103 @@ class DomainVerification:
     dnssec: DNSSECCheckResult
     dane: DANECheckResult
     bimi: BIMICheckResult
+
+
+_POLICY_RANK = {"none": 0, "quarantine": 1, "reject": 2}
+
+# Label je Fingerprint-Feld für die menschenlesbaren changes-Einträge -
+# dmarc_policy/dmarc_subdomain_policy/dmarc_pct bewusst ausgelassen,
+# dmarc_record deckt inhaltlich denselben Fall schon ab (ein geänderter
+# Tag ändert immer auch den Rohtext des Eintrags).
+_CHANGE_LABELS = {
+    "dmarc_record": "DMARC-Eintrag",
+    "spf_record": "SPF-Eintrag",
+    "dkim": "DKIM-Selektoren",
+    "mta_sts_policy_txt": "MTA-STS-Policy",
+    "tlsrpt_record": "TLS-RPT-DNS-Eintrag",
+    "dane_mx_hosts_with_tlsa": "DANE/TLSA-Hosts",
+    "bimi_record": "BIMI-Eintrag",
+}
+
+
+def _fingerprint(result: DomainVerification) -> dict:
+    """Die für Änderungserkennung relevanten Felder aus einem
+    DomainVerification-Ergebnis - bewusst eine kuratierte Teilmenge, damit
+    ein Schnappschuss stabil und aussagekräftig bleibt."""
+    return {
+        "dmarc_record": result.dmarc.record,
+        "dmarc_policy": result.dmarc.policy,
+        "dmarc_subdomain_policy": result.dmarc.subdomain_policy,
+        "dmarc_pct": result.dmarc.pct,
+        "spf_record": result.spf.record,
+        "dkim": sorted(f"{d.selector}:{d.key_type}" for d in result.dkim if d.exists),
+        "mta_sts_policy_txt": result.mta_sts.policy_txt,
+        "tlsrpt_record": result.tlsrpt_dns.record,
+        "dane_mx_hosts_with_tlsa": sorted(result.dane.mx_hosts_with_tlsa),
+        "bimi_record": result.bimi.record,
+    }
+
+
+@dataclass
+class DNSChangeResult:
+    # has_baseline=False beim allerersten Check einer Domain (noch nichts
+    # zum Vergleichen). policy_weakened=True speziell dann, wenn die
+    # DMARC-Policy (p ODER sp) seit dem letzten Check auf eine schwächere
+    # Stufe zurückgestuft wurde (reject->quarantine->none).
+    has_baseline: bool
+    changes: list[str]
+    policy_weakened: bool
+
+
+def _format_fingerprint_value(value: object) -> str:
+    if value is None:
+        return "(nicht gesetzt)"
+    if isinstance(value, list):
+        return ", ".join(value) if value else "(keine)"
+    return str(value)
+
+
+def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerification) -> DNSChangeResult:
+    """Vergleicht result gegen den gespeicherten Schnappschuss für
+    result.domain, aktualisiert den Schnappschuss IMMER (auch beim
+    allerersten Mal, um die Baseline zu legen), und gibt zurück, was sich
+    geändert hat."""
+    new_fp = _fingerprint(result)
+    old_fp = get_dns_snapshot(conn, result.domain)
+    set_dns_snapshot(conn, result.domain, new_fp)
+
+    if old_fp is None:
+        return DNSChangeResult(has_baseline=False, changes=[], policy_weakened=False)
+
+    changes: list[str] = []
+    for key, label in _CHANGE_LABELS.items():
+        old_value = old_fp.get(key)
+        new_value = new_fp.get(key)
+        if old_value != new_value:
+            changes.append(
+                f"{label} geändert: {_format_fingerprint_value(old_value)} -> "
+                f"{_format_fingerprint_value(new_value)}"
+            )
+
+    # -1 (unbekannt/fehlend) darf für sich genommen nie ein "geschwächt"
+    # auslösen - das wäre nur die fehlende Vergleichsbasis, nicht ein
+    # tatsächlicher Rückschritt.
+    old_p_rank = _POLICY_RANK.get(old_fp.get("dmarc_policy"), -1)
+    new_p_rank = _POLICY_RANK.get(new_fp.get("dmarc_policy"), -1)
+    old_sp_rank = _POLICY_RANK.get(old_fp.get("dmarc_subdomain_policy"), -1)
+    new_sp_rank = _POLICY_RANK.get(new_fp.get("dmarc_subdomain_policy"), -1)
+    policy_weakened = (old_p_rank != -1 and new_p_rank < old_p_rank) or (
+        old_sp_rank != -1 and new_sp_rank < old_sp_rank
+    )
+    if policy_weakened:
+        changes.insert(
+            0,
+            "⚠ DMARC-Policy geschwächt: "
+            f"p={old_fp.get('dmarc_policy')}->{new_fp.get('dmarc_policy')}, "
+            f"sp={old_fp.get('dmarc_subdomain_policy')}->{new_fp.get('dmarc_subdomain_policy')}",
+        )
+
+    return DNSChangeResult(has_baseline=True, changes=changes, policy_weakened=policy_weakened)
 
 
 def _parse_dmarc_tags(record: str) -> dict[str, str]:

@@ -28,7 +28,7 @@ _CONSISTENT_EMAIL = "noreply-dmarc-support@google.com"
 
 def _row(
     date_begin: int, is_flagged: bool = False, flag_reasons=None,
-    domain: str = "example.com", policy_p: str = "quarantine", policy_pct: int = 100,
+    domain: str = "example.com", policy_p: str = "quarantine", policy_pct: int = 100, policy_sp: str = "",
     count: int = 1, is_own_ip: bool = False, org_name: str = _CONSISTENT_ORG, email: str = _CONSISTENT_EMAIL,
     dkim: str = "pass", spf: str = "pass",
 ) -> ReportRow:
@@ -36,7 +36,7 @@ def _row(
         date_begin=date_begin, org_name=org_name, source_ip="192.0.2.1", count=count,
         disposition="none", dkim=dkim, spf=spf, envelope_to="",
         is_flagged=is_flagged, flag_reasons=flag_reasons or [],
-        domain=domain, policy_p=policy_p, policy_pct=policy_pct, is_own_ip=is_own_ip,
+        domain=domain, policy_p=policy_p, policy_pct=policy_pct, policy_sp=policy_sp, is_own_ip=is_own_ip,
         email=email, is_consistent=is_consistent_reporter(org_name, email),
     )
 
@@ -123,28 +123,54 @@ def test_recommended_observation_days_boundaries_are_inclusive_on_the_lower_tier
 
 
 def test_next_rollout_step_from_none():
-    assert _next_dmarc_rollout_step(None, None) == ("quarantine", 25)
-    assert _next_dmarc_rollout_step("none", 100) == ("quarantine", 25)
+    assert _next_dmarc_rollout_step(None, None) == ("quarantine", 25, False)
+    assert _next_dmarc_rollout_step("none", 100) == ("quarantine", 25, False)
 
 
 def test_next_rollout_step_ramps_pct_within_quarantine():
-    assert _next_dmarc_rollout_step("quarantine", 25) == ("quarantine", 50)
-    assert _next_dmarc_rollout_step("quarantine", 90) == ("quarantine", 100)
+    assert _next_dmarc_rollout_step("quarantine", 25) == ("quarantine", 50, False)
+    assert _next_dmarc_rollout_step("quarantine", 90) == ("quarantine", 100, False)
 
 
 def test_next_rollout_step_moves_from_quarantine_to_reject_once_pct_100():
-    assert _next_dmarc_rollout_step("quarantine", 100) == ("reject", 25)
+    assert _next_dmarc_rollout_step("quarantine", 100) == ("reject", 25, False)
 
 
 def test_next_rollout_step_ramps_pct_within_reject():
-    assert _next_dmarc_rollout_step("reject", 25) == ("reject", 50)
-    assert _next_dmarc_rollout_step("reject", 90) == ("reject", 100)
+    assert _next_dmarc_rollout_step("reject", 25) == ("reject", 50, False)
+    assert _next_dmarc_rollout_step("reject", 90) == ("reject", 100, False)
 
 
 def test_next_rollout_step_none_once_fully_enforced():
     """p=reject; pct=100 ist der einzige Zustand ohne weiteren Schritt -
     p=reject bei kleinerem pct ist NICHT fertig."""
     assert _next_dmarc_rollout_step("reject", 100) is None
+
+
+# --- _next_dmarc_rollout_step() sp-Bewusstsein (pct ist EIN gemeinsamer
+# Wert für p UND sp laut RFC 7489 - ein bereits bei pct=100 durchgesetztes,
+# strengeres sp darf durch die normale 25%-Rampe für p nicht mit
+# zurückgeworfen werden) ---
+
+
+def test_next_rollout_step_skips_ramp_when_sp_already_enforced_ahead_of_p():
+    """Der reale Bug-Fall: p=quarantine ist bei pct=100 fertig, sp=reject
+    ist bereits vollständig durchgesetzt - der nächste Schritt muss direkt
+    auf pct=100 springen statt über die übliche 25%-Zwischenstufe zu
+    laufen, sonst würde er sp=reject beim Anwenden auf pct=25 wieder
+    schwächen."""
+    assert _next_dmarc_rollout_step("quarantine", 100, current_sp="reject") == ("reject", 100, True)
+
+
+def test_next_rollout_step_normal_staged_behavior_unchanged_without_sp():
+    assert _next_dmarc_rollout_step("none", 100, current_sp=None) == ("quarantine", 25, False)
+
+
+def test_next_rollout_step_mid_ramp_unaffected_by_sp_awareness():
+    """Sobald p tatsächlich mitten in der Rampe steckt (pct < 100), gilt
+    die normale +25-Logik unverändert weiter - sp ist dann per Definition
+    nicht mehr 'ahead and enforced' in diesem Sinn."""
+    assert _next_dmarc_rollout_step("quarantine", 50, current_sp="reject") == ("quarantine", 75, False)
 
 
 # --- _detect_reporting_gap() (K) ---
@@ -359,6 +385,22 @@ def test_dmarc_readiness_reject_with_partial_pct_still_recommends_next_step():
     assert result[0].next_recommended_policy == "reject"
     assert result[0].next_recommended_pct == 35
     assert result[0].ready_for_next_step is True
+
+
+def test_dmarc_readiness_next_step_skips_ramp_when_sp_already_enforced():
+    """Der reale Bug-Fall aus _next_dmarc_rollout_step end-to-end über
+    compute_dmarc_readiness: p=quarantine ist bei pct=100 fertig, sp=reject
+    ist bereits vollständig durchgesetzt - die Empfehlung muss direkt auf
+    pct=100 springen, nicht auf die übliche 25%-Zwischenstufe."""
+    rows = [
+        _row(DAY1 - i * _DAY_SECS, count=2, policy_p="quarantine", policy_pct=100, policy_sp="reject")
+        for i in range(6)
+    ]
+    result = _readiness_for(rows)
+    assert result[0].current_sp == "reject"
+    assert result[0].next_recommended_policy == "reject"
+    assert result[0].next_recommended_pct == 100
+    assert result[0].next_step_pct_adjusted_for_sp is True
 
 
 def test_dmarc_readiness_needs_recheck_when_reject_domain_gets_a_recent_failure():
