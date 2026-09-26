@@ -13,6 +13,12 @@ struct SetupView: View {
     @ObservedObject var viewModel: SetupViewModel
     @State private var showSPFConfirmation = false
 
+    // Aus dem Bundle statt fest verdrahtet, damit sie nie von der in
+    // Info.plist gepflegten CFBundleShortVersionString abweichen kann.
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("dmarcwatch einrichten")
@@ -122,6 +128,9 @@ struct SetupView: View {
             }
 
             HStack {
+                Text("Version \(appVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Abbrechen") { viewModel.onCancel?() }
                     .keyboardShortcut(.cancelAction)
