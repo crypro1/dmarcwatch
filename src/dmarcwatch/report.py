@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
-from .anomaly import REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
+from .anomaly import REASON_FOREIGN_HEADER_FROM, REASON_LABELS_DE, REASON_OWN_IP_AUTH_FAIL, REASON_UNKNOWN_IP
 from .sanitize import sanitize_field
 from .store import query_records, query_tls_failure_details, query_tls_policies
 
@@ -158,6 +158,12 @@ class ReportRow:
     # report_metadata/email - für is_consistent_reporter() gebraucht, siehe dort.
     email: str = ""
     is_consistent: bool = False
+    # identifiers/header_from - war bereits in der DB (query_records
+    # selektiert r.header_from), aber bis eben nicht bis hierher
+    # durchgereicht - für compute_spoofed_identities() gebraucht, um
+    # REASON_FOREIGN_HEADER_FROM-Treffer (anomaly.py) nach gemeldeter
+    # Absenderidentität zu gruppieren.
+    header_from: str = ""
 
 
 def collect_rows(
@@ -190,6 +196,7 @@ def collect_rows(
                 is_own_ip=bool(r["is_own_ip"]),
                 email=email,
                 is_consistent=is_consistent_reporter(r["org_name"], email, consistent_reporter_overrides),
+                header_from=r["header_from"],
             )
         )
     return result
@@ -452,6 +459,9 @@ class DayStat:
     date: str
     clean_count: int
     flagged_count: int
+    # Echtes E-Mail-Volumen (r.count), nicht Zeilenzahl wie flagged_count -
+    # zeigt, was die eigene Policy tatsächlich abgewiesen hat.
+    blocked_count: int
 
 
 def collect_daily_stats(rows: list[ReportRow]) -> list[DayStat]:
@@ -467,7 +477,52 @@ def collect_daily_stats(rows: list[ReportRow]) -> list[DayStat]:
     for day in sorted(by_day.keys()):
         day_rows = by_day[day]
         flagged = sum(1 for r in day_rows if r.is_flagged)
-        result.append(DayStat(date=day, clean_count=len(day_rows) - flagged, flagged_count=flagged))
+        blocked = sum(r.count for r in day_rows if r.is_flagged and r.disposition == "reject")
+        result.append(
+            DayStat(date=day, clean_count=len(day_rows) - flagged, flagged_count=flagged, blocked_count=blocked)
+        )
+    return result
+
+
+@dataclass
+class SpoofedIdentity:
+    header_from: str
+    total_count: int
+    record_count: int
+    first_seen_date: str
+    last_seen_date: str
+    reporters: list[str]
+
+
+def compute_spoofed_identities(rows: list[ReportRow]) -> list[SpoofedIdentity]:
+    """Gruppiert Reports mit REASON_FOREIGN_HEADER_FROM (identifiers/header_from
+    gehört weder zur eigenen, im Report veröffentlichten Domain noch zu einer
+    ihrer Subdomains, siehe anomaly.py) nach header_from - zeigt, welche
+    fremden Absenderidentitäten gemeldet werden, wie oft und seit wann.
+
+    Bewusst auf denselben rows/demselben Zeitfenster berechnet, das auch der
+    Rest von `stats` verwendet (--days), keine eigene All-Time-Abfrage -
+    dieselbe Konvention wie jede andere Statistik in dieser Datei. header_from
+    stammt wie org_name aus dem unauthentifizierten Report-XML, siehe
+    sanitize_field()-Behandlung in to_stats_json_dict()."""
+    by_header_from: dict[str, list[ReportRow]] = {}
+    for r in rows:
+        if REASON_FOREIGN_HEADER_FROM in r.flag_reasons and r.header_from:
+            by_header_from.setdefault(r.header_from, []).append(r)
+
+    result = []
+    for header_from, group in by_header_from.items():
+        result.append(
+            SpoofedIdentity(
+                header_from=header_from,
+                total_count=sum(r.count for r in group),
+                record_count=len(group),
+                first_seen_date=time.strftime("%Y-%m-%d", time.gmtime(min(r.date_begin for r in group))),
+                last_seen_date=time.strftime("%Y-%m-%d", time.gmtime(max(r.date_begin for r in group))),
+                reporters=sorted({r.org_name for r in group}),
+            )
+        )
+    result.sort(key=lambda s: s.total_count, reverse=True)
     return result
 
 
@@ -1052,13 +1107,36 @@ def to_stats_json_dict(
     dmarc_readiness: list[DMARCReadiness],
     mta_sts_readiness: list[MTASTSReadiness],
     tls_daily: list[TLSDayStat] | None = None,
+    spoofed_identities: list[SpoofedIdentity] | None = None,
 ) -> dict:
     return {
         "days": days,
-        "daily": [{"date": d.date, "clean_count": d.clean_count, "flagged_count": d.flagged_count} for d in daily],
+        "daily": [
+            {
+                "date": d.date,
+                "clean_count": d.clean_count,
+                "flagged_count": d.flagged_count,
+                "blocked_count": d.blocked_count,
+            }
+            for d in daily
+        ],
         "tls_daily": [
             {"date": d.date, "successful_count": d.successful_count, "failure_count": d.failure_count}
             for d in (tls_daily or [])
+        ],
+        # header_from/reporters stammen wie org_name aus dem
+        # unauthentifizierten Report-XML - beide sanitisieren, dieselbe
+        # Konvention wie excluded_reporters/org_name weiter unten.
+        "spoofed_identities": [
+            {
+                "header_from": sanitize_field(s.header_from, max_len=_MAX_JSON_FIELD_LEN),
+                "total_count": s.total_count,
+                "record_count": s.record_count,
+                "first_seen_date": s.first_seen_date,
+                "last_seen_date": s.last_seen_date,
+                "reporters": [sanitize_field(name, max_len=_MAX_JSON_FIELD_LEN) for name in s.reporters],
+            }
+            for s in (spoofed_identities or [])
         ],
         "dmarc_readiness": [
             {

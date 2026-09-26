@@ -6,6 +6,7 @@ import ipaddress
 import json
 import sys
 import time
+from collections import Counter
 from datetime import date
 
 from . import keychain, launchd, notify
@@ -43,6 +44,7 @@ from .report import (
     collect_tls_rows,
     compute_dmarc_readiness,
     compute_mta_sts_readiness,
+    compute_spoofed_identities,
     day_range_to_ts,
     format_table,
     format_tls_table,
@@ -446,10 +448,12 @@ def cmd_stats(args: argparse.Namespace) -> int:
     tls_daily = collect_tls_daily_stats(tls_rows)
     dmarc_readiness = compute_dmarc_readiness(rows, args.days, until_ts)
     mta_sts_readiness = compute_mta_sts_readiness(tls_rows, args.days, until_ts)
+    spoofed_identities = compute_spoofed_identities(rows)
 
     if args.json:
         json.dump(
-            to_stats_json_dict(args.days, daily, dmarc_readiness, mta_sts_readiness, tls_daily), sys.stdout
+            to_stats_json_dict(args.days, daily, dmarc_readiness, mta_sts_readiness, tls_daily, spoofed_identities),
+            sys.stdout,
         )
         sys.stdout.write("\n")
         return 0
@@ -460,6 +464,13 @@ def cmd_stats(args: argparse.Namespace) -> int:
     for day in daily:
         print(f"{day.date}  {day.clean_count:>6}  {day.flagged_count:>9}")
     print()
+    total_blocked = sum(d.blocked_count for d in daily)
+    if total_blocked:
+        print(
+            f"{total_blocked} E-Mails wurden im gewählten Zeitraum durch die eigene "
+            "DMARC-Policy (reject) abgewiesen."
+        )
+        print()
     print(
         "Hinweis: basiert nur auf bisher gemeldeten Reports - DMARC-/TLS-RPT-Reporting ist"
     )
@@ -467,6 +478,13 @@ def cmd_stats(args: argparse.Namespace) -> int:
         "branchenweit lückenhaft (nicht jeder Empfänger meldet), keine Garantie."
     )
     print()
+    if spoofed_identities:
+        print("Auffällige Absender-Identitäten (header_from):")
+        for s in spoofed_identities:
+            print(f"  {s.header_from}: {s.total_count} E-Mails, {s.record_count}x gemeldet, "
+                  f"zuerst am {s.first_seen_date}, zuletzt am {s.last_seen_date} "
+                  f"(gemeldet von: {', '.join(s.reporters)})")
+        print()
     if not dmarc_readiness:
         print("DMARC: keine Reports im Zeitraum, keine Einschätzung möglich.")
     for r in dmarc_readiness:
@@ -598,6 +616,20 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         db_conn.close()
         print(f"Keine Treffer für {args.query!r} in den letzten {args.days} Tagen.")
         return 1
+
+    # Gruppierte Übersicht VOR der vollständigen Detailliste unten - bei
+    # mehreren Treffern mit unterschiedlichem header_from zeigt das auf
+    # einen Blick, ob hinter dieser IP/diesem Netz eine oder mehrere
+    # gemeldete Absenderidentitäten stecken (siehe REASON_FOREIGN_HEADER_FROM
+    # in anomaly.py). Bei nur einer einzigen Identität wäre das nur eine
+    # redundante Ein-Zeilen-Wiederholung des Details unten, deshalb erst ab
+    # mehr als einem eindeutigen Wert anzeigen.
+    header_from_counts = Counter(sanitize_field(m["header_from"], 80) for m in matches if m["header_from"])
+    if len(header_from_counts) > 1:
+        print("Header-From-Verteilung für diese Abfrage:")
+        for header_from, count in header_from_counts.most_common():
+            print(f"  {header_from}: {count}x")
+        print()
 
     # Pro eindeutiger IP nur einmal nachschlagen, auch wenn mehrere
     # Treffer dieselbe IP haben (mehrere Reports/Tage).

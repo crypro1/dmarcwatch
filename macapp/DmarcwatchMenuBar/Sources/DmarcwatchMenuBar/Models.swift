@@ -410,12 +410,14 @@ struct StatsResponse: Decodable {
     let tlsDaily: [TLSDayStatEntry]
     let dmarcReadiness: [DMARCReadinessEntry]
     let mtaStsReadiness: [MTASTSReadinessEntry]
+    let spoofedIdentities: [SpoofedIdentityEntry]
 
     enum CodingKeys: String, CodingKey {
         case days, daily
         case tlsDaily = "tls_daily"
         case dmarcReadiness = "dmarc_readiness"
         case mtaStsReadiness = "mta_sts_readiness"
+        case spoofedIdentities = "spoofed_identities"
     }
 }
 
@@ -423,6 +425,7 @@ struct DayStatEntry: Decodable, Identifiable {
     let date: String
     let cleanCount: Int
     let flaggedCount: Int
+    let blockedCount: Int
 
     var id: String { date }
 
@@ -430,6 +433,7 @@ struct DayStatEntry: Decodable, Identifiable {
         case date
         case cleanCount = "clean_count"
         case flaggedCount = "flagged_count"
+        case blockedCount = "blocked_count"
     }
 
     private static let isoFormatter: DateFormatter = {
@@ -590,6 +594,33 @@ struct MTASTSReadinessEntry: Decodable, Identifiable {
         case readyForEnforce = "ready_for_enforce"
         case excludedCount = "excluded_count"
         case excludedReporters = "excluded_reporters"
+    }
+}
+
+/// Spiegelt SpoofedIdentity aus report.py (compute_spoofed_identities) -
+/// Reports mit REASON_FOREIGN_HEADER_FROM (identifiers/header_from gehört
+/// weder zur eigenen Domain noch zu einer ihrer Subdomains, siehe
+/// anomaly.py), gruppiert nach header_from. Zeigt, welche fremden
+/// Absenderidentitäten gemeldet werden, wie oft und seit wann - header_from
+/// und reporters stammen wie org_name aus dem unauthentifizierten
+/// Report-XML, kommen aber bereits sanitisiert aus to_stats_json_dict().
+struct SpoofedIdentityEntry: Decodable, Identifiable {
+    let headerFrom: String
+    let totalCount: Int
+    let recordCount: Int
+    let firstSeenDate: String
+    let lastSeenDate: String
+    let reporters: [String]
+
+    var id: String { headerFrom }
+
+    enum CodingKeys: String, CodingKey {
+        case headerFrom = "header_from"
+        case totalCount = "total_count"
+        case recordCount = "record_count"
+        case firstSeenDate = "first_seen_date"
+        case lastSeenDate = "last_seen_date"
+        case reporters
     }
 }
 
