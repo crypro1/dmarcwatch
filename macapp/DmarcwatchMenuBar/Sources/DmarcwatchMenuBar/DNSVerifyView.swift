@@ -75,9 +75,17 @@ struct DNSVerifyView: View {
                 .font(.title3.bold())
 
             // Vergleich gegen den zuletzt gespeicherten DNS-Schnappschuss
-            // (siehe dns_verify.diff_and_update_snapshot) - eine
-            // zurückgestufte DMARC-Policy bekommt eine eigene, auffälligere
-            // rote Warnung statt nur der normalen orangen Änderungsliste.
+            // (siehe dns_verify.diff_and_update_snapshot) - dieselbe grün/rot
+            // statusPill wie bei MTA-STS/DNSSEC/DANE oben für den schnellen
+            // Blick, eine zurückgestufte DMARC-Policy bekommt zusätzlich eine
+            // eigene, auffälligere rote Warnung statt nur der normalen
+            // Änderungsliste.
+            if result.hasBaseline {
+                statusPill(
+                    label: result.changes.isEmpty ? "Keine Änderungen" : "Änderungen erkannt",
+                    isUp: result.changes.isEmpty
+                )
+            }
             if result.policyWeakened {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("DMARC-Policy seit letzter Prüfung geschwächt")
@@ -92,14 +100,7 @@ struct DNSVerifyView: View {
                         .foregroundColor(.orange)
                     changeEntries(result.changes, color: .orange)
                 }
-            } else if result.hasBaseline {
-                // Der häufigste Fall (nichts geändert) - ohne diese Zeile
-                // wäre der ganze Abschnitt bei einer unveränderten Domain
-                // unsichtbar, als gäbe es die Änderungserkennung gar nicht.
-                Text("Keine Änderungen seit letzter Prüfung.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
+            } else if !result.hasBaseline {
                 Text("Erste Prüfung dieser Domain - Vergleichsbasis für künftige Änderungen angelegt.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
