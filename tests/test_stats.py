@@ -1,6 +1,7 @@
 """Reine Berechnungen für `dmarcwatch stats` (report.py) - Tagestrend und
 Verschärfungs-Einschätzung für DMARC/MTA-STS, komplett ohne DB (die
 CLI-Verdrahtung inklusive echter Ingest wird in test_cli_stats.py geprüft)."""
+from dmarcwatch.anomaly import REASON_FOREIGN_HEADER_FROM
 from dmarcwatch.report import (
     MIN_SAMPLE_SIZE,
     ReportRow,
@@ -12,6 +13,7 @@ from dmarcwatch.report import (
     collect_tls_daily_stats,
     compute_dmarc_readiness,
     compute_mta_sts_readiness,
+    compute_spoofed_identities,
     is_consistent_reporter,
     to_stats_json_dict,
 )
@@ -30,14 +32,14 @@ def _row(
     date_begin: int, is_flagged: bool = False, flag_reasons=None,
     domain: str = "example.com", policy_p: str = "quarantine", policy_pct: int = 100, policy_sp: str = "",
     count: int = 1, is_own_ip: bool = False, org_name: str = _CONSISTENT_ORG, email: str = _CONSISTENT_EMAIL,
-    dkim: str = "pass", spf: str = "pass",
+    dkim: str = "pass", spf: str = "pass", disposition: str = "none", header_from: str = "",
 ) -> ReportRow:
     return ReportRow(
         date_begin=date_begin, org_name=org_name, source_ip="192.0.2.1", count=count,
-        disposition="none", dkim=dkim, spf=spf, envelope_to="",
+        disposition=disposition, dkim=dkim, spf=spf, envelope_to="",
         is_flagged=is_flagged, flag_reasons=flag_reasons or [],
         domain=domain, policy_p=policy_p, policy_pct=policy_pct, policy_sp=policy_sp, is_own_ip=is_own_ip,
-        email=email, is_consistent=is_consistent_reporter(org_name, email),
+        email=email, is_consistent=is_consistent_reporter(org_name, email), header_from=header_from,
     )
 
 
@@ -63,6 +65,24 @@ def test_collect_daily_stats_groups_by_day_chronologically():
 
 def test_collect_daily_stats_empty_input():
     assert collect_daily_stats([]) == []
+
+
+def test_collect_daily_stats_blocked_count_only_counts_flagged_reject_volume():
+    # blocked_count zaehlt echtes Volumen (r.count) nur fuer Zeilen, die
+    # SOWOHL auffaellig sind ALS AUCH von der eigenen Policy tatsaechlich
+    # abgewiesen wurden (disposition == "reject") - flagged_count bleibt
+    # dabei unveraendert eine reine Zeilenzaehlung, kein Volumen.
+    rows = [
+        _row(DAY1, is_flagged=True, disposition="reject", count=5),
+        _row(DAY1, is_flagged=True, disposition="quarantine", count=7),
+        _row(DAY1, is_flagged=False, disposition="none", count=3),
+    ]
+    result = collect_daily_stats(rows)
+    assert len(result) == 1
+    day = result[0]
+    assert day.clean_count == 1
+    assert day.flagged_count == 2
+    assert day.blocked_count == 5
 
 
 # --- collect_tls_daily_stats() ---
@@ -675,6 +695,62 @@ def test_dmarc_readiness_recent_volume_window_not_diluted_by_older_quiet_period(
     assert result[0].recommended_observation_days == 14
 
 
+# --- compute_spoofed_identities() ---
+
+
+def test_compute_spoofed_identities_groups_by_header_from_with_counts_and_seen_dates():
+    rows = [
+        _row(
+            DAY1, is_flagged=True, flag_reasons=[REASON_FOREIGN_HEADER_FROM],
+            header_from="evil1.example", count=3, org_name="Reporter A",
+        ),
+        _row(
+            DAY2, is_flagged=True, flag_reasons=[REASON_FOREIGN_HEADER_FROM],
+            header_from="evil1.example", count=2, org_name="Reporter B",
+        ),
+        _row(
+            DAY1, is_flagged=True, flag_reasons=[REASON_FOREIGN_HEADER_FROM],
+            header_from="evil2.example", count=10, org_name="Reporter A",
+        ),
+    ]
+    result = compute_spoofed_identities(rows)
+    # Absteigend nach total_count - evil2.example (10) vor evil1.example (5).
+    assert [s.header_from for s in result] == ["evil2.example", "evil1.example"]
+
+    evil2 = result[0]
+    assert evil2.total_count == 10
+    assert evil2.record_count == 1
+    assert evil2.first_seen_date == "2026-08-20"
+    assert evil2.last_seen_date == "2026-08-20"
+    assert evil2.reporters == ["Reporter A"]
+
+    evil1 = result[1]
+    assert evil1.total_count == 5
+    assert evil1.record_count == 2
+    assert evil1.first_seen_date == "2026-08-20"
+    assert evil1.last_seen_date == "2026-08-21"
+    assert evil1.reporters == ["Reporter A", "Reporter B"]
+
+
+def test_compute_spoofed_identities_excludes_rows_without_the_reason():
+    """header_from allein reicht nicht - nur Zeilen, bei denen anomaly.py
+    tatsächlich REASON_FOREIGN_HEADER_FROM gesetzt hat, zählen als Spoof.
+    Ein header_from, das rein optisch fremd aussieht, aber ohne diesen Grund
+    geflaggt ist (oder gar nicht geflaggt), darf nicht mitgezählt werden."""
+    rows = [
+        _row(DAY1, is_flagged=False, flag_reasons=[], header_from="looks-foreign.example", count=5),
+        _row(DAY1, is_flagged=True, flag_reasons=["unknown_ip"], header_from="also-foreign.example", count=7),
+    ]
+    result = compute_spoofed_identities(rows)
+    assert result == []
+
+
+def test_compute_spoofed_identities_skips_rows_with_empty_header_from():
+    rows = [_row(DAY1, is_flagged=True, flag_reasons=[REASON_FOREIGN_HEADER_FROM], header_from="", count=5)]
+    result = compute_spoofed_identities(rows)
+    assert result == []
+
+
 # --- compute_mta_sts_readiness() ---
 
 
@@ -825,13 +901,30 @@ def test_to_stats_json_dict_structure():
     data = to_stats_json_dict(30, daily, dmarc_readiness, mta_sts_readiness, tls_daily)
 
     assert data["days"] == 30
-    assert data["daily"] == [{"date": "2026-08-20", "clean_count": 1, "flagged_count": 0}]
+    assert data["daily"] == [
+        {"date": "2026-08-20", "clean_count": 1, "flagged_count": 0, "blocked_count": 0}
+    ]
     assert data["tls_daily"] == [{"date": "2026-08-20", "successful_count": 5, "failure_count": 1}]
     assert data["dmarc_readiness"][0]["domain"] == "example.com"
     assert data["dmarc_readiness"][0]["recommended_observation_days"] == 60
     assert data["dmarc_readiness"][0]["next_recommended_policy"] == "reject"
     assert data["mta_sts_readiness"][0]["domain"] == "example.com"
     assert data["mta_sts_readiness"][0]["total_sessions"] == 6
+
+
+def test_to_stats_json_dict_includes_blocked_count_per_day():
+    rows = [
+        _row(DAY1, is_flagged=True, disposition="reject", count=4),
+        _row(DAY2, is_flagged=True, disposition="quarantine", count=9),
+    ]
+    daily = collect_daily_stats(rows)
+
+    data = to_stats_json_dict(30, daily, [], [])
+
+    assert data["daily"] == [
+        {"date": "2026-08-20", "clean_count": 0, "flagged_count": 1, "blocked_count": 4},
+        {"date": "2026-08-21", "clean_count": 0, "flagged_count": 1, "blocked_count": 0},
+    ]
 
 
 def test_to_stats_json_dict_tls_daily_defaults_to_empty():
@@ -853,3 +946,52 @@ def test_to_stats_json_dict_sanitizes_current_sp():
 
     assert "‮" not in data["dmarc_readiness"][0]["current_sp"]
     assert data["dmarc_readiness"][0]["current_sp"] == "quarantineevil"
+
+
+def test_to_stats_json_dict_includes_spoofed_identities_key():
+    rows = [
+        _row(
+            DAY1, is_flagged=True, flag_reasons=[REASON_FOREIGN_HEADER_FROM],
+            header_from="evil.example", count=4, org_name="Reporter A",
+        ),
+    ]
+    spoofed_identities = compute_spoofed_identities(rows)
+
+    data = to_stats_json_dict(30, [], [], [], spoofed_identities=spoofed_identities)
+
+    assert data["spoofed_identities"] == [
+        {
+            "header_from": "evil.example",
+            "total_count": 4,
+            "record_count": 1,
+            "first_seen_date": "2026-08-20",
+            "last_seen_date": "2026-08-20",
+            "reporters": ["Reporter A"],
+        }
+    ]
+
+
+def test_to_stats_json_dict_spoofed_identities_defaults_to_empty():
+    data = to_stats_json_dict(30, [], [], [])
+    assert data["spoofed_identities"] == []
+
+
+def test_to_stats_json_dict_sanitizes_spoofed_identity_fields():
+    """header_from und reporters stammen wie org_name/current_sp direkt aus
+    dem unauthentifizierten Report-XML - müssen also ebenfalls durch
+    sanitize_field laufen, sonst könnten z. B. Steuerzeichen unsanitisiert
+    bis in die Swift-GUI durchschlagen."""
+    rows = [
+        _row(
+            DAY1, is_flagged=True, flag_reasons=[REASON_FOREIGN_HEADER_FROM],
+            header_from="evil\x07.example", count=1, org_name="Reporter\x07 A",
+        ),
+    ]
+    spoofed_identities = compute_spoofed_identities(rows)
+
+    data = to_stats_json_dict(30, [], [], [], spoofed_identities=spoofed_identities)
+
+    assert "\x07" not in data["spoofed_identities"][0]["header_from"]
+    assert data["spoofed_identities"][0]["header_from"] == "evil.example"
+    assert "\x07" not in data["spoofed_identities"][0]["reporters"][0]
+    assert data["spoofed_identities"][0]["reporters"][0] == "Reporter A"

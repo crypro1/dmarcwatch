@@ -42,6 +42,60 @@ def _seed(tmp_path, monkeypatch):
     conn.close()
 
 
+# Drei Treffer im selben /32-Netz wie XML oben, aber mit zwei
+# unterschiedlichen header_from-Werten (2x evil1.example, 1x evil2.example) -
+# für die "Header-From-Verteilung"-Übersicht in cmd_inspect().
+XML_MULTIPLE_HEADER_FROM = """<?xml version="1.0"?>
+<feedback>
+<report_metadata><org_name>Reporter A</org_name><report_id>inspect-test-multi-1</report_id>
+<date_range><begin>1700000000</begin><end>1700086399</end></date_range></report_metadata>
+<policy_published><domain>example.com</domain><p>reject</p></policy_published>
+<record>
+<row><source_ip>2a01:111:f403:c200::5</source_ip><count>1</count>
+<policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf></policy_evaluated></row>
+<identifiers><header_from>evil1.example</header_from></identifiers>
+</record>
+<record>
+<row><source_ip>2a01:111:f403:c200::6</source_ip><count>1</count>
+<policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf></policy_evaluated></row>
+<identifiers><header_from>evil2.example</header_from></identifiers>
+</record>
+<record>
+<row><source_ip>2a01:111:f403:c200::7</source_ip><count>1</count>
+<policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf></policy_evaluated></row>
+<identifiers><header_from>evil1.example</header_from></identifiers>
+</record>
+</feedback>"""
+
+# Zwei Treffer im selben /24-Netz mit demselben header_from - Gegenprobe:
+# die Übersicht darf hier NICHT erscheinen (siehe Test unten).
+XML_SINGLE_HEADER_FROM = """<?xml version="1.0"?>
+<feedback>
+<report_metadata><org_name>Reporter B</org_name><report_id>inspect-test-single-1</report_id>
+<date_range><begin>1700000000</begin><end>1700086399</end></date_range></report_metadata>
+<policy_published><domain>example.com</domain><p>reject</p></policy_published>
+<record>
+<row><source_ip>203.0.113.10</source_ip><count>1</count>
+<policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf></policy_evaluated></row>
+<identifiers><header_from>same.example</header_from></identifiers>
+</record>
+<record>
+<row><source_ip>203.0.113.20</source_ip><count>1</count>
+<policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf></policy_evaluated></row>
+<identifiers><header_from>same.example</header_from></identifiers>
+</record>
+</feedback>"""
+
+
+def _seed_xml(tmp_path, monkeypatch, xml):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = Config.from_dict({"own_domains": ["example.com"], "own_ip_networks": ["192.0.2.0/24"]})
+    conn = connect(tmp_path / "Library" / "Application Support" / "dmarcwatch" / "dmarc.sqlite")
+    report = parse_aggregate_report(xml.encode(), config.max_xml_size_bytes)
+    ingest_report(conn, report, config)
+    conn.close()
+
+
 def test_inspect_exact_ip_shows_full_detail(tmp_path, monkeypatch, capsys):
     _seed(tmp_path, monkeypatch)
     result = cmd_inspect(_args(query="2a01:111:f403:c200::5"))
@@ -169,3 +223,22 @@ def test_inspect_blacklist_failure_shown_inline_not_fatal(tmp_path, monkeypatch,
     assert result == 3
     assert "Abfrage fehlgeschlagen" in out
     assert "Zeitüberschreitung" in err
+
+
+def test_inspect_shows_header_from_distribution_when_multiple_identities_match(tmp_path, monkeypatch, capsys):
+    _seed_xml(tmp_path, monkeypatch, XML_MULTIPLE_HEADER_FROM)
+    result = cmd_inspect(_args(query="2a01:111::/32"))
+    out = capsys.readouterr().out
+    assert result == 0
+    assert "Header-From-Verteilung für diese Abfrage:" in out
+    assert "evil1.example: 2x" in out
+    assert "evil2.example: 1x" in out
+
+
+def test_inspect_hides_header_from_distribution_when_all_matches_share_one_identity(tmp_path, monkeypatch, capsys):
+    _seed_xml(tmp_path, monkeypatch, XML_SINGLE_HEADER_FROM)
+    result = cmd_inspect(_args(query="203.0.113.0/24"))
+    out = capsys.readouterr().out
+    assert result == 0
+    assert "same.example" in out  # taucht im Detail pro Record trotzdem auf
+    assert "Header-From-Verteilung" not in out

@@ -57,6 +57,9 @@ struct StatsView: View {
                                 + "ist branchenweit lückenhaft (nicht jeder Empfänger meldet), keine Garantie."
                             )
                             .font(.caption2).foregroundStyle(.secondary)
+                            if !response.spoofedIdentities.isEmpty {
+                                spoofedIdentitiesCard(response)
+                            }
                             dmarcReadinessCard(response)
                             mtaStsReadinessCard(response)
                         }
@@ -81,10 +84,18 @@ struct StatsView: View {
     private func dmarcOverviewCard(_ response: StatsResponse) -> some View {
         let clean = response.daily.reduce(0) { $0 + $1.cleanCount }
         let flagged = response.daily.reduce(0) { $0 + $1.flaggedCount }
-        return donutCard(
-            title: "DMARC-Überblick · letzte \(response.days) Tage",
-            segments: [("sauber", clean, Color.green), ("auffällig", flagged, Color.red)]
-        )
+        let blocked = response.daily.reduce(0) { $0 + $1.blockedCount }
+        return VStack(alignment: .leading, spacing: 4) {
+            donutCard(
+                title: "DMARC-Überblick · letzte \(response.days) Tage",
+                segments: [("sauber", clean, Color.green), ("auffällig", flagged, Color.red)]
+            )
+            if blocked > 0 {
+                Text("\(blocked) E-Mails durch die eigene Policy abgewiesen")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func tlsOverviewCard(_ response: StatsResponse) -> some View {
@@ -196,6 +207,29 @@ struct StatsView: View {
     // Teil der eigentlichen Berechnung, die immer schon serverseitig
     // passiert ist).
     private static let minSampleSize = 10
+
+    /// Gespiegelt aus report.py:compute_spoofed_identities() - Reports mit
+    /// REASON_FOREIGN_HEADER_FROM (identifiers/header_from gehört weder zur
+    /// eigenen Domain noch zu einer ihrer Subdomains), gruppiert nach
+    /// header_from. Nur aufgerufen, wenn response.spoofedIdentities nicht
+    /// leer ist (siehe Aufrufstelle) - eine leere Liste zeigt gar keine
+    /// Karte statt einer leeren.
+    private func spoofedIdentitiesCard(_ response: StatsResponse) -> some View {
+        card {
+            Text("Auffällige Absender-Identitäten (header_from)").font(.subheadline.bold()).foregroundStyle(.secondary)
+            ForEach(response.spoofedIdentities) { entry in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.headerFrom).font(.callout.bold())
+                    Text("\(entry.totalCount) E-Mails, \(entry.recordCount)x gemeldet")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Zuerst am \(entry.firstSeenDate), zuletzt am \(entry.lastSeenDate)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Gemeldet von: \(entry.reporters.joined(separator: ", "))")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
     private func dmarcReadinessCard(_ response: StatsResponse) -> some View {
