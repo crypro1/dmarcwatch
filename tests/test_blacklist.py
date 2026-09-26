@@ -74,3 +74,23 @@ def test_servfail_raises_blacklist_check_error_instead_of_false_clean():
     with patch("dmarcwatch.spf.subprocess.run", return_value=servfail):
         with pytest.raises(BlacklistCheckError):
             check_ip_blacklist("198.51.100.5")
+
+
+def test_cname_alias_in_answer_section_not_mistaken_for_return_code():
+    # dig kann vor der eigentlichen A-Antwort eine CNAME-Zeile liefern (hier
+    # simuliert, auch wenn Spamhaus ZEN das in der Praxis nicht tut) - ohne
+    # Prüfung der Record-Type-Spalte würde der Alias-Hostname fälschlich als
+    # 127.0.0.x-Rückgabecode interpretiert statt korrekt herausgefiltert.
+    answer = _dig_result(
+        ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n"
+        ";; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 0\n"
+        "\n"
+        ";; ANSWER SECTION:\n"
+        "1.2.0.192.zen.spamhaus.org. 300 IN CNAME some-alias.spamhaus.org.\n"
+        "some-alias.spamhaus.org. 300 IN A 127.0.0.2\n"
+    )
+    with patch("dmarcwatch.spf.subprocess.run", return_value=answer):
+        result = check_ip_blacklist("198.51.100.5")
+    assert result.listed is True
+    assert result.reasons == ["SBL - bekannte Spam-Quelle"]
+    assert not any("some-alias.spamhaus.org" in reason for reason in result.reasons)

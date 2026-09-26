@@ -9,6 +9,7 @@ import time
 from dmarcwatch import cli
 from dmarcwatch.config import Config, db_path
 from dmarcwatch.parser import parse_aggregate_report
+from dmarcwatch.report import DMARCReadiness
 from dmarcwatch.store import connect, ingest_report
 
 
@@ -89,6 +90,56 @@ def test_table_output_when_json_not_set(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "example.com" in out
     assert "Noch nicht bereit" in out
+
+
+def _readiness(**overrides) -> DMARCReadiness:
+    defaults = dict(
+        domain="example.com", current_policy="quarantine", current_pct=100,
+        total_count=20, unknown_ip_failures=0, own_ip_auth_failures=0,
+        avg_daily_volume=2.0, recommended_observation_days=7, observed_days=14,
+        clean_days=14, last_failure_date=None, has_reporting_gap=False,
+        reporting_gap_days=0, next_recommended_policy="reject", next_recommended_pct=100,
+        fully_enforced=False, ready_for_next_step=True, needs_recheck=False,
+        excluded_count=0, excluded_reporters=[], current_sp="reject",
+        next_step_pct_adjusted_for_sp=True, sp_behind_recommendation=None,
+    )
+    defaults.update(overrides)
+    return DMARCReadiness(**defaults)
+
+
+def test_pct_adjusted_for_sp_note_printed_once_when_ready(tmp_path, monkeypatch, capsys):
+    # Regression: die "pct-Zwischenstufe uebersprungen..."-Meldung haengt
+    # NUR von next_step_pct_adjusted_for_sp ab, nicht davon, welcher der
+    # fully_enforced/ready_for_next_step/sonst-Zweige gefeuert hat - sie
+    # darf pro Domain nur einmal erscheinen, nicht einmal pro Zweig.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    conn = connect(db_path())
+    conn.close()
+    monkeypatch.setattr(cli, "compute_dmarc_readiness", lambda *a, **kw: [_readiness(ready_for_next_step=True)])
+    monkeypatch.setattr(cli, "compute_mta_sts_readiness", lambda *a, **kw: [])
+
+    result = cli.cmd_stats(_args(json=False))
+
+    assert result == 0
+    out = capsys.readouterr().out
+    assert out.count("pct-Zwischenstufe übersprungen") == 1
+
+
+def test_pct_adjusted_for_sp_note_printed_once_when_not_ready(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    conn = connect(db_path())
+    conn.close()
+    monkeypatch.setattr(
+        cli, "compute_dmarc_readiness",
+        lambda *a, **kw: [_readiness(ready_for_next_step=False, clean_days=1, own_ip_auth_failures=1, last_failure_date="2026-01-01")],
+    )
+    monkeypatch.setattr(cli, "compute_mta_sts_readiness", lambda *a, **kw: [])
+
+    result = cli.cmd_stats(_args(json=False))
+
+    assert result == 0
+    out = capsys.readouterr().out
+    assert out.count("pct-Zwischenstufe übersprungen") == 1
 
 
 def test_no_reports_returns_empty_structure(tmp_path, monkeypatch, capsys):

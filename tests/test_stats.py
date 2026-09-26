@@ -166,6 +166,16 @@ def test_next_rollout_step_normal_staged_behavior_unchanged_without_sp():
     assert _next_dmarc_rollout_step("none", 100, current_sp=None) == ("quarantine", 25, False)
 
 
+def test_next_rollout_step_does_not_skip_ramp_for_p_none_even_if_sp_ahead():
+    """Die sp-aware Sonderregel schützt AUSSCHLIESSLICH den Übergang
+    quarantine -> reject (siehe Test oben), NICHT den allerersten Schritt ab
+    p=none: p=none hatte bislang keinerlei Durchsetzungswirkung, ein Sprung
+    direkt auf pct=100 wäre also kein Schutz vor einem Rückschritt (den
+    gibt es hier nicht), sondern ein Überspringen der eigentlich gewollten
+    vorsichtigen ersten Stufe für eine bisher komplett ungetestete Policy."""
+    assert _next_dmarc_rollout_step("none", 100, current_sp="reject") == ("quarantine", 25, False)
+
+
 def test_next_rollout_step_mid_ramp_unaffected_by_sp_awareness():
     """Sobald p tatsächlich mitten in der Rampe steckt (pct < 100), gilt
     die normale +25-Logik unverändert weiter - sp ist dann per Definition
@@ -240,6 +250,21 @@ def test_detect_reporting_gap_flags_huge_gap_with_only_two_gaps():
     has_gap, gap_days = _detect_reporting_gap(days)
     assert has_gap is True
     assert gap_days == 401
+
+
+def test_detect_reporting_gap_flags_two_comparably_large_gaps_with_only_three_report_days():
+    """Bei genau drei Report-Tagen mit ZWEI vergleichbar großen Lücken (eine
+    Domain, die im ganzen Jahr nur drei Mal berichtet hat) bleibt die
+    zweitgrößte Lücke die einzige Baseline und hebt die Schwelle so weit an
+    (max(7, 190*4)=760), dass selbst die größte Lücke (200 Tage) darunter
+    bliebe - es gibt hier keinen sinnvollen 'üblichen Rhythmus' zum
+    Vergleichen. _REPORTING_GAP_ABSOLUTE_DAYS fängt das unabhängig vom
+    Median ab."""
+    day0 = DAY1 // _DAY_SECS
+    days = [day0, day0 + 190, day0 + 390]
+    has_gap, gap_days = _detect_reporting_gap(days)
+    assert has_gap is True
+    assert gap_days == 200
 
 
 # --- compute_dmarc_readiness() ---
@@ -401,6 +426,50 @@ def test_dmarc_readiness_next_step_skips_ramp_when_sp_already_enforced():
     assert result[0].next_recommended_policy == "reject"
     assert result[0].next_recommended_pct == 100
     assert result[0].next_step_pct_adjusted_for_sp is True
+
+
+def test_dmarc_readiness_recommends_raising_sp_when_weaker_than_enforced_p():
+    """Neuerung, Gegenstück zum sp-ahead-Fall oben: p steht bereits
+    vollständig durchgesetzt bei reject;pct=100, aber sp ist explizit
+    gesetzt und dabei schwächer (quarantine) - Subdomains stehen dann trotz
+    'vollständig durchgesetzt'-Meldung unter einer laxeren Policy als die
+    Domain selbst, sp_behind_recommendation macht das sichtbar."""
+    rows = [
+        _row(DAY1 - i * _DAY_SECS, count=2, policy_p="reject", policy_pct=100, policy_sp="quarantine")
+        for i in range(6)
+    ]
+    result = _readiness_for(rows)
+    assert result[0].fully_enforced is True
+    assert result[0].sp_behind_recommendation == "reject"
+
+
+def test_dmarc_readiness_no_sp_behind_recommendation_when_sp_at_or_above_p():
+    rows = [
+        _row(DAY1 - i * _DAY_SECS, count=2, policy_p="reject", policy_pct=100, policy_sp="reject")
+        for i in range(6)
+    ]
+    result = _readiness_for(rows)
+    assert result[0].sp_behind_recommendation is None
+
+
+def test_dmarc_readiness_no_sp_behind_recommendation_without_sp():
+    rows = [_row(DAY1 - i * _DAY_SECS, count=2, policy_p="reject", policy_pct=100) for i in range(6)]
+    result = _readiness_for(rows)
+    assert result[0].current_sp is None
+    assert result[0].sp_behind_recommendation is None
+
+
+def test_dmarc_readiness_no_sp_behind_recommendation_when_p_not_fully_enforced():
+    """sp_behind_recommendation ist nur gesetzt, wenn p selbst bereits
+    vollständig durchgesetzt ist - sonst würde es mit der eigentlichen
+    next_recommended_*-Empfehlung für p konkurrieren."""
+    rows = [
+        _row(DAY1 - i * _DAY_SECS, count=2, policy_p="quarantine", policy_pct=50, policy_sp="none")
+        for i in range(6)
+    ]
+    result = _readiness_for(rows)
+    assert result[0].fully_enforced is False
+    assert result[0].sp_behind_recommendation is None
 
 
 def test_dmarc_readiness_needs_recheck_when_reject_domain_gets_a_recent_failure():
@@ -769,3 +838,18 @@ def test_to_stats_json_dict_tls_daily_defaults_to_empty():
     data = to_stats_json_dict(30, [], [], compute_mta_sts_readiness([], days=30, until_ts=DAY1))
     assert data["tls_daily"] == []
     assert data["mta_sts_readiness"] == []
+
+
+def test_to_stats_json_dict_sanitizes_current_sp():
+    """current_sp kommt wie current_policy direkt aus dem unauthentifizierten
+    policy_published/sp-Tag eines Reports - muss also genauso durch
+    sanitize_field laufen wie current_policy, sonst könnten z. B.
+    Bidi-Override-Zeichen unsanitisiert bis in die Swift-GUI durchschlagen."""
+    rows = [_row(DAY1, count=MIN_SAMPLE_SIZE, policy_sp="quarantine‮evil")]
+    until_ts = DAY1 + 30 * _DAY_SECS
+    dmarc_readiness = compute_dmarc_readiness(rows, days=30, until_ts=until_ts)
+
+    data = to_stats_json_dict(30, [], dmarc_readiness, [])
+
+    assert "‮" not in data["dmarc_readiness"][0]["current_sp"]
+    assert data["dmarc_readiness"][0]["current_sp"] == "quarantineevil"

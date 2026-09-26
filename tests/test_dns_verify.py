@@ -41,7 +41,7 @@ from dmarcwatch.dns_verify import (
 )
 from dmarcwatch.blacklist import BlacklistCheckError, BlacklistResult
 from dmarcwatch.spf import SPFCheckResult, SPFResolutionError
-from dmarcwatch.store import connect
+from dmarcwatch.store import connect, get_and_replace_dns_snapshot
 
 
 def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -841,7 +841,7 @@ def test_fingerprint_returns_expected_shape():
     )
     result.spf = SPFCheckResult(exists=True, record="v=spf1 -all", lookup_count=0, lookup_limit_ok=True)
     result.dkim = [
-        DKIMCheckResult(selector="default", exists=True, key_type="rsa"),
+        DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="deadbeefcafe0000"),
         DKIMCheckResult(selector="unused", exists=False),
     ]
     result.mta_sts = MTASTSCheckResult(configured=True, policy_txt="v=STSv1; id=1")
@@ -856,7 +856,7 @@ def test_fingerprint_returns_expected_shape():
         "dmarc_pct": 100,
         "spf_record": "v=spf1 -all",
         # Nur exists=True-Selektoren zählen - "unused" existiert nicht.
-        "dkim": ["default:rsa"],
+        "dkim": ["default:rsa:deadbeefcafe0000"],
         "mta_sts_policy_txt": "v=STSv1; id=1",
         "tlsrpt_record": "v=TLSRPTv1; rua=mailto:t@example.com",
         "dane_mx_hosts_with_tlsa": ["mail.example.com"],
@@ -919,3 +919,131 @@ def test_diff_and_update_snapshot_non_policy_change_does_not_flag_weakened(tmp_p
     assert change.policy_weakened is False
     assert change.changes != []
     conn.close()
+
+
+def test_diff_and_update_snapshot_transient_dmarc_error_does_not_look_like_removal(tmp_path):
+    """Regressionstest: ein einzelner Resolver-Timeout beim DMARC-Lookup
+    (DMARCCheckResult.error) darf NICHT wie ein echtes Entfernen des
+    DMARC-Eintrags aussehen - weder als "geschwächt" gemeldet werden, noch
+    die gespeicherte Baseline mit dem fehlgeschlagenen None-Zustand
+    überschreiben."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; rua=mailto:a@example.com",
+        policy="reject", subdomain_policy="reject", pct=100,
+    )
+    diff_and_update_snapshot(conn, baseline)
+
+    failed = _clean_result()
+    failed.dmarc = DMARCCheckResult(
+        exists=False, error="DNS-Abfrage fehlgeschlagen (TXT _dmarc.example.com): timeout",
+        warnings=["DMARC-Abfrage fehlgeschlagen: timeout"],
+    )
+    change = diff_and_update_snapshot(conn, failed)
+
+    assert change.has_baseline is True
+    assert change.changes == []
+    assert change.policy_weakened is False
+
+    # Peek: get_and_replace_dns_snapshot() mit einem leeren Ersatzwert gibt
+    # den zuvor gespeicherten Stand zurück, bevor es ihn selbst überschreibt.
+    stored = get_and_replace_dns_snapshot(conn, "example.com", {})
+    assert stored["dmarc_record"] == "v=DMARC1; p=reject; rua=mailto:a@example.com"
+    assert stored["dmarc_policy"] == "reject"
+    assert stored["dmarc_subdomain_policy"] == "reject"
+    assert stored["dmarc_pct"] == 100
+    conn.close()
+
+
+def test_diff_and_update_snapshot_sp_inherits_p_when_absent_flags_weakened(tmp_path):
+    """RFC 7489: ein fehlendes sp-Tag ERBT den Rang von p - eine Baseline
+    mit p=reject und ohne sp bedeutet also implizit "Subdomains ebenfalls
+    reject". Wird sp später explizit auf none gesetzt, ist das ein echter
+    Rückschritt, auch wenn p selbst unverändert bleibt."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject", policy="reject", subdomain_policy=None,
+    )
+    diff_and_update_snapshot(conn, baseline)
+
+    weakened = _clean_result()
+    weakened.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; sp=none", policy="reject", subdomain_policy="none",
+    )
+    change = diff_and_update_snapshot(conn, weakened)
+
+    assert change.policy_weakened is True
+    conn.close()
+
+
+def test_diff_and_update_snapshot_removing_redundant_sp_tag_not_flagged(tmp_path):
+    """Umgekehrter Fall: ein redundantes sp=reject-Tag wird entfernt, p
+    bleibt reject - sp erbt danach wieder reject von p, also KEINE
+    tatsächliche Änderung, kein falscher "geschwächt"-Alarm."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; sp=reject", policy="reject", subdomain_policy="reject",
+    )
+    diff_and_update_snapshot(conn, baseline)
+
+    unchanged = _clean_result()
+    unchanged.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject", policy="reject", subdomain_policy=None,
+    )
+    change = diff_and_update_snapshot(conn, unchanged)
+
+    assert change.policy_weakened is False
+    conn.close()
+
+
+def test_diff_and_update_snapshot_pct_regression_flags_weakened(tmp_path):
+    """Ein sinkender pct-Wert lässt einen Großteil der Mail wieder
+    unauthentifiziert durch, auch ohne Rückstufung von p/sp - das muss
+    ebenfalls als geschwächt zählen (RFC 7489), nicht nur unauffällig im
+    generischen 'DMARC-Eintrag geändert' verschwinden."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; pct=100", policy="reject", pct=100,
+    )
+    diff_and_update_snapshot(conn, baseline)
+
+    reduced = _clean_result()
+    reduced.dmarc = DMARCCheckResult(
+        exists=True, record="v=DMARC1; p=reject; pct=10", policy="reject", pct=10,
+    )
+    change = diff_and_update_snapshot(conn, reduced)
+
+    assert change.policy_weakened is True
+    assert any("100" in c and "10" in c for c in change.changes)
+    conn.close()
+
+
+def test_check_dkim_key_fingerprint_changes_with_key_material():
+    """Ein Key-Tausch bei gleichem Selektor/Key-Typ (z. B. jährliche
+    DKIM-Rotation) muss sich im key_fingerprint niederschlagen, sonst ist
+    er für die Änderungserkennung unsichtbar (siehe _fingerprint())."""
+    record_a = _txt("v=DKIM1; k=rsa; p=AAAAB3NzaC1yc2EAAAADAQABAAAA")
+    record_b = _txt("v=DKIM1; k=rsa; p=BBBBB3NzaC1yc2EAAAADAQABAAAA")
+    with patch("dmarcwatch.dns_verify.subprocess.run", return_value=record_a):
+        result_a = check_dkim("example.com", "selector1")
+    with patch("dmarcwatch.dns_verify.subprocess.run", return_value=record_b):
+        result_b = check_dkim("example.com", "selector1")
+
+    assert result_a.key_fingerprint is not None
+    assert result_a.key_fingerprint != result_b.key_fingerprint
+
+
+def test_fingerprint_dkim_includes_key_fingerprint_for_rotation_detection():
+    """Selector:key_type allein bleibt bei einem reinen Schlüsseltausch
+    identisch (siehe check_dkim()-Docstring) - der Fingerprint muss den
+    key_fingerprint mit einbeziehen, sonst ist die Rotation unsichtbar."""
+    result_a = _clean_result()
+    result_a.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="aaaa")]
+    result_b = _clean_result()
+    result_b.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="bbbb")]
+
+    assert _fingerprint(result_a)["dkim"] != _fingerprint(result_b)["dkim"]

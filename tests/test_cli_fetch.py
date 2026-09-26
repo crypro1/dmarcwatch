@@ -49,7 +49,7 @@ def _run_fetch_with_dns_mocks(tmp_path, monkeypatch, verify_result):
     # `connect` bleibt bewusst UNGEMOCKT (anders als in _run_fetch_with_mocks
     # unten): _run_dns_check_and_persist() liest/schreibt über dieselbe
     # Verbindung einen echten DNS-Schnappschuss (dns_verify.
-    # diff_and_update_snapshot -> store.get_dns_snapshot/set_dns_snapshot),
+    # diff_and_update_snapshot -> store.get_and_replace_dns_snapshot),
     # ein MagicMock statt einer echten (isolierten, weil HOME=tmp_path)
     # sqlite3-Verbindung würde dort mit einem TypeError beim json.loads()
     # des Fingerprints scheitern. fetch_and_ingest und verify_domain sind
@@ -334,3 +334,33 @@ def test_auto_dns_check_does_not_affect_fetch_exit_code(tmp_path, monkeypatch):
     result, _, _ = _run_fetch_with_dns_mocks(tmp_path, monkeypatch, warned)
 
     assert result == 0
+
+
+def test_weakened_policy_notification_strips_only_literal_warning_prefix(tmp_path, monkeypatch):
+    """entry.lstrip('⚠ ') behandelt sein Argument als Zeichen-MENGE, nicht als
+    literales Präfix - ein Change-Eintrag, dessen Inhalt selbst mit '⚠'/' '
+    beginnt (hier künstlich über einen gemockten diff_and_update_snapshot
+    erzeugt, um den Unterschied sichtbar zu machen, unabhängig davon, ob das
+    reale dns_verify.py aktuell je so einen Eintrag produziert), darf davon
+    nicht mit-abgeschnitten werden - nur das literale '⚠ '-Präfix selbst."""
+    from dmarcwatch.dns_verify import DNSChangeResult
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"], "enable_auto_dns_check": True})
+    crafted_change = DNSChangeResult(
+        has_baseline=True,
+        changes=["⚠ ⚠⚠ Kritischer Rückschritt: p=reject->none"],
+        policy_weakened=True,
+    )
+
+    with patch.object(keychain, "get_password", return_value="secret"):
+        with patch.object(cli, "connect_imap", return_value=MagicMock()):
+            with patch.object(cli, "fetch_and_ingest", return_value=_empty_summary()):
+                with patch.object(cli, "verify_domain", return_value=_clean_dns_result("example.com")):
+                    with patch.object(cli, "diff_and_update_snapshot", return_value=crafted_change):
+                        with patch.object(notify, "send_notification") as mock_notify:
+                            cli.cmd_fetch(_args())
+
+    messages = [call.kwargs.get("message") or call.args[1] for call in mock_notify.call_args_list]
+    detail = next(m for m in messages if "Kritischer Rückschritt" in m)
+    assert "⚠⚠ Kritischer Rückschritt" in detail

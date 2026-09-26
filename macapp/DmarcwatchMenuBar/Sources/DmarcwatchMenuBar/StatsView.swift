@@ -226,25 +226,21 @@ struct StatsView: View {
                     }
                     if r.fullyEnforced {
                         readinessPill(label: "Vollständig durchgesetzt (p=reject, pct=100)", isReady: true)
+                        if let spBehindRecommendation = r.spBehindRecommendation {
+                            Text("sp=\(r.currentSp ?? "?") ist schwächer als p=\(r.currentPolicy ?? "?") - Empfehlung: sp=\(spBehindRecommendation) setzen.")
+                                .font(.caption2).foregroundStyle(.blue)
+                        }
                     } else if r.readyForNextStep {
                         readinessPill(
                             label: "Bereit für p=\(r.nextRecommendedPolicy ?? "?"), pct=\(r.nextRecommendedPct.map(String.init) ?? "?")",
                             isReady: true
                         )
-                        if r.nextStepPctAdjustedForSp {
-                            Text("Zwischenstufe übersprungen, um sp=\(r.currentSp ?? "?") nicht zu schwächen.")
-                                .font(.caption2).foregroundStyle(.blue)
-                        }
                     } else {
                         VStack(alignment: .leading, spacing: 2) {
                             readinessPill(
                                 label: "Noch nicht bereit für p=\(r.nextRecommendedPolicy ?? "?"), pct=\(r.nextRecommendedPct.map(String.init) ?? "?")",
                                 isReady: false
                             )
-                            if r.nextStepPctAdjustedForSp {
-                                Text("Zwischenstufe übersprungen, um sp=\(r.currentSp ?? "?") nicht zu schwächen.")
-                                    .font(.caption2).foregroundStyle(.blue)
-                            }
                             if r.ownIpAuthFailures > 0 && r.cleanDays < r.recommendedObservationDays {
                                 Text("Own-IP-Fehlschlag zuletzt am \(r.lastFailureDate ?? "?").")
                                     .font(.caption2).foregroundStyle(.secondary)
@@ -262,6 +258,10 @@ struct StatsView: View {
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
                         }
+                    }
+                    if r.nextStepPctAdjustedForSp {
+                        Text("Zwischenstufe übersprungen, um sp=\(r.currentSp ?? "?") nicht zu schwächen.")
+                            .font(.caption2).foregroundStyle(.blue)
                     }
                 }
             }

@@ -7,6 +7,7 @@ from dmarcwatch.store import (
     IngestStatus,
     TLSIngestStatus,
     connect,
+    get_and_replace_dns_snapshot,
     get_known_dkim_selectors,
     ingest_report,
     ingest_tls_report,
@@ -196,6 +197,43 @@ def test_tls_report_foreign_domain_rejected(tmp_path):
     result = ingest_tls_report(conn, report, config)
     assert result.status == TLSIngestStatus.REJECTED_FOREIGN_DOMAIN
     assert query_tls_policies(conn, since_ts=0, until_ts=2_000_000_000) == []
+
+
+def test_get_and_replace_dns_snapshot_returns_previous_and_persists_new(tmp_path):
+    """Regressionstest für die frühere TOCTOU-Lücke zwischen getrennten
+    get_dns_snapshot()/set_dns_snapshot()-Aufrufen (siehe dns_verify.
+    diff_and_update_snapshot) - ein einzelner atomarer Aufruf liefert den
+    ALTEN Stand zurück und ersetzt ihn durch den neuen."""
+    conn = connect(tmp_path / "dmarc.sqlite")
+
+    first = get_and_replace_dns_snapshot(conn, "example.com", {"dmarc_policy": "reject"})
+    assert first is None
+
+    second = get_and_replace_dns_snapshot(conn, "example.com", {"dmarc_policy": "none"})
+    assert second == {"dmarc_policy": "reject"}
+
+    third = get_and_replace_dns_snapshot(conn, "example.com", {"dmarc_policy": "quarantine"})
+    assert third == {"dmarc_policy": "none"}
+
+
+def test_get_and_replace_dns_snapshot_carries_forward_selected_keys(tmp_path):
+    """carry_forward_keys übernimmt bei vorhandenem altem Schnappschuss
+    gezielt einzelne Felder aus DIESEM statt aus new_fingerprint - für
+    dns_verify.py: ein in diesem Lauf fehlgeschlagener Lookup (DMARCCheck
+    Result.error/SPFCheckResult.error) soll den alten Wert nicht mit None
+    überschreiben."""
+    conn = connect(tmp_path / "dmarc.sqlite")
+    get_and_replace_dns_snapshot(conn, "example.com", {"dmarc_policy": "reject", "spf_record": "v=spf1 -all"})
+
+    old = get_and_replace_dns_snapshot(
+        conn, "example.com",
+        {"dmarc_policy": None, "spf_record": "v=spf1 -all"},
+        carry_forward_keys=["dmarc_policy"],
+    )
+    assert old == {"dmarc_policy": "reject", "spf_record": "v=spf1 -all"}
+
+    stored = get_and_replace_dns_snapshot(conn, "example.com", {})
+    assert stored == {"dmarc_policy": "reject", "spf_record": "v=spf1 -all"}
 
 
 def test_tls_report_mixed_domains_keeps_only_own(tmp_path):
