@@ -489,7 +489,10 @@ struct TLSDayStatEntry: Decodable, Identifiable {
 /// selbst voll durchgesetzt (pct=100), überspringt die nächste empfohlene
 /// Stufe die übliche 25%-Zwischenstufe und geht direkt auf pct=100, um das
 /// bereits durchgesetzte sp nicht mit zurückzuwerfen;
-/// nextStepPctAdjustedForSp zeigt an, wann das passiert ist.
+/// nextStepPctAdjustedForSp zeigt an, wann das passiert ist. Umgekehrt: ist
+/// p bereits vollständig durchgesetzt (fullyEnforced), aber currentSp
+/// explizit gesetzt und schwächer als p, empfiehlt spBehindRecommendation
+/// (= currentPolicy), sp ebenfalls anzuheben.
 struct DMARCReadinessEntry: Decodable, Identifiable {
     let domain: String
     let currentPolicy: String?
@@ -511,6 +514,7 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
     let readyForNextStep: Bool
     let needsRecheck: Bool
     let nextStepPctAdjustedForSp: Bool
+    let spBehindRecommendation: String?
     // Reports mit inkonsistenten Metadaten (org_name/E-Mail-Domain ohne
     // plausiblen Bezug zueinander, siehe report.py:is_consistent_reporter)
     // fließen NICHT in die obigen Felder ein - sichtbar statt
@@ -541,6 +545,7 @@ struct DMARCReadinessEntry: Decodable, Identifiable {
         case readyForNextStep = "ready_for_next_step"
         case needsRecheck = "needs_recheck"
         case nextStepPctAdjustedForSp = "next_step_pct_adjusted_for_sp"
+        case spBehindRecommendation = "sp_behind_recommendation"
         case excludedCount = "excluded_count"
         case excludedReporters = "excluded_reporters"
     }

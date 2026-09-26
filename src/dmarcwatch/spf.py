@@ -85,7 +85,7 @@ def _dig_checked(record_type: str, name: str) -> list[str]:
                 in_answer_section = False
             else:
                 fields = line.split()
-                if len(fields) >= 5:
+                if len(fields) >= 5 and fields[3] == "A":
                     answers.append(fields[-1])
 
     if status not in ("NOERROR", "NXDOMAIN"):

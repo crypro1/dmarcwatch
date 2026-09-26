@@ -71,3 +71,13 @@ def test_bidi_override_stripped_but_safe_text_preserved():
     assert "\u202e" not in safe
     assert "Trusted-Bank" in safe
     assert "evil.example" in safe
+
+
+def test_word_joiner_stripped():
+    from dmarcwatch.sanitize import sanitize_field
+
+    evil = "Trusted-Bank\u2060evil.example"
+    safe = sanitize_field(evil, max_len=60)
+    assert "\u2060" not in safe
+    assert "Trusted-Bank" in safe
+    assert "evil.example" in safe

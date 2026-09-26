@@ -397,7 +397,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             # p=none feuert), beide können im selben Lauf zusammen auftreten.
             weakened = [(r.domain, c.changes[0]) for r, c in dns_results if c.policy_weakened]
             if config.notify_on_new_findings and weakened:
-                detail = "; ".join(f"{domain}: {entry.lstrip('⚠ ')}" for domain, entry in weakened)
+                detail = "; ".join(f"{domain}: {entry.removeprefix('⚠ ')}" for domain, entry in weakened)
                 notify.send_notification(
                     title="DMARC-Policy geschwächt",
                     message=detail,
@@ -490,10 +490,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
             )
         if r.fully_enforced:
             print("  Bereits vollständig durchgesetzt (p=reject, pct=100).")
+            if r.sp_behind_recommendation:
+                print(f"  ℹ sp={r.current_sp} ist schwächer als p={r.current_policy} - Empfehlung: sp={r.sp_behind_recommendation} setzen.")
         elif r.ready_for_next_step:
             print(f"  Bereit für nächsten Schritt: p={r.next_recommended_policy}, pct={r.next_recommended_pct}.")
-            if r.next_step_pct_adjusted_for_sp:
-                print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={r.current_sp} nicht zu schwächen.")
         else:
             reasons = []
             if r.own_ip_auth_failures and r.clean_days < r.recommended_observation_days:
@@ -512,8 +512,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
                 f"  Noch nicht bereit für p={r.next_recommended_policy}, pct={r.next_recommended_pct}: "
                 + "; ".join(reasons) + "."
             )
-            if r.next_step_pct_adjusted_for_sp:
-                print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={r.current_sp} nicht zu schwächen.")
+        if r.next_step_pct_adjusted_for_sp:
+            print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={r.current_sp} nicht zu schwächen.")
     print()
     if not mta_sts_readiness:
         print("MTA-STS: keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")

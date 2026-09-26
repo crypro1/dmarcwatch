@@ -503,6 +503,7 @@ MIN_SAMPLE_SIZE = 10
 _RECENT_VOLUME_WINDOW_DAYS = 30
 _REPORTING_GAP_MIN_DAYS = 7
 _REPORTING_GAP_RATIO = 4
+_REPORTING_GAP_ABSOLUTE_DAYS = 75
 
 
 def _recommended_observation_days(avg_daily_volume: float) -> int:
@@ -548,7 +549,15 @@ def _detect_reporting_gap(day_indices: list[int]) -> tuple[bool, int]:
     aus Ausreißer und Rest gemittelt und die Erkennung an dieser
     Datengröße rechnerisch unmöglich machen (z. B. Lücken [1, 401]: alter
     Median 201, Schwelle max(7, 201*4)=804 gegen max_gap=401 - die
-    401-Tage-Funkstille bliebe unentdeckt)."""
+    401-Tage-Funkstille bliebe unentdeckt).
+
+    Zusätzlich ein fester Schwellenwert (_REPORTING_GAP_ABSOLUTE_DAYS),
+    unabhängig von der Median-Baseline: bei nur drei Report-Tagen bleibt
+    die größte Lücke IMMER außen vor (s. o.), bei zwei annähernd gleich
+    großen Lücken (z. B. 190 und 200 Tage) besteht die Baseline dann aber
+    genau aus der zweitgrößten Lücke selbst und hebt die Schwelle so weit
+    an, dass auch die größte Lücke darunter bleibt - es gibt bei so wenigen
+    Reports schlicht keinen sinnvollen "üblichen Rhythmus" zum Vergleichen."""
     unique_days = sorted(set(day_indices))
     if len(unique_days) < 3:
         return False, 0
@@ -559,7 +568,9 @@ def _detect_reporting_gap(day_indices: list[int]) -> tuple[bool, int]:
     median_gap = (
         baseline_gaps[mid] if len(baseline_gaps) % 2 else (baseline_gaps[mid - 1] + baseline_gaps[mid]) / 2
     )
-    if max_gap >= max(_REPORTING_GAP_MIN_DAYS, median_gap * _REPORTING_GAP_RATIO):
+    if max_gap >= _REPORTING_GAP_ABSOLUTE_DAYS or max_gap >= max(
+        _REPORTING_GAP_MIN_DAYS, median_gap * _REPORTING_GAP_RATIO
+    ):
         return True, max_gap
     return False, 0
 
@@ -579,26 +590,33 @@ def _next_dmarc_rollout_step(
     ist NICHT fertig, auch wenn die Policy schon "reject" heißt.
 
     pct ist laut RFC 7489 EIN gemeinsamer Wert für p UND sp - es gibt
-    keinen getrennten pct je Policy. Steht sp bereits strenger als p UND
-    mit pct=100 vollständig durchgesetzt (sp_ahead_and_enforced), würde
-    der sonst übliche erste Schritt einer Politikwechsel-Stufe (pct=25)
-    das bereits durchgesetzte sp beim Anwenden auf denselben,
-    gemeinsamen pct-Wert wieder auf 25% Durchsetzung zurückwerfen -
-    genau der Bug, der diesen Parameter nötig macht. In diesem Fall wird
-    der erste Schritt einer neuen Policy-Stufe daher direkt auf pct=100
-    gesetzt statt über die übliche 25%-Rampe zu laufen; einmal mitten in
-    der Rampe (pct bereits < 100) ist sp per Definition nicht mehr
-    "ahead and enforced" in diesem Sinn, dort greift die Sonderregel
-    deshalb nicht. adjusted_for_sp (dritter Rückgabewert) ist True genau
-    dann, wenn diese Sonderregel gegriffen hat."""
+    keinen getrennten pct je Policy. Die Sonderregel sp_ahead_and_enforced
+    schützt AUSSCHLIESSLICH den Übergang quarantine -> reject: steht p
+    bereits bei quarantine;pct=100 (also selbst schon durchgesetzt) und sp
+    ist strenger UND ebenfalls voll durchgesetzt, würde der sonst übliche
+    erste Schritt der nächsten Politikwechsel-Stufe (pct=25) das bereits
+    durchgesetzte sp beim Anwenden auf denselben, gemeinsamen pct-Wert
+    wieder auf 25% Durchsetzung zurückwerfen - genau der Bug, der diesen
+    Parameter nötig macht. In diesem einen Fall wird der erste Schritt
+    direkt auf pct=100 gesetzt statt über die übliche 25%-Rampe zu laufen.
+
+    Für den Start bei p=none (current_policy nicht in quarantine/reject)
+    gilt die Sonderregel BEWUSST NICHT, selbst wenn sp dort schon
+    strenger und durchgesetzt ist: p hatte bis dahin schlicht keine
+    Durchsetzungswirkung, ein direkter Sprung auf pct=100 wäre kein Schutz
+    vor einem Rückschritt (den gibt es hier nicht), sondern ein Überspringen
+    der eigentlich gewollten, vorsichtigen ersten Stufe für eine bisher
+    komplett ungetestete Policy. Einmal mitten in der Rampe (pct bereits
+    < 100) ist sp per Definition ebenfalls nicht mehr "ahead and enforced"
+    in diesem Sinn, dort greift die Sonderregel also ebenso nicht.
+    adjusted_for_sp (dritter Rückgabewert) ist True genau dann, wenn die
+    Sonderregel beim quarantine -> reject Übergang gegriffen hat."""
     policy = current_policy or "none"
     pct = current_pct if current_pct is not None else 0
     sp_rank = _POLICY_RANK.get(current_sp, -1) if current_sp else -1
     policy_rank = _POLICY_RANK.get(policy, 0)
     sp_ahead_and_enforced = sp_rank > policy_rank and pct >= 100
     if policy not in ("quarantine", "reject"):
-        if sp_ahead_and_enforced:
-            return "quarantine", 100, True
         return "quarantine", 25, False
     if policy == "quarantine":
         if pct < 100:
@@ -608,6 +626,22 @@ def _next_dmarc_rollout_step(
         return "reject", 25, False
     if pct < 100:
         return "reject", min(100, pct + 25), False
+    return None
+
+
+def _sp_behind_recommendation(
+    current_policy: str | None, current_sp: str | None, fully_enforced: bool
+) -> str | None:
+    """Gegenstück zu sp_ahead_and_enforced in _next_dmarc_rollout_step: p
+    steht bereits vollständig durchgesetzt, aber sp ist explizit gesetzt
+    und dabei schwächer als p - siehe DMARCReadiness.sp_behind_recommendation
+    für die volle Begründung. Nur relevant, wenn fully_enforced True ist,
+    sonst konkurriert die Meldung mit der eigentlichen p-Empfehlung."""
+    if not fully_enforced or not current_sp:
+        return None
+    policy_rank = _POLICY_RANK.get(current_policy or "none", 0)
+    if _POLICY_RANK.get(current_sp, -1) < policy_rank:
+        return current_policy
     return None
 
 
@@ -682,7 +716,16 @@ class DMARCReadiness:
     gesetzt wurde (siehe _next_dmarc_rollout_step) - pct gilt laut RFC 7489
     gemeinsam für p UND sp, ein bereits bei pct=100 durchgesetztes,
     strengeres sp würde durch die normale Rampe sonst mit auf 25%
-    zurückgesetzt."""
+    zurückgesetzt.
+
+    sp_behind_recommendation ist das Gegenstück in die andere Richtung: p
+    steht bereits vollständig durchgesetzt bei reject;pct=100
+    (fully_enforced), aber sp ist explizit gesetzt und dabei SCHWÄCHER als
+    p - Subdomains stehen dann trotz "vollständig durchgesetzt"-Meldung
+    unter einer laxeren Policy als die Domain selbst. Nur gesetzt, wenn
+    fully_enforced True ist (sonst konkurriert die Meldung mit der
+    eigentlichen next_recommended_*-Empfehlung für p), Wert ist dann
+    current_policy (das Ziel, auf das sp angehoben werden sollte)."""
 
     domain: str
     current_policy: str | None
@@ -706,6 +749,7 @@ class DMARCReadiness:
     excluded_reporters: list[str]
     current_sp: str | None
     next_step_pct_adjusted_for_sp: bool
+    sp_behind_recommendation: str | None
 
 
 def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> list[DMARCReadiness]:
@@ -764,6 +808,9 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
                     excluded_reporters=excluded_reporters,
                     current_sp=current_sp,
                     next_step_pct_adjusted_for_sp=adjusted_for_sp,
+                    sp_behind_recommendation=_sp_behind_recommendation(
+                        latest.policy_p or None, current_sp, next_policy is None
+                    ),
                 )
             )
             continue
@@ -849,6 +896,9 @@ def compute_dmarc_readiness(rows: list[ReportRow], days: int, until_ts: int) -> 
                 excluded_reporters=excluded_reporters,
                 current_sp=current_sp,
                 next_step_pct_adjusted_for_sp=adjusted_for_sp,
+                sp_behind_recommendation=_sp_behind_recommendation(
+                    latest.policy_p or None, current_sp, fully_enforced
+                ),
             )
         )
     return result
@@ -1017,7 +1067,9 @@ def to_stats_json_dict(
                 if r.current_policy
                 else r.current_policy,
                 "current_pct": r.current_pct,
-                "current_sp": r.current_sp,
+                "current_sp": sanitize_field(r.current_sp, max_len=_MAX_JSON_FIELD_LEN)
+                if r.current_sp
+                else r.current_sp,
                 "total_count": r.total_count,
                 "unknown_ip_failures": r.unknown_ip_failures,
                 "own_ip_auth_failures": r.own_ip_auth_failures,
@@ -1034,6 +1086,9 @@ def to_stats_json_dict(
                 "ready_for_next_step": r.ready_for_next_step,
                 "needs_recheck": r.needs_recheck,
                 "next_step_pct_adjusted_for_sp": r.next_step_pct_adjusted_for_sp,
+                "sp_behind_recommendation": sanitize_field(r.sp_behind_recommendation, max_len=_MAX_JSON_FIELD_LEN)
+                if r.sp_behind_recommendation
+                else r.sp_behind_recommendation,
                 "excluded_count": r.excluded_count,
                 "excluded_reporters": [
                     sanitize_field(name, max_len=_MAX_JSON_FIELD_LEN) for name in r.excluded_reporters

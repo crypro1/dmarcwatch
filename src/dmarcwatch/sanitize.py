@@ -16,7 +16,7 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # von Text umkehren/verschleiern, Zero-Width-Zeichen und BOM (U+200B-U+200F,
 # U+FEFF) sind unsichtbar - beides liesse sich fuer Spoofing im Menuleisten-
 # Titel missbrauchen (z.B. eine gefaelschte Domain vortaeuschen).
-_INVISIBLE_CHARS = re.compile(r"[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]")
+_INVISIBLE_CHARS = re.compile(r"[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff\u2060\u180e\u061c]")
 
 
 def sanitize_field(value: str, max_len: int = 80) -> str:

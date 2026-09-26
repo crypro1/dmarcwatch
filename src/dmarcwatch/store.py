@@ -278,19 +278,45 @@ def get_all_cached_blacklist(conn: sqlite3.Connection) -> dict[str, tuple[bool, 
     return {row[0]: (bool(row[1]), json.loads(row[2])) for row in rows}
 
 
-def get_dns_snapshot(conn: sqlite3.Connection, domain: str) -> dict | None:
-    """Letzter gespeicherter DNS-Eintrags-Fingerprint für `domain` (siehe
-    dns_verify.py:_fingerprint), oder None bei der allerersten Prüfung."""
-    row = conn.execute(
-        "SELECT fingerprint_json FROM dns_snapshots WHERE domain = ?", (domain,)
-    ).fetchone()
-    if row is None:
-        return None
-    return json.loads(row[0])
+def get_and_replace_dns_snapshot(
+    conn: sqlite3.Connection,
+    domain: str,
+    new_fingerprint: dict,
+    carry_forward_keys: list[str] | None = None,
+) -> dict | None:
+    """Liest den zuletzt gespeicherten DNS-Eintrags-Fingerprint für `domain`
+    (siehe dns_verify.py:_fingerprint) und ersetzt ihn durch
+    new_fingerprint, als EINE atomare Transaktion - explizites BEGIN
+    IMMEDIATE statt der früher getrennten get_dns_snapshot()+
+    set_dns_snapshot()-Aufrufe. Zwei überlappende verify-dns-Läufe (der
+    launchd-automatische in `fetch` und ein manueller, oder zwei manuelle)
+    konnten sonst beide denselben alten Stand lesen, bevor einer von beiden
+    schreibt - wer zuletzt schreibt, gewinnt dann still, und der zuerst
+    gemeldete Wechsel geht für künftige Vergleiche verloren. BEGIN IMMEDIATE
+    holt die Schreibsperre schon vor dem SELECT; ein zweiter, gleichzeitiger
+    Aufruf blockiert dadurch bis zum COMMIT dieses Aufrufs, statt denselben
+    (dann veralteten) alten Stand zu lesen.
 
+    carry_forward_keys: Felder, die - falls bereits ein alter Schnappschuss
+    existiert - aus DIESEM statt aus new_fingerprint übernommen werden, für
+    Felder, deren Lookup in diesem Lauf fehlgeschlagen ist (siehe
+    DMARCCheckResult.error/SPFCheckResult.error in dns_verify.py) und die
+    sonst fälschlich als "Eintrag entfernt" gespeichert würden.
 
-def set_dns_snapshot(conn: sqlite3.Connection, domain: str, fingerprint: dict) -> None:
-    with conn:
+    Gibt den ALTEN Fingerprint zurück (None bei der allerersten Prüfung
+    einer Domain)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT fingerprint_json FROM dns_snapshots WHERE domain = ?", (domain,)
+        ).fetchone()
+        old_fingerprint = json.loads(row[0]) if row is not None else None
+
+        to_store = dict(new_fingerprint)
+        if old_fingerprint is not None:
+            for key in carry_forward_keys or []:
+                to_store[key] = old_fingerprint.get(key)
+
         conn.execute(
             """
             INSERT INTO dns_snapshots (domain, fingerprint_json, checked_at)
@@ -299,9 +325,14 @@ def set_dns_snapshot(conn: sqlite3.Connection, domain: str, fingerprint: dict) -
                 fingerprint_json = excluded.fingerprint_json,
                 checked_at = excluded.checked_at
             """,
-            (domain, json.dumps(fingerprint, sort_keys=True), int(time.time())),
+            (domain, json.dumps(to_store, sort_keys=True), int(time.time())),
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     secure_wal_sidecar_files(conn)
+    return old_fingerprint
 
 
 def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]:

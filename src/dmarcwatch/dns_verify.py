@@ -22,6 +22,7 @@ aufgetaucht sind.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 import ssl
@@ -34,8 +35,9 @@ from defusedxml.ElementTree import fromstring as defused_fromstring
 from defusedxml.common import DefusedXmlException
 
 from .blacklist import BlacklistCheckError, check_ip_blacklist
+from .report import _POLICY_RANK
 from .spf import DIG_TIMEOUT_SECONDS, SPFCheckResult, SPFResolutionError, _dig, _txt_records, validate_spf
-from .store import get_dns_snapshot, get_known_dkim_selectors, set_dns_snapshot
+from .store import get_and_replace_dns_snapshot, get_known_dkim_selectors
 
 _HTTPS_TIMEOUT_SECONDS = 5.0
 
@@ -75,6 +77,7 @@ class DMARCCheckResult:
     adkim: str | None = None
     aspf: str | None = None
     warnings: list[str] = field(default_factory=list)
+    error: str | None = None
 
 
 @dataclass
@@ -82,6 +85,7 @@ class DKIMCheckResult:
     selector: str
     exists: bool
     key_type: str | None = None
+    key_fingerprint: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -216,8 +220,6 @@ class DomainVerification:
     bimi: BIMICheckResult
 
 
-_POLICY_RANK = {"none": 0, "quarantine": 1, "reject": 2}
-
 # Label je Fingerprint-Feld für die menschenlesbaren changes-Einträge -
 # dmarc_policy/dmarc_subdomain_policy/dmarc_pct bewusst ausgelassen,
 # dmarc_record deckt inhaltlich denselben Fall schon ab (ein geänderter
@@ -243,7 +245,7 @@ def _fingerprint(result: DomainVerification) -> dict:
         "dmarc_subdomain_policy": result.dmarc.subdomain_policy,
         "dmarc_pct": result.dmarc.pct,
         "spf_record": result.spf.record,
-        "dkim": sorted(f"{d.selector}:{d.key_type}" for d in result.dkim if d.exists),
+        "dkim": sorted(f"{d.selector}:{d.key_type}:{d.key_fingerprint}" for d in result.dkim if d.exists),
         "mta_sts_policy_txt": result.mta_sts.policy_txt,
         "tlsrpt_record": result.tlsrpt_dns.record,
         "dane_mx_hosts_with_tlsa": sorted(result.dane.mx_hosts_with_tlsa),
@@ -270,17 +272,44 @@ def _format_fingerprint_value(value: object) -> str:
     return str(value)
 
 
+def _effective_sp_rank(fp: dict) -> int:
+    """Rang der Subdomain-Policy (sp) für den Rückstufungs-Vergleich - ein
+    FEHLENDES sp-Tag ist laut RFC 7489 kein "unbekannt", sondern erbt den
+    Rang von p (Subdomains folgen dann automatisch der Hauptpolicy). -1
+    (unbekannt) nur, wenn selbst p zu diesem Zeitpunkt nie beobachtet
+    wurde - siehe diff_and_update_snapshot()."""
+    sp_rank = _POLICY_RANK.get(fp.get("dmarc_subdomain_policy"))
+    if sp_rank is not None:
+        return sp_rank
+    return _POLICY_RANK.get(fp.get("dmarc_policy"), -1)
+
+
 def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerification) -> DNSChangeResult:
     """Vergleicht result gegen den gespeicherten Schnappschuss für
     result.domain, aktualisiert den Schnappschuss IMMER (auch beim
     allerersten Mal, um die Baseline zu legen), und gibt zurück, was sich
     geändert hat."""
     new_fp = _fingerprint(result)
-    old_fp = get_dns_snapshot(conn, result.domain)
-    set_dns_snapshot(conn, result.domain, new_fp)
+
+    # Ein fehlgeschlagener Lookup in DIESEM Lauf (DMARCCheckResult.error/
+    # SPFCheckResult.error, z. B. ein einzelner Resolver-Timeout) darf die
+    # betroffenen Felder nicht als "entfernt" überschreiben - das sähe sonst
+    # genauso aus wie ein echtes Entfernen des Eintrags. Alte Werte werden
+    # stattdessen übernommen, atomar mit dem Lesen des alten Schnappschusses
+    # (siehe get_and_replace_dns_snapshot()).
+    carry_forward_keys: list[str] = []
+    if result.dmarc.error is not None:
+        carry_forward_keys.extend(["dmarc_record", "dmarc_policy", "dmarc_subdomain_policy", "dmarc_pct"])
+    if result.spf.error is not None:
+        carry_forward_keys.append("spf_record")
+
+    old_fp = get_and_replace_dns_snapshot(conn, result.domain, new_fp, carry_forward_keys)
 
     if old_fp is None:
         return DNSChangeResult(has_baseline=False, changes=[], policy_weakened=False)
+
+    for key in carry_forward_keys:
+        new_fp[key] = old_fp.get(key)
 
     changes: list[str] = []
     for key, label in _CHANGE_LABELS.items():
@@ -297,18 +326,29 @@ def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerificatio
     # tatsächlicher Rückschritt.
     old_p_rank = _POLICY_RANK.get(old_fp.get("dmarc_policy"), -1)
     new_p_rank = _POLICY_RANK.get(new_fp.get("dmarc_policy"), -1)
-    old_sp_rank = _POLICY_RANK.get(old_fp.get("dmarc_subdomain_policy"), -1)
-    new_sp_rank = _POLICY_RANK.get(new_fp.get("dmarc_subdomain_policy"), -1)
-    policy_weakened = (old_p_rank != -1 and new_p_rank < old_p_rank) or (
+    old_sp_rank = _effective_sp_rank(old_fp)
+    new_sp_rank = _effective_sp_rank(new_fp)
+    rank_weakened = (old_p_rank != -1 and new_p_rank < old_p_rank) or (
         old_sp_rank != -1 and new_sp_rank < old_sp_rank
     )
+
+    # Ein fehlendes pct-Tag heißt laut RFC 7489 implizit pct=100 - erst so
+    # ist ein sinkender Wert überhaupt vergleichbar, auch wenn das Tag vorher
+    # oder nachher gar nicht gesetzt war.
+    old_pct = old_fp.get("dmarc_pct") if old_fp.get("dmarc_pct") is not None else 100
+    new_pct = new_fp.get("dmarc_pct") if new_fp.get("dmarc_pct") is not None else 100
+    pct_weakened = new_pct < old_pct
+
+    policy_weakened = rank_weakened or pct_weakened
     if policy_weakened:
-        changes.insert(
-            0,
+        detail = (
             "⚠ DMARC-Policy geschwächt: "
             f"p={old_fp.get('dmarc_policy')}->{new_fp.get('dmarc_policy')}, "
-            f"sp={old_fp.get('dmarc_subdomain_policy')}->{new_fp.get('dmarc_subdomain_policy')}",
+            f"sp={old_fp.get('dmarc_subdomain_policy')}->{new_fp.get('dmarc_subdomain_policy')}"
         )
+        if pct_weakened:
+            detail += f", pct={old_pct}->{new_pct}"
+        changes.insert(0, detail)
 
     return DNSChangeResult(has_baseline=True, changes=changes, policy_weakened=policy_weakened)
 
@@ -335,9 +375,10 @@ def check_dmarc(domain: str) -> DMARCCheckResult:
         # Anders als bei den optionalen Checks (MTA-STS, TLS-RPT-DNS, ...)
         # darf ein fehlgeschlagener Lookup hier nicht mit "kein DMARC-Eintrag"
         # gleichgesetzt werden - DMARC-Abwesenheit ist eine eigene, relevante
-        # Aussage, ein DNS-Fehler eine andere.
+        # Aussage, ein DNS-Fehler eine andere. error (zusätzlich zu warnings)
+        # macht das für diff_and_update_snapshot() unterscheidbar.
         return DMARCCheckResult(
-            exists=False, warnings=[f"DMARC-Abfrage fehlgeschlagen: {exc}"]
+            exists=False, error=str(exc), warnings=[f"DMARC-Abfrage fehlgeschlagen: {exc}"]
         )
     dmarc_records = [r for r in all_records if r.lower().startswith("v=dmarc1")]
 
@@ -451,13 +492,21 @@ def check_dkim(domain: str, selector: str) -> DKIMCheckResult:
     key_type = tags.get("k", "rsa").lower()
     if key_type not in ("rsa", "ed25519"):
         warnings.append(f"Unbekannter Key-Typ k={key_type!r} (erwartet: rsa oder ed25519).")
-    if not tags.get("p"):
+    key_value = tags.get("p")
+    if not key_value:
         warnings.append(
             "Kein Public Key ('p'-Tag leer oder fehlt) - falls das ein Widerruf sein soll, "
             "ist das korrekt, sonst ist der Selektor nicht funktionsfähig."
         )
 
-    return DKIMCheckResult(selector=selector, exists=True, key_type=key_type, warnings=warnings)
+    # Kurzer Hash statt des vollen Keys - reicht, um eine Schlüsselrotation
+    # bei gleichem Selektor/Key-Typ zu erkennen (siehe _fingerprint()), ohne
+    # den vollen Public-Key-Text im Fingerprint mitzuschleppen.
+    key_fingerprint = hashlib.sha256(key_value.encode("utf-8")).hexdigest()[:16] if key_value else None
+
+    return DKIMCheckResult(
+        selector=selector, exists=True, key_type=key_type, key_fingerprint=key_fingerprint, warnings=warnings
+    )
 
 
 def _fetch_mta_sts_policy(hostname: str) -> tuple[bool, str | None]:

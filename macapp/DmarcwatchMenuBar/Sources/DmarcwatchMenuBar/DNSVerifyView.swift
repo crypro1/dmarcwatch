@@ -91,7 +91,7 @@ struct DNSVerifyView: View {
                     Text("DMARC-Policy seit letzter Prüfung geschwächt")
                         .font(.callout.bold())
                         .foregroundColor(.red)
-                    changeEntries(result.changes, color: .red)
+                    changeEntries(Array(result.changes.dropFirst()), color: .red)
                 }
             } else if !result.changes.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
