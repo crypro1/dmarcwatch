@@ -4,6 +4,93 @@ Alle nennenswerten Änderungen an dmarcwatch werden hier festgehalten.
 Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
+## [1.3.0] - 2026-09-26
+
+### Hinzugefügt
+- sp-aware Rollout-Empfehlung für `stats`/"Statistik…"
+  (`_next_dmarc_rollout_step`, [report.py](src/dmarcwatch/report.py)):
+  `pct` ist laut RFC 7489 ein einziger, geteilter Wert für `p` **oder**
+  `sp`, nie für beide getrennt. Stand bereits `sp` auf einer strengeren,
+  vollständig durchgesetzten Stufe als `p` (z. B. `p=quarantine;
+  sp=reject` ohne gesetztes `pct`), hätte die bisherige, naive erste
+  Rollout-Stufe für `p` (`pct=25`) das bereits durchgesetzte `sp` mit
+  zurückgestuft - genau das ist einer realen Domain in diesem Tool
+  passiert. Die Empfehlung überspringt die 25%-Zwischenstufe jetzt in
+  diesem Fall und schlägt direkt `pct=100` vor
+  (`next_step_pct_adjusted_for_sp`, sichtbar in Terminal und
+  Menüleisten-App).
+- DNS-Änderungserkennung für `verify-dns`/"DNS prüfen…"
+  (`diff_and_update_snapshot`, [dns_verify.py](src/dmarcwatch/dns_verify.py),
+  neue `dns_snapshots`-Tabelle, Schema v5): jede Prüfung vergleicht die
+  aktuellen DNS-Einträge jetzt zusätzlich gegen einen lokal gespeicherten
+  Schnappschuss der letzten Prüfung derselben Domain - nicht nur, ob der
+  aktuelle Zustand nach den bestehenden Regeln gut aussieht, sondern auch,
+  ob sich seit dem letzten Mal überhaupt etwas geändert hat. Eine
+  grüne/rote Pille pro Domain zeigt das auf einen Blick, darunter im
+  Änderungsfall die genauen Felder (alter → neuer Wert). Eine
+  zurückgestufte DMARC-Policy (`p` oder `sp` schwächer als beim letzten
+  Mal, z. B. `reject` → `none`) bekommt eine eigene, lautere Warnung und
+  löst beim automatischen periodischen Check (`enable_auto_dns_check`)
+  eine eigene Notification aus, getrennt von der üblichen
+  "DNS-Konfiguration auffällig"-Meldung - der durch die bestehenden
+  Regeln allein unauffällige neue Zustand (`p=none` ist für sich
+  genommen technisch gültig) wäre sonst nicht als Rückschritt erkennbar
+  gewesen, egal ob durch einen Angriff, einen Tippfehler im
+  Registrar-Panel oder Versehen verursacht.
+- Versionsnummer in "Einstellungen…" (unten links, aus
+  `CFBundleShortVersionString` gelesen statt fest verdrahtet).
+
+### Behoben
+Zehn Befunde aus einer gezielten Adversarial-Review, jeder mit einem
+Regressionstest, der gegen den alten Code nachweislich fehlschlägt:
+- `_extract_zip` ([archive.py](src/dmarcwatch/archive.py)) fing
+  `zlib.error` bei einem gezielt beschädigten Deflate-Stream in einem
+  Zip-Anhang nicht ab (anders als `_extract_gz` daneben) - ein
+  entkommener Fehler hätte `fetch` bei jedem künftigen Lauf erneut zum
+  Absturz gebracht, da die auslösende Nachricht nie als verarbeitet
+  markiert wird.
+- `policy_published/pct` ([parser.py](src/dmarcwatch/parser.py)) und
+  drei TLS-RPT-Zählfelder ([tls_parser.py](src/dmarcwatch/tls_parser.py))
+  wurden ohne Obergrenze geparst - ein Report mit einem absurd großen
+  Wert ließ SQLite beim Einfügen mit `OverflowError` abstürzen, ebenfalls
+  ein wiederkehrender Absturz-Loop aus einer einzigen präparierten Mail.
+- `_search_unseen`/`_mark_processed` ([fetch.py](src/dmarcwatch/fetch.py))
+  arbeiteten mit IMAP-Sequenznummern statt UIDs, kombiniert mit einem
+  `expunge()` pro Nachricht - da EXPUNGE laut RFC 3501 alle höheren
+  Sequenznummern verschiebt, konnten bei aktivem
+  `move_to_processed_folder` und mehreren ungelesenen Nachrichten Reports
+  übersprungen, doppelt verarbeitet oder ungelesen verworfen werden. Läuft
+  jetzt durchgehend über stabile UIDs.
+- `own_ip_fail_rows` ([report.py](src/dmarcwatch/report.py)) zählte
+  jeden Record mit `disposition != none` als Auth-Fehlschlag, auch wenn
+  DKIM und SPF beide bestanden hatten - eine unrelated
+  Policy-Override-Begründung des Empfängers konnte so `needs_recheck`
+  fälschlich dauerhaft auslösen.
+- `_detect_reporting_gap` ([report.py](src/dmarcwatch/report.py)) konnte
+  bei exakt drei unterschiedlichen Report-Tagen (zwei Lücken) eine
+  Report-Lücke rechnerisch gar nicht mehr erkennen, weil der Ausreißer
+  seine eigene Vergleichsbasis mit verzerrte - eine mehrmonatige Lücke
+  wäre unbemerkt geblieben.
+- `is_own_ip` ([config.py](src/dmarcwatch/config.py)) erkannte
+  IPv4-mapped-IPv6-Adressen (`::ffff:203.0.113.5`) nicht als Mitglied
+  einer IPv4-CIDR in `own_ip_networks` - ein echter eigener
+  Auth-Fehlschlag von einem Dual-Stack-Sender konnte so unbemerkt am
+  Sicherheitsnetz vorbeirutschen.
+- `check_ip_blacklist` ([blacklist.py](src/dmarcwatch/blacklist.py))
+  behandelte eine leere `dig +short`-Antwort immer als "nicht gelistet" -
+  das ist von einem echten SERVFAIL (z. B. Spamhaus drosselt den
+  abfragenden Resolver) nicht zu unterscheiden, ein gelisteter eigener
+  Mailserver konnte so fälschlich als sauber gemeldet werden.
+- `check_dmarc` ([dns_verify.py](src/dmarcwatch/dns_verify.py)) war als
+  einzige Prüfung in dieser Datei nicht gegen einen DNS-Abfragefehler
+  abgesichert - ein einzelner Timeout ließ `verify-dns` komplett
+  abstürzen statt den Fehler als Warnung zu melden.
+- `sanitize_field` ([sanitize.py](src/dmarcwatch/sanitize.py)) entfernte
+  nur klassische Steuerzeichen, keine Unicode-Bidi-Override-Zeichen
+  (z. B. U+202E) - ein präparierter `org_name` hätte sich in der
+  Menüleisten-App optisch umsortieren/tarnen können, genau dort, wo
+  Nutzer:innen beurteilen, welcher Absender auffällig ist.
+
 ## [1.2.0] - 2026-09-19
 
 ### Hinzugefügt
