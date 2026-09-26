@@ -477,7 +477,10 @@ def collect_daily_stats(rows: list[ReportRow]) -> list[DayStat]:
     for day in sorted(by_day.keys()):
         day_rows = by_day[day]
         flagged = sum(1 for r in day_rows if r.is_flagged)
-        blocked = sum(r.count for r in day_rows if r.is_flagged and r.disposition == "reject")
+        # disposition == "reject" impliziert bereits is_flagged (anomaly.py
+        # setzt REASON_DISPOSITION unbedingt bei jeder disposition != none),
+        # eine zusätzliche is_flagged-Prüfung wäre nur redundant.
+        blocked = sum(r.count for r in day_rows if r.disposition == "reject")
         result.append(
             DayStat(date=day, clean_count=len(day_rows) - flagged, flagged_count=flagged, blocked_count=blocked)
         )

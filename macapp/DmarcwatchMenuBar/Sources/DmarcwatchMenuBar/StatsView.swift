@@ -85,11 +85,10 @@ struct StatsView: View {
         let clean = response.daily.reduce(0) { $0 + $1.cleanCount }
         let flagged = response.daily.reduce(0) { $0 + $1.flaggedCount }
         let blocked = response.daily.reduce(0) { $0 + $1.blockedCount }
-        return VStack(alignment: .leading, spacing: 4) {
-            donutCard(
-                title: "DMARC-Überblick · letzte \(response.days) Tage",
-                segments: [("sauber", clean, Color.green), ("auffällig", flagged, Color.red)]
-            )
+        return donutCard(
+            title: "DMARC-Überblick · letzte \(response.days) Tage",
+            segments: [("sauber", clean, Color.green), ("auffällig", flagged, Color.red)]
+        ) {
             if blocked > 0 {
                 Text("\(blocked) E-Mails durch die eigene Policy abgewiesen")
                     .font(.caption)
@@ -111,8 +110,15 @@ struct StatsView: View {
     }
 
     /// Gemeinsamer Ring+Legende-Aufbau für DMARC- und TLS-RPT-Überblick -
-    /// dieselbe Struktur, nur andere Segmente/Farben.
-    private func donutCard(title: String, segments: [(label: String, count: Int, color: Color)]) -> some View {
+    /// dieselbe Struktur, nur andere Segmente/Farben. `extra` hängt
+    /// optional weiteren Inhalt (z. B. eine Zusatzzeile) INNERHALB derselben
+    /// card{}-Umrandung an, statt dass ein Aufrufer eine eigene, unstylte
+    /// Hülle drumherum bauen müsste.
+    private func donutCard<Extra: View>(
+        title: String,
+        segments: [(label: String, count: Int, color: Color)],
+        @ViewBuilder extra: () -> Extra = { EmptyView() }
+    ) -> some View {
         let total = segments.reduce(0) { $0 + $1.count }
         return card {
             Text(title).font(.subheadline.bold()).foregroundStyle(.secondary)
@@ -140,6 +146,7 @@ struct StatsView: View {
                     .font(.callout)
                 }
             }
+            extra()
         }
     }
 
@@ -216,7 +223,8 @@ struct StatsView: View {
     /// Karte statt einer leeren.
     private func spoofedIdentitiesCard(_ response: StatsResponse) -> some View {
         card {
-            Text("Auffällige Absender-Identitäten (header_from)").font(.subheadline.bold()).foregroundStyle(.secondary)
+            Text("Auffällige Absender-Identitäten (header_from) · letzte \(response.days) Tage")
+                .font(.subheadline.bold()).foregroundStyle(.secondary)
             ForEach(response.spoofedIdentities) { entry in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.headerFrom).font(.callout.bold())

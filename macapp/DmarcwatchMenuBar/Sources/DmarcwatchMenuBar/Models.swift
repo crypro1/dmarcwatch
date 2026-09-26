@@ -419,6 +419,21 @@ struct StatsResponse: Decodable {
         case mtaStsReadiness = "mta_sts_readiness"
         case spoofedIdentities = "spoofed_identities"
     }
+
+    // Eigenes init statt des synthetisierten: spoofedIdentities per
+    // decodeIfPresent mit Fallback [] statt decode, damit eine ältere
+    // CLI-Version ohne dieses Feld nicht den kompletten Decode (und damit
+    // das ganze Statistik-Fenster) mit einem Fehler blockiert - nur diese
+    // eine Karte bliebe dann leer.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        days = try container.decode(Int.self, forKey: .days)
+        daily = try container.decode([DayStatEntry].self, forKey: .daily)
+        tlsDaily = try container.decode([TLSDayStatEntry].self, forKey: .tlsDaily)
+        dmarcReadiness = try container.decode([DMARCReadinessEntry].self, forKey: .dmarcReadiness)
+        mtaStsReadiness = try container.decode([MTASTSReadinessEntry].self, forKey: .mtaStsReadiness)
+        spoofedIdentities = try container.decodeIfPresent([SpoofedIdentityEntry].self, forKey: .spoofedIdentities) ?? []
+    }
 }
 
 struct DayStatEntry: Decodable, Identifiable {
@@ -434,6 +449,16 @@ struct DayStatEntry: Decodable, Identifiable {
         case cleanCount = "clean_count"
         case flaggedCount = "flagged_count"
         case blockedCount = "blocked_count"
+    }
+
+    // blockedCount per decodeIfPresent mit Fallback 0 statt decode - siehe
+    // Begründung bei StatsResponse.init oben, gleiches Prinzip.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        date = try container.decode(String.self, forKey: .date)
+        cleanCount = try container.decode(Int.self, forKey: .cleanCount)
+        flaggedCount = try container.decode(Int.self, forKey: .flaggedCount)
+        blockedCount = try container.decodeIfPresent(Int.self, forKey: .blockedCount) ?? 0
     }
 
     private static let isoFormatter: DateFormatter = {
@@ -612,7 +637,11 @@ struct SpoofedIdentityEntry: Decodable, Identifiable {
     let lastSeenDate: String
     let reporters: [String]
 
-    var id: String { headerFrom }
+    // headerFrom allein kommt bereits gekürzt/sanitisiert aus report.py -
+    // zwei tatsächlich unterschiedliche, sehr lange rohe header_from-Werte
+    // könnten nach der Kürzung identisch aussehen. Weitere Felder mit in
+    // die ID aufnehmen macht eine Kollision deutlich unwahrscheinlicher.
+    var id: String { "\(headerFrom)|\(totalCount)|\(firstSeenDate)|\(lastSeenDate)" }
 
     enum CodingKeys: String, CodingKey {
         case headerFrom = "header_from"
