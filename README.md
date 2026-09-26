@@ -174,6 +174,27 @@ Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   Unterzeile "keine Auffälligkeiten" reicht dafür. Der Bestätigungsdialog
   selbst erklärt beim ersten Klick, was geprüft wird und wann rot erscheint,
   und lässt sich über "Nicht mehr fragen" dauerhaft überspringen.
+
+  Zusätzlich vergleicht jede Prüfung die aktuellen DNS-Einträge gegen einen
+  lokal gespeicherten Schnappschuss der letzten Prüfung derselben Domain
+  (`dns_snapshots`-Tabelle, [`diff_and_update_snapshot`](src/dmarcwatch/dns_verify.py))
+  - nicht nur, ob der AKTUELLE Zustand nach den obigen Regeln gut aussieht,
+  sondern auch, ob sich seit dem letzten Mal überhaupt etwas geändert hat.
+  Eine grüne/rote Pille pro Domain zeigt das auf einen Blick ("Keine
+  Änderungen" bzw. "Änderungen erkannt"), darunter im Änderungsfall die
+  genauen Felder (alter → neuer Wert). Eine zurückgestufte DMARC-Policy
+  (`p` oder `sp` schwächer als beim letzten Mal, z. B. `reject` → `none`)
+  bekommt eine eigene, auffälligere rote Warnung statt nur der normalen
+  Änderungsliste, und löst beim automatischen periodischen Check
+  (`enable_auto_dns_check`) eine eigene Notification aus, getrennt von der
+  üblichen "DNS-Konfiguration auffällig"-Meldung - genau der Fall, in dem
+  ein durch den heutigen Regelsatz allein unauffälliger neuer Zustand (z. B.
+  `p=none` ist für sich genommen technisch gültig) trotzdem höchst
+  besorgniserregend ist, weil er eine bewusst schärfer eingestellte Policy
+  zurücknimmt - egal ob durch einen Angriff, einen Tippfehler im
+  Registrar-Panel oder Versehen. Der allererste Check einer Domain legt nur
+  die Vergleichsbasis an, ohne Warnung (es gibt noch nichts zum
+  Vergleichen).
 - **Statistik…** öffnet ein Fenster mit Tagestrend (sauber/auffällig) und
   einer Einschätzung, ob eine Verschärfung von DMARC (Richtung `reject`)
   bzw. MTA-STS (Richtung `enforce`) im gewählten Zeitraum sicher gewesen
@@ -432,7 +453,18 @@ ohne App-Update ergänzt werden. Beispiel:
   25/50/75/100 → `reject` 25/50/75/100 - [`_next_dmarc_rollout_step`](src/dmarcwatch/report.py))
   statt eines einzigen Sprungs direkt auf `p=reject; pct=100`: eine bereits
   bei `p=reject` stehende Domain mit `pct=10` gilt NICHT als fertig, es
-  wird weiterhin der nächste `pct`-Schritt empfohlen. **MTA-STS-Bereitschaft**
+  wird weiterhin der nächste `pct`-Schritt empfohlen. `pct` ist laut RFC 7489
+  ein einziger, geteilter Wert - er gilt für `p` **oder** `sp`, je nachdem
+  welche Policy für eine konkrete Mail zählt, nie für beide getrennt. Steht
+  `sp` bereits auf einer strengeren, vollständig durchgesetzten Stufe als
+  `p` (z. B. `p=quarantine; sp=reject` ohne gesetztes `pct`, also implizit
+  100), würde die naive erste Rollout-Stufe für `p` (`pct=25`) genau dieses
+  bereits durchgesetzte `sp` mit zurückstufen, da `pct` geteilt ist - in dem
+  Fall überspringt die Empfehlung die 25%-Zwischenstufe und schlägt direkt
+  `pct=100` für die neue `p`-Stufe vor (`next_step_pct_adjusted_for_sp` im
+  JSON, sichtbar als Hinweiszeile in Terminal und Menüleisten-App). Einmal
+  mitten in einer Stufe (`pct` schon < 100) greift diese Sonderregel nicht
+  mehr, der normale 25%-Rhythmus läuft weiter. **MTA-STS-Bereitschaft**
   läuft pro Domain unabhängig (eine zweite, unabhängige Domain verwässert
   nicht mehr die Einschätzung der ersten) und schlüsselt gemeldete
   TLS-Fehlschläge zusätzlich nach RFC-8460-Ergebnistyp auf, gewichtet mit
@@ -588,7 +620,12 @@ ohne App-Update ergänzt werden. Beispiel:
   Deutschland-Adressbereich) - die anderen fünf liegen alle in den USA.
   Spamhaus gilt davon unabhängig ohnehin als die fachlich angesehenste
   einzelne Liste; Invaluement ist ohne kostenpflichtigen Abfrage-Key gar
-  nicht frei nutzbar. `--json` gibt strukturierte Ausgabe statt der Tabelle
+  nicht frei nutzbar. Jeder Lauf vergleicht außerdem gegen den beim
+  vorherigen Lauf gespeicherten Schnappschuss derselben Domain und zeigt
+  unter "Änderungen seit letzter Prüfung:", was sich geändert hat (eine
+  zurückgestufte DMARC-Policy separat und lauter markiert) - siehe
+  ["DNS prüfen…"](#native-menüleisten-app) oben für die volle Begründung.
+  `--json` gibt strukturierte Ausgabe statt der Tabelle
   aus - für das "DNS prüfen…"-Fenster in der Menüleisten-App gedacht,
   funktioniert aber genauso von Hand im Terminal.
 
@@ -659,7 +696,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-351 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+371 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
