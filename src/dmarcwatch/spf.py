@@ -48,16 +48,8 @@ def _dig(record_type: str, name: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def _dig_checked(record_type: str, name: str) -> list[str]:
-    """Wie _dig(), aber ohne `+short` und mit Prüfung des DNS-Antwortstatus:
-    `dig +short` liefert sowohl bei einer echten leeren Antwort (NXDOMAIN)
-    als auch bei einem Auflösungsfehler (z. B. SERVFAIL, etwa wenn Spamhaus
-    einen gemeinsam genutzten/öffentlichen Resolver drosselt) gleichermaßen
-    leeres stdout mit Exit-Code 0 - für Aufrufer, die das unterscheiden
-    müssen (siehe check_ip_blacklist() in blacklist.py), reicht der
-    Exit-Code allein nicht.
-
-    Wirft SPFResolutionError bei jedem Status außer NOERROR/NXDOMAIN."""
+def _dig_full(record_type: str, name: str) -> str:
+    """Volle dig-Ausgabe (ohne `+short`, inklusive Header mit Antwortstatus)."""
     try:
         result = subprocess.run(
             ["dig", "+time=3", "+tries=1", record_type, name],
@@ -71,14 +63,51 @@ def _dig_checked(record_type: str, name: str) -> list[str]:
     if result.returncode != 0:
         detail = result.stderr.strip() or f"dig beendete sich mit Code {result.returncode}"
         raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): {detail}")
+    return result.stdout
 
-    status = "SERVFAIL"
+
+def _response_status(dig_stdout: str) -> str | None:
+    """Antwortstatus (NOERROR, NXDOMAIN, SERVFAIL, ...) aus der Header-Zeile
+    einer vollen dig-Ausgabe, None wenn keine Header-Zeile vorhanden ist."""
+    for line in dig_stdout.splitlines():
+        if line.startswith(";; ->>HEADER<<-") and "status:" in line:
+            return line.split("status:", 1)[1].split(",", 1)[0].strip()
+    return None
+
+
+def _raise_on_resolution_failure(record_type: str, name: str) -> None:
+    """Für einen LEEREN `dig +short`-Befund: prüft per zweiter, voller
+    Abfrage, ob das wirklich "kein Eintrag" (NOERROR/NXDOMAIN) war oder ein
+    Auflösungsfehler (SERVFAIL, REFUSED, ...) - siehe _dig_checked(), warum
+    `+short` beides nicht unterscheidet. Ohne diese Prüfung sähe z. B. ein
+    vorübergehender SERVFAIL beim DMARC-Lookup genauso aus wie ein echtes
+    Entfernen des Eintrags (falscher "DMARC-Policy geschwächt"-Alarm und eine
+    verfälschte Baseline in dns_verify.diff_and_update_snapshot()).
+
+    Wirft SPFResolutionError bei einem Status außer NOERROR/NXDOMAIN; eine
+    Ausgabe ohne Header-Zeile gilt nicht als Fehler."""
+    status = _response_status(_dig_full(record_type, name))
+    if status is not None and status not in ("NOERROR", "NXDOMAIN"):
+        raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): Status {status}")
+
+
+def _dig_checked(record_type: str, name: str) -> list[str]:
+    """Wie _dig(), aber ohne `+short` und mit Prüfung des DNS-Antwortstatus:
+    `dig +short` liefert sowohl bei einer echten leeren Antwort (NXDOMAIN)
+    als auch bei einem Auflösungsfehler (z. B. SERVFAIL, etwa wenn Spamhaus
+    einen gemeinsam genutzten/öffentlichen Resolver drosselt) gleichermaßen
+    leeres stdout mit Exit-Code 0 - für Aufrufer, die das unterscheiden
+    müssen (siehe check_ip_blacklist() in blacklist.py), reicht der
+    Exit-Code allein nicht.
+
+    Wirft SPFResolutionError bei jedem Status außer NOERROR/NXDOMAIN."""
+    stdout = _dig_full(record_type, name)
+
+    status = _response_status(stdout) or "SERVFAIL"
     answers: list[str] = []
     in_answer_section = False
-    for line in result.stdout.splitlines():
-        if line.startswith(";; ->>HEADER<<-") and "status:" in line:
-            status = line.split("status:", 1)[1].split(",", 1)[0].strip()
-        elif line.startswith(";; ANSWER SECTION:"):
+    for line in stdout.splitlines():
+        if line.startswith(";; ANSWER SECTION:"):
             in_answer_section = True
         elif in_answer_section:
             if not line.strip() or line.startswith(";;"):
@@ -103,6 +132,8 @@ def _txt_records(domain: str) -> list[str]:
         content = "".join(parts[i] for i in range(1, len(parts), 2))
         if content:
             records.append(content)
+    if not records:
+        _raise_on_resolution_failure("TXT", domain)
     return records
 
 
@@ -143,57 +174,80 @@ class _LookupBudget:
         return self._used
 
 
-def _resolve(domain: str, budget: _LookupBudget, seen: set[str]) -> set[str]:
+def _resolve(domain: str, budget: _LookupBudget, path: set[str], count_lookup: bool = True) -> set[str]:
+    """path enthält nur die Domains auf dem AKTUELLEN Rekursionspfad (wird
+    beim Verlassen wieder entfernt), nicht jede je besuchte Domain - eine
+    Raute (A inkludiert B und C, beide inkludieren D) ist laut RFC 7208
+    erlaubt und kein Zyklus; nur ein echter Rückbezug auf eine Domain weiter
+    oben im selben Pfad (A -> B -> A) ist einer. Der Gesamtaufwand bleibt
+    unabhängig davon durch das Lookup-Budget begrenzt.
+
+    count_lookup=False nur für den Einstiegsaufruf: die TXT-Abfrage des
+    eigenen Eintrags zählt laut RFC 7208 4.6.4 nicht zum Limit von 10, nur
+    include/a/mx/ptr/exists/redirect tun das."""
     domain = domain.strip().rstrip(".").lower()
     if not domain:
         return set()
-    if domain in seen:
+    if domain in path:
         raise SPFResolutionError(f"Zyklus in SPF-Includes entdeckt bei {domain!r}.")
-    seen.add(domain)
-    budget.spend(domain)
+    if count_lookup:
+        budget.spend(domain)
+    path.add(domain)
+    try:
+        record = _find_spf_record(domain)
+        if record is None:
+            raise SPFResolutionError(f"Kein SPF-Eintrag (v=spf1) für {domain!r} gefunden.")
 
-    record = _find_spf_record(domain)
-    if record is None:
-        raise SPFResolutionError(f"Kein SPF-Eintrag (v=spf1) für {domain!r} gefunden.")
+        networks: set[str] = set()
+        redirect_target: str | None = None
 
-    networks: set[str] = set()
-    redirect_target: str | None = None
+        for token in record.split():
+            low = token.lower()
+            if low.startswith("ip4:"):
+                value = token[len("ip4:"):]
+                networks.add(value if "/" in value else f"{value}/32")
+            elif low.startswith("ip6:"):
+                value = token[len("ip6:"):]
+                networks.add(value if "/" in value else f"{value}/128")
+            elif low.startswith("include:"):
+                networks |= _resolve(token[len("include:"):], budget, path)
+            elif low == "a" or low.startswith("a:"):
+                target = token.split(":", 1)[1] if ":" in token else domain
+                budget.spend(target)
+                networks |= _resolve_host_to_networks(target)
+            elif low == "mx" or low.startswith("mx:"):
+                target = token.split(":", 1)[1] if ":" in token else domain
+                # Der mx-Mechanismus zählt als EIN Lookup - die
+                # Adressabfragen der einzelnen MX-Hosts zählen laut RFC 7208
+                # 4.6.4 nicht zum Gesamtlimit, haben aber ein eigenes Limit
+                # von 10 pro mx-Mechanismus.
+                budget.spend(target)
+                mx_hosts = []
+                for mx_line in _dig("MX", target):
+                    mx_parts = mx_line.split()
+                    if len(mx_parts) < 2:
+                        continue
+                    mx_hosts.append(mx_parts[1].rstrip("."))
+                if len(mx_hosts) > MAX_DNS_LOOKUPS:
+                    raise SPFResolutionError(
+                        f"'mx' für {target!r} liefert {len(mx_hosts)} MX-Hosts, mehr als die "
+                        f"von RFC 7208 erlaubten {MAX_DNS_LOOKUPS} Adressabfragen."
+                    )
+                for mx_host in mx_hosts:
+                    networks |= _resolve_host_to_networks(mx_host)
+            elif low.startswith("redirect="):
+                redirect_target = token[len("redirect="):]
+            # Bewusst nicht behandelt: CIDR-Längen-Modifikatoren wie "a/24" oder
+            # "mx/24" (selten), "ptr" (von RFC 7208 selbst als veraltet
+            # markiert) und "exists:" (liefert keine IP-Menge, nur einen
+            # Wahrheitswert) - werden übersprungen, nicht als Fehler behandelt.
 
-    for token in record.split():
-        low = token.lower()
-        if low.startswith("ip4:"):
-            value = token[len("ip4:"):]
-            networks.add(value if "/" in value else f"{value}/32")
-        elif low.startswith("ip6:"):
-            value = token[len("ip6:"):]
-            networks.add(value if "/" in value else f"{value}/128")
-        elif low.startswith("include:"):
-            networks |= _resolve(token[len("include:"):], budget, seen)
-        elif low == "a" or low.startswith("a:"):
-            target = token.split(":", 1)[1] if ":" in token else domain
-            budget.spend(target)
-            networks |= _resolve_host_to_networks(target)
-        elif low == "mx" or low.startswith("mx:"):
-            target = token.split(":", 1)[1] if ":" in token else domain
-            budget.spend(target)
-            for mx_line in _dig("MX", target):
-                mx_parts = mx_line.split()
-                if len(mx_parts) < 2:
-                    continue
-                mx_host = mx_parts[1].rstrip(".")
-                budget.spend(mx_host)
-                networks |= _resolve_host_to_networks(mx_host)
-        elif low.startswith("redirect="):
-            redirect_target = token[len("redirect="):]
-        # Bewusst nicht behandelt: CIDR-Längen-Modifikatoren wie "a/24" oder
-        # "mx/24" (selten), "ptr" (von RFC 7208 selbst als veraltet
-        # markiert) und "exists:" (liefert keine IP-Menge, nur einen
-        # Wahrheitswert) - werden übersprungen, nicht als Fehler behandelt.
+        if redirect_target:
+            networks |= _resolve(redirect_target, budget, path)
 
-    if redirect_target:
-        networks |= _resolve(redirect_target, budget, seen)
-
-    return networks
+        return networks
+    finally:
+        path.discard(domain)
 
 
 def resolve_own_ip_networks(domain: str) -> list[str]:
@@ -204,7 +258,7 @@ def resolve_own_ip_networks(domain: str) -> list[str]:
     Wirft SPFResolutionError bei fehlendem SPF-Eintrag, einem Zyklus in den
     Includes, oder zu vielen verschachtelten Lookups."""
     budget = _LookupBudget()
-    raw_networks = _resolve(domain, budget, set())
+    raw_networks = _resolve(domain, budget, set(), count_lookup=False)
 
     validated: list[str] = []
     for network in raw_networks:
@@ -267,7 +321,7 @@ def validate_spf(domain: str) -> SPFCheckResult:
     budget = _LookupBudget()
     lookup_limit_ok = True
     try:
-        _resolve(domain, budget, set())
+        _resolve(domain, budget, set(), count_lookup=False)
     except SPFResolutionError as exc:
         lookup_limit_ok = False
         warnings.append(str(exc))

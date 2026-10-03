@@ -61,9 +61,17 @@ def _extract_gz(data: bytes, max_size_bytes: int) -> bytes:
 
 
 def _extract_zip(data: bytes, max_size_bytes: int) -> bytes:
+    # Nicht nur BadZipFile: zipfile dekodiert Dateinamen mit gesetztem
+    # UTF-8-Flag (Bit 11) ohne eigene Fehlerbehandlung, ein Eintrag mit
+    # ungültigen UTF-8-Bytes im Namen wirft daher UnicodeDecodeError (ein
+    # ValueError) - sowohl hier im Konstruktor (zentrales Verzeichnis) als
+    # auch unten in zf.open() (lokaler Header). Dieselbe Begründung wie beim
+    # EOFError/zlib.error in _extract_gz(): alles außer ArchiveError würde in
+    # fetch.py den kompletten Lauf abbrechen, bevor die Nachricht als
+    # verarbeitet markiert ist.
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as exc:
+    except (zipfile.BadZipFile, ValueError, EOFError, OSError) as exc:
         raise ArchiveError(f"Ungültiges ZIP-Archiv: {exc}") from exc
 
     infos = zf.infolist()
@@ -82,7 +90,7 @@ def _extract_zip(data: bytes, max_size_bytes: int) -> bytes:
             return _read_bounded(member, max_size_bytes)
     except ArchiveError:
         raise
-    except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error) as exc:
+    except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error, ValueError, EOFError) as exc:
         raise ArchiveError(f"ZIP-Eintrag konnte nicht gelesen werden: {exc}") from exc
 
 

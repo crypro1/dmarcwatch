@@ -208,7 +208,9 @@ def test_validate_spf_valid_record_no_warnings():
     assert result.exists is True
     assert result.warnings == []
     assert result.lookup_limit_ok is True
-    assert result.lookup_count == 1
+    # Die TXT-Abfrage des eigenen Eintrags zählt laut RFC 7208 4.6.4 nicht
+    # zum Limit - ein Eintrag ohne include/a/mx/... verbraucht 0 Lookups.
+    assert result.lookup_count == 0
 
 
 def test_validate_spf_flags_multiple_records():
@@ -248,3 +250,99 @@ def test_validate_spf_counts_lookups_and_flags_limit_exceeded():
     assert result.exists is True  # der Top-Level-Eintrag selbst existiert ja
     assert result.lookup_limit_ok is False
     assert any("Zu viele verschachtelte SPF-Lookups" in w for w in result.warnings)
+
+
+# --- RFC-7208-Zählweise, Rauten statt Zyklen, SERVFAIL ---
+
+
+def _fake_run_from(responses: dict):
+    def fake_run(cmd, **kwargs):
+        record_type, name = cmd[-2], cmd[-1]
+        return responses.get((record_type, name), _dig_result(""))
+
+    return fake_run
+
+
+def test_validate_spf_exactly_ten_lookups_is_within_rfc_limit():
+    """RFC 7208 erlaubt GENAU 10 DNS-Lookup-Terme - die Abfrage des eigenen
+    Eintrags zählt nicht mit. Früher wurde sie mitgezählt, ein gültiger
+    Eintrag mit 10 includes galt dadurch als Limitüberschreitung."""
+    includes = " ".join(f"include:i{n}.example.net" for n in range(10))
+    responses = {("TXT", "example.com"): _txt(f"v=spf1 {includes} -all")}
+    for n in range(10):
+        responses[("TXT", f"i{n}.example.net")] = _txt(f"v=spf1 ip4:192.0.2.{n} -all")
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_fake_run_from(responses)):
+        result = validate_spf("example.com")
+
+    assert result.lookup_limit_ok is True
+    assert result.lookup_count == 10
+    assert result.warnings == []
+
+
+def test_mx_mechanism_counts_as_single_lookup():
+    """Die Adressabfragen der einzelnen MX-Hosts zählen laut RFC 7208 4.6.4
+    nicht zum Gesamtlimit - "mx" ist EIN Lookup-Term."""
+    responses = {
+        ("TXT", "example.com"): _txt("v=spf1 mx -all"),
+        ("MX", "example.com"): _dig_result("10 mx1.example.com.\n20 mx2.example.com.\n30 mx3.example.com.\n"),
+        ("A", "mx1.example.com"): _dig_result("203.0.113.1\n"),
+        ("A", "mx2.example.com"): _dig_result("203.0.113.2\n"),
+        ("A", "mx3.example.com"): _dig_result("203.0.113.3\n"),
+    }
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_fake_run_from(responses)):
+        result = validate_spf("example.com")
+
+    assert result.lookup_count == 1
+    assert result.lookup_limit_ok is True
+
+
+def test_diamond_include_is_not_reported_as_cycle():
+    """A inkludiert B und C, B inkludiert ebenfalls C - eine Raute, kein
+    Zyklus (z. B. _spf.google.com UND _netblocks.google.com direkt
+    eingetragen). Früher meldete die global geführte "schon gesehen"-Menge
+    das fälschlich als Zyklus und "Aus SPF ermitteln" schlug komplett fehl."""
+    responses = {
+        ("TXT", "example.com"): _txt("v=spf1 include:_spf.google.com include:_netblocks.google.com -all"),
+        ("TXT", "_spf.google.com"): _txt("v=spf1 include:_netblocks.google.com ~all"),
+        ("TXT", "_netblocks.google.com"): _txt("v=spf1 ip4:35.190.247.0/24 ~all"),
+    }
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_fake_run_from(responses)):
+        assert resolve_own_ip_networks("example.com") == ["35.190.247.0/24"]
+        result = validate_spf("example.com")
+
+    assert result.lookup_limit_ok is True
+    assert result.warnings == []
+
+
+def test_validate_spf_servfail_is_reported_as_error_not_as_missing_record():
+    """`dig +short` liefert bei SERVFAIL leeres stdout mit Exit-Code 0, genau
+    wie bei einem fehlenden Eintrag - ohne Statusprüfung sähe ein
+    Resolver-Fehler wie ein entfernter SPF-Eintrag aus."""
+    servfail = _dig_result(";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n")
+
+    def fake_run(cmd, **kwargs):
+        return _dig_result("") if "+short" in cmd else servfail
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        result = validate_spf("example.com")
+
+    assert result.exists is False
+    assert result.error is not None
+    assert "SERVFAIL" in result.error
+
+
+def test_validate_spf_nxdomain_is_still_a_missing_record():
+    nxdomain = _dig_result(";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n")
+
+    def fake_run(cmd, **kwargs):
+        return _dig_result("") if "+short" in cmd else nxdomain
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        result = validate_spf("example.com")
+
+    assert result.exists is False
+    assert result.error is None
+    assert any("Kein SPF-Eintrag" in w for w in result.warnings)

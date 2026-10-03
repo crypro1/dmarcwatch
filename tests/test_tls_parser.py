@@ -328,3 +328,12 @@ def test_real_world_google_report_shape_is_parsed_correctly():
     assert pr.successful_session_count == 4523
     assert pr.failure_count == 2  # vor dem Fix: fälschlich 0
     assert pr.failure_details[0].failed_session_count == 2
+
+
+def test_huge_integer_literal_is_parse_error_not_crash():
+    """Regressionstest: json.loads wirft für eine Ganzzahl mit mehr als 4300
+    Stellen einen schlichten ValueError (kein JSONDecodeError) - der lief
+    bis fetch.py durch und brach jeden künftigen Lauf erneut ab."""
+    raw = _bytes(_sample()).replace(b'"total-successful-session-count": 42', b'"total-successful-session-count": ' + b"1" * 5000)
+    with pytest.raises(TLSReportParseError):
+        parse_tls_report(raw, MAX_SIZE)

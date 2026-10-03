@@ -94,3 +94,13 @@ def test_cname_alias_in_answer_section_not_mistaken_for_return_code():
     assert result.listed is True
     assert result.reasons == ["SBL - bekannte Spam-Quelle"]
     assert not any("some-alias.spamhaus.org" in reason for reason in result.reasons)
+
+
+def test_spamhaus_error_codes_are_errors_not_listings():
+    """127.255.255.x sind laut Spamhaus Fehlercodes (z. B. .254 = Abfrage
+    über einen öffentlichen Resolver), keine Listings - sonst erschiene bei
+    so einem Resolver JEDE IP als gelistet und würde so gecacht."""
+    for code in ("127.255.255.252", "127.255.255.254", "127.255.255.255"):
+        with patch("dmarcwatch.blacklist._dig_checked", return_value=[code]):
+            with pytest.raises(BlacklistCheckError, match="kein Listing"):
+                check_ip_blacklist("192.0.2.1")

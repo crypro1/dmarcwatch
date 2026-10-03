@@ -157,3 +157,12 @@ def test_generic_rule_is_documented_as_spoofable_not_fixed():
     die ohnehin dominierende Identitäts-Kopie (siehe oben) kein
     zusätzlicher Schutz wäre - deshalb bewusst nicht gebaut."""
     assert is_consistent_reporter("AMAZON-SES", "x@amazonses.evil.example") is True
+
+
+def test_config_override_key_in_natural_spelling_is_normalized():
+    """Der Override-Schlüssel ist laut README der org_name - in natürlicher
+    Schreibweise ("Comcast Cable") traf er den intern normalisierten
+    Vergleichswert ("comcastcable") früher nie und blieb still wirkungslos."""
+    overrides = {"Comcast Cable": ("xfinity.example",)}
+    assert is_consistent_reporter("Comcast Cable", "dmarc@reports.xfinity.example", overrides) is True
+    assert is_consistent_reporter("Comcast Cable", "dmarc@unrelated.example", overrides) is False

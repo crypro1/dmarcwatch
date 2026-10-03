@@ -38,10 +38,22 @@ def sanitize_field(value: str, max_len: int = 80) -> str:
     return text
 
 
-def mask_email(address: str) -> str:
-    """Kürzt eine Mailadresse für Logs (4.7: keine vollständigen Mailadressen in Logs)."""
-    if not address or "@" not in address:
+def mask_email(address: object) -> str:
+    """Kürzt eine Mailadresse für Logs (4.7: keine vollständigen Mailadressen in Logs).
+
+    Nimmt bewusst nicht nur str an: email.message.Message.get() liefert unter
+    der compat32-Policy (Default von email.message_from_bytes) für einen
+    Header mit rohen 8-Bit-Bytes (z. B. ein unkodiertes "From: Jörg <...>")
+    ein email.header.Header-Objekt statt eines str - `"@" in header` wirft
+    darauf TypeError, und das in fetch.py, BEVOR die Nachricht als
+    verarbeitet markiert ist (jeder künftige Lauf stürzte erneut daran ab).
+    Surrogates aus der surrogateescape-Dekodierung werden ersetzt, damit
+    das Ergebnis auch sicher in die UTF-8-Logdatei geschrieben werden kann."""
+    if address is None:
         return "***"
-    local, _, domain = address.partition("@")
+    text = str(address).encode("utf-8", errors="replace").decode("utf-8")
+    if not text or "@" not in text:
+        return "***"
+    local, _, domain = text.partition("@")
     local_masked = (local[0] + "***") if local else "***"
     return f"{local_masked}@{domain}"

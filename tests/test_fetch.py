@@ -488,3 +488,46 @@ def test_tls_rpt_folder_not_found_raises_with_hint(tmp_path):
 
     with pytest.raises(FetchError):
         fetch_and_ingest(_tlsrpt_config(), fake_imap, db_conn, logger)
+
+
+def test_raw_8bit_from_header_does_not_abort_run(tmp_path):
+    """Regressionstest: unter der compat32-Policy liefert msg.get("From")
+    für einen Header mit rohen 8-Bit-Bytes ein email.header.Header-Objekt
+    statt str - mask_email() warf darauf TypeError, und zwar BEVOR die
+    Nachricht als verarbeitet markiert war (jeder weitere Lauf stürzte an
+    derselben Nachricht erneut ab)."""
+    good = gzip.compress((FIXTURES / "ses_single_pass.xml").read_bytes())
+    raw = _make_message("report.xml.gz", good).replace(
+        b"From: dmarc-noreply@google.com", b"From: J\xc3\xb6rg <dmarc@reporter.example>"
+    )
+    imap = FakeImap({b"1": raw})
+    conn = connect(tmp_path / "dmarc.sqlite")
+
+    summary = fetch_and_ingest(_config(), imap, conn, logging.getLogger("test"))
+
+    assert summary.reports_inserted == 1
+    assert b"1" in imap.stored_flags
+    conn.close()
+
+
+def test_zip_with_invalid_utf8_filename_is_skipped_and_marked_processed(tmp_path):
+    import io
+    import struct
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("rr.xml", b"<feedback/>")
+    data = bytearray(buf.getvalue())
+    pos = data.find(b"PK\x01\x02")
+    struct.pack_into("<H", data, pos + 8, struct.unpack_from("<H", data, pos + 8)[0] | 0x800)
+    data[pos + 46] = 0xFF
+    data[pos + 47] = 0xFE
+    imap = FakeImap({b"1": _make_message("report.zip", bytes(data))})
+    conn = connect(tmp_path / "dmarc.sqlite")
+
+    summary = fetch_and_ingest(_config(), imap, conn, logging.getLogger("test"))
+
+    assert summary.attachments_skipped == 1
+    assert b"1" in imap.stored_flags
+    conn.close()

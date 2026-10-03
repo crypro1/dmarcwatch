@@ -196,3 +196,26 @@ def test_json_unknown_extension_rejected():
 def test_json_empty_attachment_rejected():
     with pytest.raises(ArchiveError):
         extract_report_json("empty.json", b"", MAX_ATTACHMENT, MAX_JSON)
+
+
+def test_zip_with_invalid_utf8_filename_raises_archive_error():
+    """Regressionstest: ein ZIP-Eintrag mit gesetztem UTF-8-Flag, aber
+    ungültigen UTF-8-Bytes im Namen ließ zipfile einen UnicodeDecodeError
+    werfen - kein ArchiveError, also brach fetch.py den ganzen Lauf ab, bevor
+    die Nachricht als verarbeitet markiert war (bei jedem weiteren Lauf
+    erneut)."""
+    import struct
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("rr.xml", b"<feedback/>")
+    data = bytearray(buf.getvalue())
+    for signature, name_offset, flag_offset in ((b"PK\x01\x02", 46, 8), (b"PK\x03\x04", 30, 6)):
+        pos = data.find(signature)
+        flags = struct.unpack_from("<H", data, pos + flag_offset)[0]
+        struct.pack_into("<H", data, pos + flag_offset, flags | 0x800)
+        data[pos + name_offset] = 0xFF
+        data[pos + name_offset + 1] = 0xFE
+
+    with pytest.raises(ArchiveError):
+        extract_report_xml("report.zip", bytes(data), MAX_ATTACHMENT, MAX_XML)

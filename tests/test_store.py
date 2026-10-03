@@ -255,3 +255,18 @@ def test_tls_report_mixed_domains_keeps_only_own(tmp_path):
     rows = query_tls_policies(conn, since_ts=0, until_ts=2_000_000_000)
     assert len(rows) == 1
     assert rows[0]["policy_domain"] == "example.com"
+
+
+def test_get_known_dkim_selectors_skips_selectors_that_are_not_dns_names(tmp_path):
+    """Der Selektor stammt aus unauthentifiziertem Report-XML und landet als
+    dig-Argument in check_dkim() - "+tcp", "-f..." oder "@server" würde dig
+    als Option bzw. Server-Angabe interpretieren."""
+    xml = (FIXTURES / "microsoft_two_records.xml").read_text(encoding="utf-8")
+    assert "<selector>default</selector>" in xml
+    for n, bad in enumerate(["+tcp", "-f/etc/passwd", "@198.51.100.7", "a b"]):
+        forged = xml.replace("<selector>default</selector>", f"<selector>{bad}</selector>")
+        forged = forged.replace("<report_id>", f"<report_id>forged-{n}-", 1)
+        conn = connect(tmp_path / f"dmarc-{n}.sqlite")
+        ingest_report(conn, parse_aggregate_report(forged.encode("utf-8"), MAX_SIZE), _config())
+        assert get_known_dkim_selectors(conn, "example.com") == []
+        conn.close()

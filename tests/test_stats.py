@@ -995,3 +995,18 @@ def test_to_stats_json_dict_sanitizes_spoofed_identity_fields():
     assert data["spoofed_identities"][0]["header_from"] == "evil.example"
     assert "\x07" not in data["spoofed_identities"][0]["reporters"][0]
     assert data["spoofed_identities"][0]["reporters"][0] == "Reporter A"
+
+
+def test_collect_daily_stats_blocked_count_ignores_foreign_header_from_rows():
+    """Ein "reject" für ein header_from, das gar nicht zur eigenen Domain
+    gehört (REASON_FOREIGN_HEADER_FROM), stammt nicht von der EIGENEN Policy
+    - typischerweise ein gefälschter Report, der sonst mit einem beliebig
+    hohen count die angezeigte Wirkung der eigenen Policy aufbläht."""
+    rows = [
+        _row(DAY1, is_flagged=True, disposition="reject", count=5, flag_reasons=["disposition_not_none"]),
+        _row(
+            DAY1, is_flagged=True, disposition="reject", count=9_999_999, header_from="paypal.com",
+            flag_reasons=["disposition_not_none", REASON_FOREIGN_HEADER_FROM],
+        ),
+    ]
+    assert collect_daily_stats(rows)[0].blocked_count == 5
