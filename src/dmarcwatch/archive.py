@@ -12,7 +12,18 @@ import io
 import zipfile
 import zlib
 
+try:
+    import lzma
+except ImportError:  # Python ohne liblzma: zipfile wirft dann NotImplementedError (ein RuntimeError)
+    lzma = None
+
 _CHUNK_SIZE = 64 * 1024
+
+# lzma.LZMAError erbt direkt von Exception (weder OSError noch ValueError) -
+# ein ZIP-Eintrag mit Kompressionsmethode 14 (LZMA) und kaputten Daten oder
+# Filter-Eigenschaften würde sonst an jedem except unten vorbei bis fetch.py
+# durchschlagen, siehe _extract_zip().
+_LZMA_ERRORS: tuple[type[Exception], ...] = (lzma.LZMAError,) if lzma is not None else ()
 
 
 class ArchiveError(ValueError):
@@ -90,7 +101,7 @@ def _extract_zip(data: bytes, max_size_bytes: int) -> bytes:
             return _read_bounded(member, max_size_bytes)
     except ArchiveError:
         raise
-    except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error, ValueError, EOFError) as exc:
+    except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error, ValueError, EOFError, *_LZMA_ERRORS) as exc:
         raise ArchiveError(f"ZIP-Eintrag konnte nicht gelesen werden: {exc}") from exc
 
 

@@ -219,3 +219,30 @@ def test_zip_with_invalid_utf8_filename_raises_archive_error():
 
     with pytest.raises(ArchiveError):
         extract_report_xml("report.zip", bytes(data), MAX_ATTACHMENT, MAX_XML)
+
+
+@pytest.mark.parametrize("corrupt", ["properties", "stream"])
+def test_zip_with_corrupt_lzma_entry_raises_archive_error(corrupt):
+    """Regressionstest: lzma.LZMAError erbt weder von OSError noch von
+    ValueError - ein LZMA-komprimierter ZIP-Eintrag (Methode 14) mit kaputten
+    Daten schlug sonst bis fetch.py durch und brach jeden künftigen Lauf an
+    derselben Nachricht erneut ab."""
+    import struct
+
+    pytest.importorskip("lzma")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_LZMA) as zf:
+        zf.writestr("rr.xml", bytes(range(256)) * 50)
+    data = bytearray(buf.getvalue())
+    pos = data.find(b"PK\x03\x04")
+    comp_size = struct.unpack_from("<I", data, pos + 18)[0]
+    name_len, extra_len = struct.unpack_from("<HH", data, pos + 26)
+    payload = pos + 30 + name_len + extra_len
+    if corrupt == "properties":
+        data[payload + 4] = 0xFF  # ungültiges lc/lp/pb-Byte
+    else:
+        for i in range(payload + 9, payload + min(comp_size, 60)):
+            data[i] ^= 0xA5
+
+    with pytest.raises(ArchiveError):
+        extract_report_xml("report.zip", bytes(data), MAX_ATTACHMENT, MAX_XML)

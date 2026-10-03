@@ -380,3 +380,71 @@ def test_validate_spf_nxdomain_is_still_a_missing_record():
     assert result.exists is False
     assert result.error is None
     assert any("Kein SPF-Eintrag" in w for w in result.warnings)
+
+
+# --- Regressionen der dig_command()-Härtung ---
+
+
+def test_wildcard_name_is_a_valid_query_name():
+    """check_wildcard_spf() fragt `*.<domain>` ab - ein "*" als erstes Label
+    darf nicht als ungültiger Name verweigert werden."""
+    assert dig_command("TXT", "*.example.com", "+short")[-1] == "*.example.com"
+    for bad in ("a.*.example.com", "*", "**.example.com"):
+        with pytest.raises(SPFResolutionError):
+            dig_command("TXT", bad)
+
+
+def test_a_mechanism_with_cidr_suffix_does_not_abort_resolution():
+    """`a:host/28` ist gültiges SPF - "host/28" als DNS-Name verweigerte
+    dig_command() früher, die ganze Auflösung brach ab ("Aus SPF ermitteln"
+    schlug fehl, verify-dns meldete das Lookup-Limit als verletzt)."""
+    responses = {
+        ("TXT", "example.com"): _txt("v=spf1 a:mail.example.com/28 mx:example.com/24 ip4:192.0.2.1 -all"),
+        ("A", "mail.example.com"): _dig_result("203.0.113.5\n"),
+        ("MX", "example.com"): _dig_result("10 mx1.example.com.\n"),
+        ("A", "mx1.example.com"): _dig_result("203.0.113.9\n"),
+    }
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_fake_run_from(responses)):
+        networks = resolve_own_ip_networks("example.com")
+        result = validate_spf("example.com")
+
+    assert networks == ["192.0.2.1/32", "203.0.113.5/32", "203.0.113.9/32"]
+    assert result.lookup_limit_ok is True
+    assert result.warnings == []
+
+
+def test_null_mx_under_mx_mechanism_does_not_abort_resolution():
+    """Null-MX ("0 .", RFC 7505) ergab früher einen leeren Hostnamen, den
+    dig_command() verweigerte - die ganze SPF-Auswertung schlug fehl."""
+    responses = {
+        ("TXT", "example.com"): _txt("v=spf1 mx ip4:192.0.2.1 -all"),
+        ("MX", "example.com"): _dig_result("0 .\n"),
+    }
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_fake_run_from(responses)):
+        result = validate_spf("example.com")
+
+    assert result.lookup_limit_ok is True
+    assert result.warnings == []
+
+
+def test_empty_short_answer_contradicted_by_full_answer_is_an_error():
+    """Erste (+short-)Abfrage leer (z. B. vorübergehender SERVFAIL), die
+    Wiederholung liefert den Eintrag doch - das darf nicht als "kein
+    Eintrag" durchgehen (sonst falsches "entfernt" in der
+    Änderungserkennung)."""
+    full = _dig_result(
+        ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n\n"
+        ";; ANSWER SECTION:\n"
+        'example.com.\t300\tIN\tTXT\t"v=spf1 -all"\n\n'
+    )
+
+    def fake_run(cmd, **kwargs):
+        return _dig_result("") if "+short" in cmd else full
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        result = validate_spf("example.com")
+
+    assert result.exists is False
+    assert result.error is not None

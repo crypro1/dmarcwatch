@@ -33,13 +33,16 @@ class SPFResolutionError(RuntimeError):
 
 
 # Syntaktisch gültiger DNS-Name (Labels aus Buchstaben, Ziffern, "_" und
-# "-", Label beginnt nie mit "-"), optional mit abschließendem Punkt. Die
-# abgefragten Namen stammen teils aus unauthentifizierten Quellen (SPF-
-# include/redirect/a/mx-Ziele und MX-Antworten aus fremden DNS-Zonen,
-# DKIM-Selektoren aus Report-XML) - ein Wert wie "+tcp", "-f/etc/x" oder
-# "@server" würde von dig sonst als Option bzw. Server-Angabe gelesen.
+# "-", Label beginnt nie mit "-"), optional mit abschließendem Punkt und
+# optional mit "*" als ERSTEM Label (Wildcard nach RFC 4592, für
+# dns_verify.check_wildcard_spf - "*" kann dig weder als Option noch als
+# Server-Angabe lesen). Die abgefragten Namen stammen teils aus
+# unauthentifizierten Quellen (SPF-include/redirect/a/mx-Ziele und
+# MX-Antworten aus fremden DNS-Zonen, DKIM-Selektoren aus Report-XML) - ein
+# Wert wie "+tcp", "-f/etc/x" oder "@server" würde von dig sonst als Option
+# bzw. Server-Angabe gelesen.
 _DNS_NAME_RE = re.compile(
-    r"(?=.{1,253}\.?$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,62})?"
+    r"(?=.{1,253}\.?$)(?:\*\.)?[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,62})?"
     r"(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,62})?)*\.?"
 )
 
@@ -105,6 +108,25 @@ def _response_status(dig_stdout: str) -> str | None:
     return None
 
 
+def _answer_rdata(dig_stdout: str, record_type: str) -> list[str]:
+    """RDATA aller Einträge vom Typ record_type aus dem ANSWER-Abschnitt
+    einer vollen dig-Ausgabe - CNAME-Zwischenschritte einer Alias-Kette
+    (eigene Zeilen mit Typ CNAME) werden dabei übersprungen."""
+    answers: list[str] = []
+    in_answer_section = False
+    for line in dig_stdout.splitlines():
+        if line.startswith(";; ANSWER SECTION:"):
+            in_answer_section = True
+        elif in_answer_section:
+            if not line.strip() or line.startswith(";;"):
+                in_answer_section = False
+            else:
+                fields = line.split(None, 4)
+                if len(fields) == 5 and fields[3] == record_type:
+                    answers.append(fields[4].strip())
+    return answers
+
+
 def _raise_on_resolution_failure(record_type: str, name: str) -> None:
     """Für einen LEEREN `dig +short`-Befund: prüft per zweiter, voller
     Abfrage, ob das wirklich "kein Eintrag" (NOERROR/NXDOMAIN) war oder ein
@@ -114,11 +136,21 @@ def _raise_on_resolution_failure(record_type: str, name: str) -> None:
     Entfernen des Eintrags (falscher "DMARC-Policy geschwächt"-Alarm und eine
     verfälschte Baseline in dns_verify.diff_and_update_snapshot()).
 
-    Wirft SPFResolutionError bei einem Status außer NOERROR/NXDOMAIN; eine
-    Ausgabe ohne Header-Zeile gilt nicht als Fehler."""
-    status = _response_status(_dig_full(record_type, name))
+    Wirft SPFResolutionError bei einem Status außer NOERROR/NXDOMAIN - und
+    ebenso, wenn die zweite Abfrage doch Einträge des gesuchten Typs liefert:
+    dann war die erste, leere Antwort selbst der vorübergehende Fehler (z. B.
+    ein SERVFAIL, den der Resolver inzwischen aus dem Cache oder über eine
+    andere Anycast-Instanz beantwortet), und "kein Eintrag" wäre falsch.
+    Eine Ausgabe ohne Header-Zeile gilt nicht als Fehler."""
+    stdout = _dig_full(record_type, name)
+    status = _response_status(stdout)
     if status is not None and status not in ("NOERROR", "NXDOMAIN"):
         raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): Status {status}")
+    if _answer_rdata(stdout, record_type):
+        raise SPFResolutionError(
+            f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): widersprüchliche Antworten "
+            "(erste Abfrage leer, Wiederholung mit Eintrag)"
+        )
 
 
 def _dig_checked(record_type: str, name: str) -> list[str]:
@@ -134,27 +166,15 @@ def _dig_checked(record_type: str, name: str) -> list[str]:
     stdout = _dig_full(record_type, name)
 
     status = _response_status(stdout) or "SERVFAIL"
-    answers: list[str] = []
-    in_answer_section = False
-    for line in stdout.splitlines():
-        if line.startswith(";; ANSWER SECTION:"):
-            in_answer_section = True
-        elif in_answer_section:
-            if not line.strip() or line.startswith(";;"):
-                in_answer_section = False
-            else:
-                fields = line.split()
-                if len(fields) >= 5 and fields[3] == "A":
-                    answers.append(fields[-1])
-
     if status not in ("NOERROR", "NXDOMAIN"):
         raise SPFResolutionError(f"DNS-Abfrage fehlgeschlagen ({record_type} {name}): Status {status}")
-    return answers
+    return _answer_rdata(stdout, record_type)
 
 
 def _txt_records(domain: str) -> list[str]:
+    lines = _dig("TXT", domain)
     records = []
-    for line in _dig("TXT", domain):
+    for line in lines:
         # dig gibt jedes Character-String eines TXT-Eintrags in
         # Anführungszeichen aus, mehrere direkt hintereinander, falls der
         # Text über 255 Byte lang war (`"teil1" "teil2"`) - zusammenfügen.
@@ -162,7 +182,10 @@ def _txt_records(domain: str) -> list[str]:
         content = "".join(parts[i] for i in range(1, len(parts), 2))
         if content:
             records.append(content)
-    if not records:
+    # Nur bei gar keiner TXT-Zeile nachprüfen (wie check_dkim()): ein
+    # vorhandener, aber leerer Eintrag ("") ist eine echte Antwort, kein
+    # Kandidat für einen verschluckten Auflösungsfehler.
+    if not any('"' in line for line in lines):
         _raise_on_resolution_failure("TXT", domain)
     return records
 
@@ -204,6 +227,18 @@ class _LookupBudget:
         return self._used
 
 
+def _mechanism_target(token: str, domain: str) -> str:
+    """Zielname eines a-/mx-Mechanismus ("a", "a:host", "a:host/24",
+    "mx:host/24//64"). Ein CIDR-Längen-Modifikator wird abgeschnitten statt
+    mit abgefragt: "host/24" ist kein DNS-Name, dig_command() würde ihn
+    verweigern und damit die gesamte Auflösung abbrechen. Übernommen werden
+    dann nur die Adressen des Hosts selbst (eine Teilmenge des eigentlich
+    erlaubten Netzes, siehe Kommentar zu den nicht behandelten Modifikatoren
+    in _resolve)."""
+    target = token.split(":", 1)[1] if ":" in token else domain
+    return target.split("/", 1)[0]
+
+
 def _resolve(domain: str, budget: _LookupBudget, path: set[str], count_lookup: bool = True) -> set[str]:
     """path enthält nur die Domains auf dem AKTUELLEN Rekursionspfad (wird
     beim Verlassen wieder entfernt), nicht jede je besuchte Domain - eine
@@ -242,11 +277,11 @@ def _resolve(domain: str, budget: _LookupBudget, path: set[str], count_lookup: b
             elif low.startswith("include:"):
                 networks |= _resolve(token[len("include:"):], budget, path)
             elif low == "a" or low.startswith("a:"):
-                target = token.split(":", 1)[1] if ":" in token else domain
+                target = _mechanism_target(token, domain)
                 budget.spend(target)
                 networks |= _resolve_host_to_networks(target)
             elif low == "mx" or low.startswith("mx:"):
-                target = token.split(":", 1)[1] if ":" in token else domain
+                target = _mechanism_target(token, domain)
                 # Der mx-Mechanismus zählt als EIN Lookup - die
                 # Adressabfragen der einzelnen MX-Hosts zählen laut RFC 7208
                 # 4.6.4 nicht zum Gesamtlimit, haben aber ein eigenes Limit
@@ -257,7 +292,12 @@ def _resolve(domain: str, budget: _LookupBudget, path: set[str], count_lookup: b
                     mx_parts = mx_line.split()
                     if len(mx_parts) < 2:
                         continue
-                    mx_hosts.append(mx_parts[1].rstrip("."))
+                    # Null-MX ("0 .", RFC 7505) hat keinen Host - "" würde
+                    # dig_command() als ungültigen Namen verweigern und damit
+                    # die ganze Auflösung abbrechen.
+                    mx_host = mx_parts[1].rstrip(".")
+                    if mx_host:
+                        mx_hosts.append(mx_host)
                 if len(mx_hosts) > MAX_DNS_LOOKUPS:
                     raise SPFResolutionError(
                         f"'mx' für {target!r} liefert {len(mx_hosts)} MX-Hosts, mehr als die "
@@ -268,9 +308,11 @@ def _resolve(domain: str, budget: _LookupBudget, path: set[str], count_lookup: b
             elif low.startswith("redirect="):
                 redirect_target = token[len("redirect="):]
             # Bewusst nicht behandelt: CIDR-Längen-Modifikatoren wie "a/24" oder
-            # "mx/24" (selten), "ptr" (von RFC 7208 selbst als veraltet
-            # markiert) und "exists:" (liefert keine IP-Menge, nur einen
-            # Wahrheitswert) - werden übersprungen, nicht als Fehler behandelt.
+            # "mx/24" (selten; bei "a:host/24" wird nur der Modifikator
+            # verworfen, siehe _mechanism_target), "ptr" (von RFC 7208 selbst
+            # als veraltet markiert) und "exists:" (liefert keine IP-Menge, nur
+            # einen Wahrheitswert) - werden übersprungen, nicht als Fehler
+            # behandelt.
 
         if redirect_target:
             networks |= _resolve(redirect_target, budget, path)

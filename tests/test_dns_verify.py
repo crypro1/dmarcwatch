@@ -1166,3 +1166,108 @@ def test_check_dane_mx_lookup_failure_sets_error():
         result = check_dane("example.com")
     assert result.configured is False
     assert result.error is not None
+
+
+# --- Regressionen: Wildcard-Abfrage, widersprüchliche Antworten, DKIM pro Selektor ---
+
+
+def test_check_wildcard_spf_actually_queries_wildcard_name():
+    """Regressionstest: dig_command() verweigerte `*.<domain>` als
+    ungültigen Namen, check_wildcard_spf() meldete dadurch IMMER "nicht
+    konfiguriert" - auch einen zu offenen Wildcard-Eintrag (+all)."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _txt("v=spf1 +all")
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        result = check_wildcard_spf("example.com")
+
+    assert any(cmd[cmd.index("-q") + 1] == "*.example.com" for cmd in calls)
+    assert result.configured is True
+    assert any("-all" in w for w in result.warnings)
+
+
+def test_check_dmarc_contradicting_retry_is_error_not_missing_record():
+    full = _dig_result(
+        ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n\n"
+        ";; ANSWER SECTION:\n"
+        '_dmarc.example.com.\t300\tIN\tTXT\t"v=DMARC1; p=reject"\n\n'
+    )
+
+    def fake_run(cmd, **kwargs):
+        return _dig_result("") if "+short" in cmd else full
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        result = check_dmarc("example.com")
+
+    assert result.exists is False
+    assert result.error is not None
+
+
+def test_dkim_selector_dropping_out_of_window_is_not_reported_as_removal(tmp_path):
+    """Ein Selektor, der nur aus dem Zeitfenster von get_known_dkim_selectors()
+    fällt (also gar nicht mehr abgefragt wird), ist kein "entfernt" - sonst
+    meldete jeder selten genutzte Selektor regelmäßig eine DNS-Änderung."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dkim = [
+        DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="aa"),
+        DKIMCheckResult(selector="news", exists=True, key_type="rsa", key_fingerprint="bb"),
+    ]
+    diff_and_update_snapshot(conn, baseline)
+
+    aged = _clean_result()
+    aged.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="aa")]
+    assert diff_and_update_snapshot(conn, aged).changes == []
+    # Kommt der Selektor zurück (unverändert), ist das ebenfalls keine Änderung.
+    assert diff_and_update_snapshot(conn, baseline).changes == []
+    conn.close()
+
+
+def test_checked_but_missing_dkim_selector_is_still_reported_as_removal(tmp_path):
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="aa")]
+    diff_and_update_snapshot(conn, baseline)
+
+    gone = _clean_result()
+    gone.dkim = [DKIMCheckResult(selector="default", exists=False)]
+    assert any("DKIM-Selektoren" in c for c in diff_and_update_snapshot(conn, gone).changes)
+    conn.close()
+
+
+def test_one_failing_dkim_selector_does_not_hide_changes_of_another(tmp_path):
+    """Früher wurde bei einem einzigen Lookup-Fehler die ganze Selektorliste
+    übernommen - ein dauerhaft fehlschlagender Selektor legte so die
+    Erkennung einer Schlüsselrotation bei allen anderen still."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dkim = [
+        DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="aa"),
+        DKIMCheckResult(selector="broken", exists=True, key_type="rsa", key_fingerprint="bb"),
+    ]
+    diff_and_update_snapshot(conn, baseline)
+
+    rotated = _clean_result()
+    rotated.dkim = [
+        DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="cc"),
+        DKIMCheckResult(selector="broken", exists=False, error="timeout"),
+    ]
+    dkim_changes = [c for c in diff_and_update_snapshot(conn, rotated).changes if c.startswith("DKIM-Selektoren")]
+    assert len(dkim_changes) == 1
+    old_side, new_side = dkim_changes[0].split(" -> ")
+    assert "default:rsa:aa" in old_side and "default:rsa:cc" in new_side
+    # Der fehlgeschlagene Selektor wird übernommen, nicht als entfernt gemeldet.
+    assert "broken:rsa:bb" in old_side and "broken:rsa:bb" in new_side
+    conn.close()
+
+
+def test_check_dane_mx_servfail_sets_error():
+    """`dig +short MX` ist bei SERVFAIL leer wie bei "kein MX" - ohne
+    Nachprüfung meldete die Änderungserkennung die TLSA-Hosts als entfernt."""
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_servfail_run):
+        result = check_dane("example.com")
+    assert result.configured is False
+    assert result.error is not None

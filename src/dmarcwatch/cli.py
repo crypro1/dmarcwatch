@@ -200,7 +200,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # load_config() mit einem Traceback ab.
     try:
         config = Config.from_dict(raw_config)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, AttributeError) as exc:
+        # AttributeError: z. B. eine Zahl statt eines Strings in own_domains
+        # aus dem Setup-Fenster (Config.__post_init__ ruft .strip() auf).
         print(f"Fehler in der Konfiguration: {exc}", file=sys.stderr)
         return 1
     if config_changed:
@@ -390,7 +392,24 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 days_since = (date.today() - last_date).days
             except ValueError:
                 days_since = None
-        due = last_check is None or days_since is None or days_since >= config.auto_dns_check_interval_days
+        # Auch fällig, wenn eine eigene Domain im gespeicherten Stand fehlt
+        # (neu konfiguriert, oder der Stand stammt nur aus einem
+        # `verify-dns <eigene-domain>` ohne vorherigen Gesamtlauf, siehe
+        # _run_dns_check_and_persist) - sonst bliebe sie bis zu
+        # auto_dns_check_interval_days ungeprüft und unsichtbar.
+        stored_domains = last_check.get("domains") if last_check else None
+        checked_keys = (
+            {_domain_key(e.get("domain")) for e in stored_domains if isinstance(e, dict)}
+            if isinstance(stored_domains, list)
+            else set()
+        )
+        missing_domain = any(_domain_key(d) not in checked_keys for d in config.own_domains if d.strip())
+        due = (
+            last_check is None
+            or days_since is None
+            or days_since >= config.auto_dns_check_interval_days
+            or missing_domain
+        )
         if due:
             dns_results = _run_dns_check_and_persist(list(config.own_domains))
             warned_domains = [r.domain for r, c in dns_results if has_warnings(r)]
@@ -998,7 +1017,17 @@ def _verification_to_dict(result: DomainVerification) -> dict:
     }
 
 
-def _run_dns_check_and_persist(domains: list[str]) -> list[tuple[DomainVerification, DNSChangeResult]]:
+def _domain_key(domain: object) -> str | None:
+    """Vergleichsschlüssel für Domains in last_dns_check.json - wie
+    Config.is_own_domain() normalisiert."""
+    if not isinstance(domain, str):
+        return None
+    return domain.strip().lower().rstrip(".")
+
+
+def _run_dns_check_and_persist(
+    domains: list[str], menubar_mode: str = "replace"
+) -> list[tuple[DomainVerification, DNSChangeResult]]:
     """Führt verify_domain() für alle domains aus, vergleicht das Ergebnis
     gegen den zuletzt gespeicherten DNS-Schnappschuss (siehe
     dns_verify.diff_and_update_snapshot) und speichert das Ergebnis
@@ -1006,7 +1035,22 @@ def _run_dns_check_and_persist(domains: list[str]) -> list[tuple[DomainVerificat
     von cmd_verify_dns (Klick auf "DNS prüfen…" oder Terminal-Aufruf) UND
     vom periodischen automatischen Check in cmd_fetch genutzt, damit die
     Menüleisten-App unabhängig vom Auslöser immer den letzten bekannten
-    Stand anzeigen kann, ohne selbst eine DNS-Abfrage zu machen."""
+    Stand anzeigen kann, ohne selbst eine DNS-Abfrage zu machen.
+
+    menubar_mode steuert last_dns_check.json, der Schnappschuss-Vergleich
+    läuft in jedem Modus (die Änderungserkennung pro Domain bleibt also
+    vollständig erhalten):
+    - "replace": Lauf über alle eigenen Domains, ersetzt die Datei.
+    - "merge": `verify-dns <eigene-domain>` - ersetzt nur den Eintrag dieser
+      Domain und lässt checked_at stehen. Ohne das ginge eine dabei
+      gefundene Änderung (z. B. geschwächte Policy) verloren: der
+      Schnappschuss ist danach schon aktualisiert, der nächste vollständige
+      Lauf sähe keinen Unterschied mehr, die Menüleiste nie die Warnung.
+    - "none": `verify-dns <fremde-domain>` - Datei bleibt unangetastet. Sie
+      beschreibt den Stand der eigenen Domains, und ihr checked_at steuert
+      den automatischen Check in cmd_fetch: eine fremde Domain würde sonst
+      die eigenen aus der Anzeige verdrängen und den nächsten automatischen
+      Check um bis zu auto_dns_check_interval_days verschieben."""
     db_conn = connect(db_path())
     try:
         results = [verify_domain(db_conn, domain) for domain in domains]
@@ -1014,15 +1058,44 @@ def _run_dns_check_and_persist(domains: list[str]) -> list[tuple[DomainVerificat
     finally:
         db_conn.close()
 
-    write_dns_check_result(
-        {
-            "checked_at": time.strftime("%Y-%m-%d"),
-            "domains": [
-                {**_verification_to_dict(r), "has_warnings": has_warnings(r), **_dns_change_to_dict(c)}
-                for r, c in zip(results, changes)
-            ],
-        }
-    )
+    if menubar_mode == "none":
+        return list(zip(results, changes))
+
+    entries = [
+        {**_verification_to_dict(r), "has_warnings": has_warnings(r), **_dns_change_to_dict(c)}
+        for r, c in zip(results, changes)
+    ]
+    checked_at = time.strftime("%Y-%m-%d")
+    if menubar_mode == "merge":
+        existing = read_dns_check_result()
+        if (
+            isinstance(existing, dict)
+            and isinstance(existing.get("checked_at"), str)
+            and isinstance(existing.get("domains"), list)
+        ):
+            # Eintrag an seiner bisherigen Stelle ersetzen (stabile
+            # Reihenfolge in der Menüleiste), Domains normalisiert
+            # vergleichen (Groß-/Kleinschreibung, abschließender Punkt) und
+            # Nicht-Dict-Müll verwerfen - die Menüleisten-App dekodiert die
+            # Liste strikt und verwürfe sonst den ganzen DNS-Stand.
+            fresh = {_domain_key(e["domain"]): e for e in entries}
+            merged: list[dict] = []
+            placed: set[str] = set()
+            for old_entry in existing["domains"]:
+                if not isinstance(old_entry, dict):
+                    continue
+                key = _domain_key(old_entry.get("domain"))
+                if key in fresh:
+                    if key not in placed:
+                        merged.append(fresh[key])
+                        placed.add(key)
+                else:
+                    merged.append(old_entry)
+            merged.extend(e for key, e in fresh.items() if key not in placed)
+            entries = merged
+            checked_at = existing["checked_at"]
+
+    write_dns_check_result({"checked_at": checked_at, "domains": entries})
     return list(zip(results, changes))
 
 
@@ -1033,7 +1106,22 @@ def cmd_verify_dns(args: argparse.Namespace) -> int:
     periodisch automatisch über `fetch`, wenn `enable_auto_dns_check`
     aktiv ist (einmalige Zustimmung per Checkbox, siehe cmd_fetch)."""
     if args.domain:
-        domains = [args.domain]
+        try:
+            own_domains = list(load_config().own_domains)
+        except (OSError, ValueError, TypeError, AttributeError):
+            own_domains = []
+        # Eine eigene Domain unter der Schreibweise aus der Konfiguration
+        # prüfen (wie der Lauf ohne Argument): sonst landete
+        # `verify-dns Example.com.` unter einem eigenen Schnappschuss-Schlüssel
+        # (ohne Baseline) und als zweiter Eintrag in der Menüleiste.
+        wanted = _domain_key(args.domain)
+        own_match = next((d for d in own_domains if d.strip() and _domain_key(d) == wanted), None)
+        if own_match is not None:
+            domains = [own_match]
+            menubar_mode = "merge"
+        else:
+            domains = [args.domain]
+            menubar_mode = "none"
     else:
         config = load_config()
         domains = list(config.own_domains)
@@ -1043,8 +1131,9 @@ def cmd_verify_dns(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        menubar_mode = "replace"
 
-    results = _run_dns_check_and_persist(domains)
+    results = _run_dns_check_and_persist(domains, menubar_mode=menubar_mode)
 
     if args.json:
         json.dump(

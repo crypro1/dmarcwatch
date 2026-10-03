@@ -276,11 +276,28 @@ def test_auto_dns_check_skips_when_recently_checked(tmp_path, monkeypatch):
         "enable_auto_dns_check": True,
         "auto_dns_check_interval_days": 7,
     })
-    write_dns_check_result({"checked_at": time.strftime("%Y-%m-%d"), "domains": []})
+    write_dns_check_result({"checked_at": time.strftime("%Y-%m-%d"), "domains": [{"domain": "example.com"}]})
 
     _, mock_verify, _ = _run_fetch_with_dns_mocks(tmp_path, monkeypatch, _clean_dns_result("example.com"))
 
     mock_verify.assert_not_called()
+
+
+def test_auto_dns_check_runs_when_own_domain_missing_from_stored_state(tmp_path, monkeypatch):
+    """Ein Stand von heute, der nur eine der eigenen Domains enthält (z. B.
+    aus `verify-dns example.com` ohne vorherigen Gesamtlauf), darf den
+    automatischen Check für die übrigen nicht aufschieben."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({
+        "own_domains": ["example.com", "example.org"],
+        "enable_auto_dns_check": True,
+        "auto_dns_check_interval_days": 7,
+    })
+    write_dns_check_result({"checked_at": time.strftime("%Y-%m-%d"), "domains": [{"domain": "example.com"}]})
+
+    _, mock_verify, _ = _run_fetch_with_dns_mocks(tmp_path, monkeypatch, _clean_dns_result("example.com"))
+
+    assert mock_verify.call_count == 2
 
 
 def test_auto_dns_check_runs_again_after_interval_elapsed(tmp_path, monkeypatch):

@@ -129,6 +129,10 @@ def test_unknown_ip_is_flagged(tmp_path):
     assert rows[0]["flag_reasons"] == "unknown_ip"
 
 
+# Kurz nach dem date_end (1700186399) von microsoft_two_records.xml.
+_FIXTURE_NOW = 1_700_200_000
+
+
 def test_get_known_dkim_selectors_reads_real_selectors_from_reports(tmp_path):
     """Für `dmarcwatch verify-dns` (dns_verify.py): Selektoren werden aus
     bereits abgerufenen, echten Reports gelesen statt geraten."""
@@ -136,7 +140,7 @@ def test_get_known_dkim_selectors_reads_real_selectors_from_reports(tmp_path):
     config = _config()
     ingest_report(conn, _load("microsoft_two_records.xml"), config)
 
-    selectors = get_known_dkim_selectors(conn, "example.com")
+    selectors = get_known_dkim_selectors(conn, "example.com", now=_FIXTURE_NOW)
     assert selectors == ["default"]
 
 
@@ -145,7 +149,7 @@ def test_get_known_dkim_selectors_empty_for_unknown_domain(tmp_path):
     config = _config()
     ingest_report(conn, _load("microsoft_two_records.xml"), config)
 
-    assert get_known_dkim_selectors(conn, "never-seen.example") == []
+    assert get_known_dkim_selectors(conn, "never-seen.example", now=_FIXTURE_NOW) == []
 
 
 def test_injection_field_stored_verbatim_and_flagged(tmp_path):
@@ -263,10 +267,82 @@ def test_get_known_dkim_selectors_skips_selectors_that_are_not_dns_names(tmp_pat
     als Option bzw. Server-Angabe interpretieren."""
     xml = (FIXTURES / "microsoft_two_records.xml").read_text(encoding="utf-8")
     assert "<selector>default</selector>" in xml
-    for n, bad in enumerate(["+tcp", "-f/etc/passwd", "@198.51.100.7", "a b"]):
+    for n, bad in enumerate(["+tcp", "-f/etc/passwd", "@198.51.100.7", "a b", "*", "*.sel"]):
         forged = xml.replace("<selector>default</selector>", f"<selector>{bad}</selector>")
         forged = forged.replace("<report_id>", f"<report_id>forged-{n}-", 1)
         conn = connect(tmp_path / f"dmarc-{n}.sqlite")
         ingest_report(conn, parse_aggregate_report(forged.encode("utf-8"), MAX_SIZE), _config())
-        assert get_known_dkim_selectors(conn, "example.com") == []
+        assert get_known_dkim_selectors(conn, "example.com", now=_FIXTURE_NOW) == []
         conn.close()
+
+
+def test_get_known_dkim_selectors_ignores_reports_older_than_window(tmp_path):
+    """Ein nach einer Schlüsselrotation stillgelegter Selektor darf nicht
+    für immer bei jeder Prüfung als "NICHT gefunden" warnen."""
+    conn = connect(tmp_path / "dmarc.sqlite")
+    ingest_report(conn, _load("microsoft_two_records.xml"), _config())
+
+    assert get_known_dkim_selectors(conn, "example.com", now=_FIXTURE_NOW + 29 * 86400) == ["default"]
+    assert get_known_dkim_selectors(conn, "example.com", now=_FIXTURE_NOW + 31 * 86400) == []
+
+
+def test_get_known_dkim_selectors_ignores_failed_signatures(tmp_path):
+    """Ein Selektor, dessen DKIM-Prüfung fehlschlug (z. B. Fremdsignatur
+    oder erfundener Selektor), wird nicht gegen das DNS geprüft."""
+    xml = (FIXTURES / "microsoft_two_records.xml").read_text(encoding="utf-8")
+    forged = xml.replace("<selector>default</selector>", "<selector>made-up</selector>", 1)
+    forged = forged.replace("<result>pass</result>", "<result>fail</result>", 1)
+    conn = connect(tmp_path / "dmarc.sqlite")
+    ingest_report(conn, parse_aggregate_report(forged.encode("utf-8"), MAX_SIZE), _config())
+
+    assert "made-up" not in get_known_dkim_selectors(conn, "example.com", now=_FIXTURE_NOW)
+
+
+def _forged_report(selector: str = "default", result: str = "pass", date_end: int | None = None, rid: str = "x"):
+    xml = (FIXTURES / "microsoft_two_records.xml").read_text(encoding="utf-8")
+    xml = xml.replace("<selector>default</selector>", f"<selector>{selector}</selector>")
+    if result != "pass":
+        xml = xml.replace("<result>pass</result>", f"<result>{result}</result>")
+    if date_end is not None:
+        xml = xml.replace("<begin>1700100000</begin>", f"<begin>{date_end - 3600}</begin>", 1)
+        xml = xml.replace("<end>1700186399</end>", f"<end>{date_end}</end>", 1)
+    xml = xml.replace("<report_id>", f"<report_id>{rid}-", 1)
+    return parse_aggregate_report(xml.encode("utf-8"), MAX_SIZE)
+
+
+def test_get_known_dkim_selectors_future_date_end_does_not_bypass_window(tmp_path):
+    """date_end stammt aus dem (fälschbaren) Report und darf bis ins Jahr
+    2100 reichen - das Zeitfenster richtet sich deshalb höchstens nach dem
+    lokalen Abrufzeitpunkt, sonst bliebe ein erfundener Selektor ewig."""
+    import time
+
+    conn = connect(tmp_path / "dmarc.sqlite")
+    ingest_report(conn, _forged_report("forged", date_end=4_102_000_000), _config())
+    now = int(time.time())
+
+    assert get_known_dkim_selectors(conn, "example.com", now=now) == ["forged"]
+    assert get_known_dkim_selectors(conn, "example.com", now=now + 31 * 86400) == []
+
+
+def test_get_known_dkim_selectors_rejects_selector_whose_query_name_is_too_long(tmp_path):
+    """Jedes Label <= 63 Zeichen, der abgefragte Name aber > 253 - dig_command()
+    verweigerte ihn in jedem Lauf, das ergab einen dauerhaften DKIM-Fehler."""
+    conn = connect(tmp_path / "dmarc.sqlite")
+    ingest_report(conn, _forged_report(".".join(["a" * 63] * 4)), _config())
+
+    assert get_known_dkim_selectors(conn, "example.com", now=_FIXTURE_NOW) == []
+
+
+def test_get_known_dkim_selectors_keeps_selector_whose_key_vanished(tmp_path):
+    """Verschwindet der Key eines weiter benutzten Selektors aus dem DNS,
+    melden neue Reports nur noch "fail" - die Warnung darf nicht nach 30
+    Tagen von selbst verstummen (anomaly.py markiert das nicht, solange SPF
+    besteht)."""
+    import time
+
+    now = int(time.time())
+    conn = connect(tmp_path / "dmarc.sqlite")
+    ingest_report(conn, _load("microsoft_two_records.xml"), _config())  # alter "pass"-Report (2023)
+    ingest_report(conn, _forged_report(result="fail", date_end=now - 3600, rid="recent"), _config())
+
+    assert get_known_dkim_selectors(conn, "example.com", now=now) == ["default"]

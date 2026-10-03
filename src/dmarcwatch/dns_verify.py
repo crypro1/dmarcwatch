@@ -335,6 +335,20 @@ def _rank_and_pct_weakened(old_rank: int, new_rank: int, old_pct: int, new_pct: 
     return new_quarantine < old_quarantine or new_reject < old_reject
 
 
+def _keep_unchecked_dkim_entries(old_fp: dict, fingerprint: dict, checked_selectors: set[str]) -> None:
+    """Übernimmt die alten "dkim"-Einträge (`selector:key_type:fingerprint`)
+    aller Selektoren, die in DIESEM Lauf nicht erfolgreich abgefragt wurden -
+    wegen eines Lookup-Fehlers oder weil sie aus dem Zeitfenster von
+    store.get_known_dkim_selectors() gefallen sind (z. B. ein nur monatlich
+    genutzter Newsletter-Selektor). Ungeprüft ist kein "entfernt"; als
+    entfernt gilt nur ein abgefragter Selektor ohne Eintrag im DNS."""
+    kept = {
+        entry for entry in (old_fp.get("dkim") or [])
+        if entry.split(":", 1)[0] not in checked_selectors
+    }
+    fingerprint["dkim"] = sorted(set(fingerprint.get("dkim") or []) | kept)
+
+
 def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerification) -> DNSChangeResult:
     """Vergleicht result gegen den gespeicherten Schnappschuss für
     result.domain, aktualisiert den Schnappschuss IMMER (auch beim
@@ -356,10 +370,10 @@ def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerificatio
     # Dasselbe für alle übrigen Fingerprint-Felder: ein fehlgeschlagener
     # DKIM-/MTA-STS-/TLS-RPT-/DANE-/BIMI-Lookup darf nicht als "entfernt"
     # gemeldet und gespeichert werden (sonst im nächsten Lauf zusätzlich ein
-    # falsches "wieder da"). Bei DKIM wird die ganze Selektorliste
-    # übernommen, sobald auch nur ein Selektor nicht abgefragt werden konnte.
-    if any(d.error is not None for d in result.dkim):
-        carry_forward_keys.append("dkim")
+    # falsches "wieder da"). DKIM wird pro Selektor übernommen (siehe
+    # _keep_unchecked_dkim_entries), nicht als ganze Liste - sonst legte ein
+    # einziger dauerhaft fehlschlagender Selektor die Änderungserkennung für
+    # alle übrigen still.
     if result.mta_sts.error is not None:
         carry_forward_keys.append("mta_sts_policy_txt")
     if result.tlsrpt_dns.error is not None:
@@ -369,13 +383,19 @@ def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerificatio
     if result.bimi.error is not None:
         carry_forward_keys.append("bimi_record")
 
-    old_fp = get_and_replace_dns_snapshot(conn, result.domain, new_fp, carry_forward_keys)
+    checked_selectors = {d.selector for d in result.dkim if d.error is None}
+
+    def keep_unchecked(old: dict, fingerprint: dict) -> None:
+        _keep_unchecked_dkim_entries(old, fingerprint, checked_selectors)
+
+    old_fp = get_and_replace_dns_snapshot(conn, result.domain, new_fp, carry_forward_keys, keep_unchecked)
 
     if old_fp is None:
         return DNSChangeResult(has_baseline=False, changes=[], policy_weakened=False)
 
     for key in carry_forward_keys:
         new_fp[key] = old_fp.get(key)
+    keep_unchecked(old_fp, new_fp)
 
     changes: list[str] = []
     for key, label in _CHANGE_LABELS.items():
@@ -810,8 +830,12 @@ def _resolve_mx_hosts(domain: str) -> list[str]:
     leere Liste bei fehlendem MX, SPFResolutionError bei fehlgeschlagener
     Abfrage. Beide Aufrufer behandeln beides als "nichts zu prüfen", nicht
     als Warnung - check_dane() merkt sich den Fehler aber zusätzlich, damit
-    die Änderungserkennung ihn nicht für ein Entfernen der TLSA-Hosts hält."""
+    die Änderungserkennung ihn nicht für ein Entfernen der TLSA-Hosts hält.
+    Ein leerer `+short`-Befund wird dafür wie bei TXT nachgeprüft (SERVFAIL
+    sähe sonst wie "kein MX" aus, siehe spf._raise_on_resolution_failure)."""
     mx_lines = _dig("MX", domain)
+    if not mx_lines:
+        _raise_on_resolution_failure("MX", domain)
 
     hosts: list[str] = []
     for line in mx_lines:
