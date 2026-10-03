@@ -263,8 +263,11 @@ struct StatsView: View {
                             .font(.caption2).foregroundStyle(.orange)
                     }
                     if r.needsRecheck {
-                        Text("⚠ Bereits bei p=reject, aber own_ip_auth_fail zuletzt am \(r.lastFailureDate ?? "?") - own_ip_networks/SPF/DKIM prüfen (zählt erst ab neuen Reports).")
-                            .font(.caption2).foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("⚠ Eine Mail von deinen eigenen Sende-Adressen ist zuletzt am \(r.lastFailureDate ?? "?") bei SPF/DKIM durchgefallen. Bei p=reject kann sie dadurch abgelehnt worden sein - bitte SPF/DKIM des Absenders und \"Eigene Sende-Netze\" prüfen.")
+                            Text("Die Warnung verschwindet nach \(r.recommendedObservationDays) Tagen ohne neuen Fehler (bisher \(r.cleanDays)); bereits gespeicherte Reports werden nicht neu bewertet.")
+                        }
+                        .font(.caption2).foregroundStyle(.orange)
                     }
                     if r.fullyEnforced {
                         readinessPill(label: "Vollständig durchgesetzt (p=reject, pct=100)", isReady: true)
@@ -284,7 +287,7 @@ struct StatsView: View {
                                 isReady: false
                             )
                             if r.ownIpAuthFailures > 0 && r.cleanDays < r.recommendedObservationDays {
-                                Text("Own-IP-Fehlschlag zuletzt am \(r.lastFailureDate ?? "?").")
+                                Text("Zuletzt am \(r.lastFailureDate ?? "?") ist Mail von eigenen Sende-Adressen bei SPF/DKIM durchgefallen.")
                                     .font(.caption2).foregroundStyle(.secondary)
                             } else if r.cleanDays < r.recommendedObservationDays {
                                 Text(

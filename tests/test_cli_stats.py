@@ -142,6 +142,31 @@ def test_pct_adjusted_for_sp_note_printed_once_when_not_ready(tmp_path, monkeypa
     assert out.count("pct-Zwischenstufe übersprungen") == 1
 
 
+def test_recheck_warning_is_plain_language_without_internal_identifiers(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    conn = connect(db_path())
+    conn.close()
+    monkeypatch.setattr(
+        cli, "compute_dmarc_readiness",
+        lambda *a, **kw: [_readiness(
+            fully_enforced=True, ready_for_next_step=False, next_recommended_policy=None,
+            next_recommended_pct=None, next_step_pct_adjusted_for_sp=False, needs_recheck=True,
+            own_ip_auth_failures=3, last_failure_date="2026-09-08", clean_days=25,
+            recommended_observation_days=60,
+        )],
+    )
+    monkeypatch.setattr(cli, "compute_mta_sts_readiness", lambda *a, **kw: [])
+
+    assert cli.cmd_stats(_args(json=False)) == 0
+
+    out = capsys.readouterr().out
+    assert "zuletzt am 2026-09-08 bei SPF/DKIM durchgefallen" in out
+    assert "verschwindet nach 60 Tagen ohne neuen Fehler (bisher 25)" in out
+    # interne Feld-/Config-Namen gehören nicht in Text, den Anwender:innen lesen
+    assert "own_ip_auth_fail" not in out
+    assert "own_ip_networks" not in out
+
+
 def test_no_reports_returns_empty_structure(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HOME", str(tmp_path))
     conn = connect(db_path())
