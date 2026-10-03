@@ -4,6 +4,113 @@ Alle nennenswerten Änderungen an dmarcwatch werden hier festgehalten.
 Format angelehnt an [Keep a Changelog](https://keepachangelog.com/de/1.0.0/),
 Versionierung nach [Semantic Versioning](https://semver.org/lang/de/).
 
+## [Unreleased]
+
+### Hinzugefügt
+- Auffällige Absender-Identitäten in `stats`/"Statistik…"
+  (`compute_spoofed_identities`, [report.py](src/dmarcwatch/report.py)):
+  `header_from` wurde zwar gespeichert und bei fremden Werten bereits als
+  `foreign_header_from` markiert, aber nirgends ausgewertet. Die als
+  gefälscht markierten Records werden jetzt nach `header_from` gruppiert -
+  Anzahl E-Mails und Reports, erstes/letztes Auftreten und meldende
+  Organisationen. So ist erkennbar, welche Identität gerade gefälscht
+  wird und ob es ein Ausreißer oder eine laufende Kampagne ist. Wie alles in
+  `stats` bezieht sich das auf das gewählte `--days`-Fenster ("zuerst am"
+  heißt "zuerst im Zeitraum"); die Überschrift nennt den Zeitraum
+  ausdrücklich. Neue Karte im Statistik-Fenster, Textblock in `stats`.
+  Kein neues Schema, nur bereits gespeicherte Felder.
+- `inspect <ip>`: bei mehreren verschiedenen `header_from`-Werten hinter den
+  Treffern eine Übersicht "Header-From-Verteilung" vor der Detailliste.
+- Wirkung der eigenen Policy: `stats` und die DMARC-Karte zeigen jetzt, wie
+  viele E-Mails (echte Nachrichtenzahl, nicht Report-Zeilen) per
+  `disposition=reject` abgewiesen wurden (`blocked_count` pro Tag).
+  Zeilen mit fremdem `header_from` zählen nicht mit - ein "reject" dort kann
+  nicht von der eigenen Policy stammen, und ein gefälschter Report könnte
+  die Wirkung sonst mit einem hohen `count` aufblähen.
+- Empfehlung, `sp` nachzuziehen (`sp_behind_recommendation`): steht eine
+  Domain bereits bei `p=reject; pct=100`, aber `sp` explizit schwächer, galt
+  sie bisher als "vollständig durchgesetzt", ohne dass die schwächere
+  Subdomain-Policy je auffiel.
+
+### Geändert
+- Der orange Warntext bei `needs_recheck` ("Bereits bei p=reject, aber
+  own_ip_auth_fail …") ist in normalem Deutsch formuliert und nennt, was
+  passiert ist, warum es bei `p=reject` zählt, was zu prüfen ist und wann
+  die Warnung verschwindet, ohne interne Feldnamen. Der Hinweis unter "Noch
+  nicht bereit" nutzt dieselbe Formulierung.
+- DKIM-Selektoren für `verify-dns` kommen nur noch aus Reports der letzten
+  30 Tage und nur, wenn der Selektor mindestens einmal mit `pass` gemeldet
+  wurde (Zeitfenster nach dem früheren von `date_end` und Abrufzeitpunkt, da
+  `date_end` fälschbar ist). Ein nach einer Schlüsselrotation stillgelegter
+  oder in einem gefälschten Report erfundener Selektor warnt damit nicht
+  dauerhaft. Selektoren mit `*` oder ungültigem Namen werden verworfen, die
+  Änderungserkennung führt den Stand je Selektor fort.
+- `verify-dns <domain>` mit einer eigenen Domain aktualisiert nur deren
+  Eintrag in der Menüleiste (Reihenfolge und Datum des Gesamtlaufs bleiben),
+  mit einer fremden Domain bleibt der angezeigte Stand der eigenen Domains
+  unverändert. Der automatische Check in `fetch` ist zusätzlich fällig, wenn
+  eine eigene Domain im gespeicherten Stand fehlt. Die Änderungserkennung pro
+  Domain läuft in jedem Fall weiter.
+- Die DNS-Änderungserkennung vergleicht die effektive Durchsetzung (`p` und
+  `sp` zusammen mit `pct`) statt nur einzelner Felder: der vom Tool selbst
+  empfohlene Rollout-Schritt (z. B. `quarantine@100` → `reject@25`) löst
+  keine Warnung mehr aus, ein echtes Zurückstufen weiterhin.
+- Eine DKIM-Schlüsseländerung bei gleichem Selektor und gleichem Algorithmus
+  wird von der Änderungserkennung jetzt gesehen (Schlüssel-Fingerabdruck
+  statt nur `selektor:typ`).
+
+### Sicherheit
+- Alle `dig`-Aufrufe laufen über eine einzige Funktion
+  ([spf.py](src/dmarcwatch/spf.py) `dig_command`), die den Namen als DNS-Namen
+  validiert und per `-q` übergibt. Namen aus unauthentifizierten Quellen
+  (SPF-Ziele, MX-Antworten fremder Zonen, DKIM-Selektoren aus Report-XML)
+  können damit nie als `dig`-Option oder `@server` gelesen werden.
+- Weitere aus Reports stammende Felder werden vor der Terminal-Ausgabe in
+  `stats`/`inspect` bereinigt (`sanitize_field`), darunter `header_from`,
+  meldende Organisationen, Domain, Policy-Werte und die WHOIS-Organisation;
+  `current_sp` wurde in der JSON-Ausgabe bisher nicht bereinigt.
+- Weitere unsichtbare/Bidi-Steuerzeichen (U+2060, U+180E, U+061C) werden
+  entfernt.
+
+### Behoben
+- `fetch` bricht nicht mehr dauerhaft bei Nachrichten ab, die vor dem
+  Markieren als verarbeitet scheitern würden: rohe 8-Bit-Bytes im `From`-Header
+  (`mask_email` bekam ein `Header`-Objekt statt `str`), ZIP-Einträge mit
+  ungültigem UTF-8 im Namen oder defekten LZMA-Daten, übergroße
+  JSON-Ganzzahlen. Dieselbe Fehlerklasse wie schon der gzip-Fall in 1.2.0.
+- Ein vorübergehender DNS-Fehler (SERVFAIL, Timeout) wird nicht mehr als "kein
+  Eintrag" bzw. "DMARC-Policy entfernt" gewertet: das hätte einen falschen
+  Alarm "Policy geschwächt" ausgelöst und den gespeicherten Vergleichsstand
+  verfälscht. Gilt für DMARC, SPF, DKIM, MTA-STS, TLS-RPT, DANE und BIMI
+  (Stand wird dann aus der letzten erfolgreichen Prüfung übernommen); ein
+  leeres `dig +short`-Ergebnis wird per zweiter Abfrage auf SERVFAIL/REFUSED
+  geprüft.
+- "Policy geschwächt" erkennt jetzt ein explizit gesetztes schwächeres `sp`,
+  auch wenn es vorher fehlte (erbt laut RFC 7489 von `p`), und meldet kein
+  Zurückstufen, wenn ein redundantes `sp` einfach entfernt wird.
+- Lesen und Schreiben des DNS-Schnappschusses sind eine einzige Transaktion
+  (`BEGIN IMMEDIATE`): zwei gleichzeitige Prüfungen (geplanter Lauf und
+  Klick) konnten sich sonst gegenseitig die erkannte Änderung überschreiben.
+- Spamhaus-Rückgabecodes `127.255.255.x` (Abfrage über öffentlichen Resolver
+  abgelehnt, zu viele Abfragen) gelten nicht mehr als Listing; sie wären sonst
+  für jede IP gemeldet und im Cache gespeichert worden.
+- SPF-Auflösung: eine Raute (A inkludiert B und C, beide D) ist kein Zyklus
+  mehr, die Lookup-Zählung folgt RFC 7208 (die erste TXT-Abfrage zählt nicht,
+  `mx` zählt als ein Lookup), Null-MX und `a:host/24`-Ziele werden korrekt
+  behandelt, und ein CNAME in einer DNSBL-Antwort wird nicht mehr als
+  Rückgabecode gelesen.
+- `_detect_reporting_gap` erkennt auch dann eine lange Lücke, wenn es nur
+  wenige Report-Tage mit ähnlich großen Lücken gibt (zusätzlicher absoluter
+  Grenzwert von 75 Tagen).
+- Die sp-bewusste Rollout-Empfehlung überspringt die 25-%-Stufe nur noch beim
+  Schritt `quarantine` → `reject`, nie beim ersten Schritt von `p=none`.
+- `setup` prüft die Konfiguration, bevor sie geschrieben wird (ein Tippfehler
+  in `own_ip_networks` aus dem Einrichtungsfenster ließ sonst jeden Folgebefehl
+  abstürzen); `consistent_reporter_overrides` werden wie `org_name`
+  normalisiert und wirken damit auch in natürlicher Schreibweise.
+- Kleinkram: `lstrip('⚠ ')` entfernte eine Zeichenmenge statt eines Präfixes;
+  die Warnung "Policy geschwächt" erschien in der DNS-Prüfung doppelt.
+
 ## [1.3.0] - 2026-09-26
 
 ### Hinzugefügt

@@ -200,7 +200,11 @@ Folgende Menüpunkte in der laufenden App ersetzen den Terminal-Weg von oben:
   bzw. MTA-STS (Richtung `enforce`) im gewählten Zeitraum sicher gewesen
   wäre (`dmarcwatch stats --json`, siehe [`stats`](#befehle) unten) - reine
   Einschätzung auf Basis bereits vorhandener Reports, nichts wird
-  automatisch geändert. Reines Lesen der lokalen DB, deshalb ohne
+  automatisch geändert. Zusätzlich zeigt die DMARC-Karte, wie viele E-Mails
+  die eigene Policy im Zeitraum tatsächlich abgewiesen hat, und eine eigene
+  Karte listet die "Auffälligen Absender-Identitäten": welche fremden
+  `header_from`-Domains in den Reports als gefälscht auftauchen, wie oft,
+  seit wann und von wem gemeldet. Reines Lesen der lokalen DB, deshalb ohne
   Bestätigungsdialog.
 
 Die SMTP-TLS-RPT-Reports selbst erscheinen nicht in einem eigenen Fenster,
@@ -524,12 +528,32 @@ ohne App-Update ergänzt werden. Beispiel:
   Ausgeschlossene Reports verschwinden nicht stillschweigend:
   `excluded_count`/`excluded_reporters` zeigen, wie viele und von wem.
 
+  Neben der Verschärfungs-Einschätzung zeigt `stats`, was die eigene Policy
+  tatsächlich bewirkt hat: die Summe der E-Mails (echte Nachrichtenzahl, nicht
+  Report-Zeilen), die per `disposition=reject` abgewiesen wurden
+  (`blocked_count` pro Tag im JSON). Zeilen mit fremdem `header_from` zählen
+  dabei nicht mit - ein "reject" dort kann nicht von der EIGENEN Policy
+  stammen, und ein gefälschter Report könnte die angezeigte Wirkung sonst mit
+  einem beliebig hohen `count` aufblähen. Der Block "Auffällige
+  Absender-Identitäten" gruppiert die als `foreign_header_from` markierten
+  Records nach `header_from` (Anzahl E-Mails und Reports, erstes und letztes
+  Auftreten, meldende Organisationen) - sichtbar wird so, welche Identität
+  gerade gefälscht wird und ob das ein einmaliger Ausreißer oder eine
+  laufende Kampagne ist. Wie alles in `stats` gilt das nur für das gewählte
+  `--days`-Fenster: "zuerst am" heißt "zuerst im Zeitraum", nicht "zum ersten
+  Mal überhaupt". Ist eine Domain bereits bei `p=reject; pct=100`, aber `sp`
+  explizit schwächer, empfiehlt `stats` zusätzlich, `sp` nachzuziehen
+  (`sp_behind_recommendation`).
+
   `--json` gibt strukturierte Ausgabe statt der Tabelle aus - für das
   "Statistik…"-Fenster in der Menüleisten-App gedacht, funktioniert aber
   genauso von Hand im Terminal.
 - `dmarcwatch inspect <ip-oder-cidr> [--days N] [--whois] [--blacklist]`
   Vollständige Details zu einer IP oder einem Netz (z. B. `2a01:111::/32`),
-  ohne von Hand SQL gegen die Datenbank zu schreiben. `--whois` fragt
+  ohne von Hand SQL gegen die Datenbank zu schreiben. Stecken hinter den
+  Treffern mehrere verschiedene `header_from`-Werte, steht vor der
+  Detailliste eine Übersicht "Header-From-Verteilung" mit der Anzahl je
+  Wert. `--whois` fragt
   zusätzlich die Organisation hinter der IP per RDAP ab (rein informativ,
   keine Sicherheitseinstufung - Details und Begründung unter
   [Sicherheitsentscheidungen](#sicherheitsentscheidungen)) und legt das
@@ -707,7 +731,7 @@ der Ausgabe als expliziter, von Hand auszuführender Schritt.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-371 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
+458 Tests, siehe [tests/](tests/). Abgedeckt (Spezifikation Abschnitt 5 und
 darüber hinaus):
 
 **Funktional**
@@ -803,6 +827,17 @@ nicht als vertrauenswürdige Eingabe:
 - **Keine `shell=True`, keine Befehlszusammensetzung aus Strings**: sowohl
   `notify.py` (osascript) als auch `launchd.py` (launchctl) rufen
   `subprocess.run` mit einer Argumentliste auf.
+- **dig-Aufrufe können Namen aus fremden Quellen nicht als Option lesen**
+  ([spf.py](src/dmarcwatch/spf.py) `dig_command`): abgefragte Namen stammen
+  teils aus unauthentifizierten Quellen (SPF-`include`/`redirect`/`a`/`mx`-Ziele
+  und MX-Antworten aus fremden DNS-Zonen, DKIM-Selektoren aus Report-XML). Ein
+  Wert wie `+tcp`, `-f/etc/x` oder `@server` würde von `dig` sonst als Option
+  oder Server-Angabe gelesen. Jeder Aufruf im Projekt geht deshalb durch
+  eine einzige Funktion, die den Namen als DNS-Namen validiert (Labels aus
+  Buchstaben, Ziffern, `_`, `-`; höchstens 253 Zeichen; `*` nur als
+  erstes Label für die Wildcard-SPF-Prüfung) und ihn zusätzlich per `-q`
+  übergibt - doppelt abgesichert, falls die Validierung je etwas
+  durchließe.
 - **Passwort ausschließlich im Schlüsselbund, nie als Prozessargument**
   ([keychain.py](src/dmarcwatch/keychain.py)): `setup` liest das Passwort
   über `getpass()` ein und speichert es über das `keyring`-Modul, das auf
