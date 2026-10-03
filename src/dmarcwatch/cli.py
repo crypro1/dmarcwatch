@@ -168,6 +168,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     raw_config = read_raw_config(config_file)
 
     password_from_gui: str | None = None
+    config_changed = False
     if args.from_stdin_json:
         # Nicht-interaktiver Pfad für die native Setup-GUI (Swift-App):
         # ein JSON-Objekt komplett über stdin, nie als Kommandozeilen-
@@ -185,20 +186,26 @@ def cmd_setup(args: argparse.Namespace) -> int:
             return 1
         password_from_gui = payload.pop("password", None)
         raw_config.update(payload)
-        write_config(raw_config, config_file)
-        print(f"Konfiguration gespeichert: {config_file}")
+        config_changed = True
     elif is_first_run or args.reconfigure:
         raw_config = _prompt_config_interactively(raw_config)
-        write_config(raw_config, config_file)
-        print(f"Konfiguration gespeichert: {config_file}")
+        config_changed = True
     else:
         print(f"Konfiguration: {config_file} (bereits vorhanden, mit --reconfigure änderbar)")
 
+    # Erst prüfen, DANN speichern: eine ungültige Konfiguration (z. B. ein
+    # Tippfehler in own_ip_networks aus dem Setup-Fenster) landete sonst
+    # trotz Fehlermeldung in config.json, und jeder folgende Befehl (fetch
+    # per LaunchAgent, menubar-json, stats, ...) bräche danach in
+    # load_config() mit einem Traceback ab.
     try:
         config = Config.from_dict(raw_config)
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         print(f"Fehler in der Konfiguration: {exc}", file=sys.stderr)
         return 1
+    if config_changed:
+        write_config(raw_config, config_file)
+        print(f"Konfiguration gespeichert: {config_file}")
 
     if args.from_stdin_json:
         if password_from_gui:
@@ -486,15 +493,22 @@ def cmd_stats(args: argparse.Namespace) -> int:
                   f"zuerst am {s.first_seen_date}, zuletzt am {s.last_seen_date} "
                   f"(gemeldet von: {reporters})")
         print()
+    # domain/current_policy/current_sp/excluded_reporters (und unten bei
+    # MTA-STS failure_types/excluded_reporters) stammen aus unauthentifizierten
+    # Reports - vor der Terminal-Ausgabe bereinigen, dieselbe Konvention wie
+    # beim Absender-Identitäten-Block oben und in to_stats_json_dict().
     if not dmarc_readiness:
         print("DMARC: keine Reports im Zeitraum, keine Einschätzung möglich.")
     for r in dmarc_readiness:
-        print(f"DMARC ({r.domain}): aktuelle Policy p={r.current_policy or '?'}, pct={r.current_pct}")
+        current_policy = sanitize_field(r.current_policy, 20) if r.current_policy else "?"
+        current_sp = sanitize_field(r.current_sp, 20)
+        print(f"DMARC ({sanitize_field(r.domain, 80)}): aktuelle Policy p={current_policy}, pct={r.current_pct}")
         print(f"  {r.total_count} E-Mails, davon {r.unknown_ip_failures} von unbekannten IPs")
         if r.excluded_count:
+            excluded = ", ".join(sanitize_field(name, 80) for name in r.excluded_reporters)
             print(
                 f"  ({r.excluded_count} E-Mails von Reportern mit inkonsistenten Metadaten "
-                f"ausgeschlossen: {', '.join(r.excluded_reporters)})"
+                f"ausgeschlossen: {excluded})"
             )
         if r.has_reporting_gap:
             print(
@@ -510,7 +524,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
         if r.fully_enforced:
             print("  Bereits vollständig durchgesetzt (p=reject, pct=100).")
             if r.sp_behind_recommendation:
-                print(f"  ℹ sp={r.current_sp} ist schwächer als p={r.current_policy} - Empfehlung: sp={r.sp_behind_recommendation} setzen.")
+                print(
+                    f"  ℹ sp={current_sp} ist schwächer als p={current_policy} - Empfehlung: "
+                    f"sp={sanitize_field(r.sp_behind_recommendation, 20)} setzen."
+                )
         elif r.ready_for_next_step:
             print(f"  Bereit für nächsten Schritt: p={r.next_recommended_policy}, pct={r.next_recommended_pct}.")
         else:
@@ -532,19 +549,20 @@ def cmd_stats(args: argparse.Namespace) -> int:
                 + "; ".join(reasons) + "."
             )
         if r.next_step_pct_adjusted_for_sp:
-            print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={r.current_sp} nicht zu schwächen.")
+            print(f"  ℹ pct-Zwischenstufe übersprungen, um bereits durchgesetztes sp={current_sp} nicht zu schwächen.")
     print()
     if not mta_sts_readiness:
         print("MTA-STS: keine TLS-RPT-Reports im Zeitraum, keine Einschätzung möglich.")
     for m in mta_sts_readiness:
-        print(f"MTA-STS ({m.domain}):")
+        print(f"MTA-STS ({sanitize_field(m.domain, 80)}):")
         if m.excluded_count:
+            excluded = ", ".join(sanitize_field(name, 80) for name in m.excluded_reporters)
             print(
                 f"  ({m.excluded_count} TLS-Sitzungen von Reportern mit inkonsistenten Metadaten "
-                f"ausgeschlossen: {', '.join(m.excluded_reporters)})"
+                f"ausgeschlossen: {excluded})"
             )
         if m.total_failure_count:
-            types = ", ".join(f"{k} ({v})" for k, v in sorted(m.failure_types.items()))
+            types = ", ".join(f"{sanitize_field(k, 40)} ({v})" for k, v in sorted(m.failure_types.items()))
             print(f"  {m.total_failure_count} TLS-Fehlschläge im Zeitraum" + (f" - {types}" if types else ""))
         if m.has_reporting_gap:
             print(
@@ -691,7 +709,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                     whois_cache[ip] = f"Abfrage fehlgeschlagen ({exc})"
                     inline_lookup_failed = True
                     print(f"WHOIS-Abfrage fehlgeschlagen: {exc}", file=sys.stderr)
-            print(f"WHOIS-Organisation (nur Hinweis, keine Einstufung): {whois_cache[ip]}")
+            # RDAP-Antwort kommt von außen - vor der Terminal-Ausgabe
+            # bereinigen, wie whois_organization in to_json_dict().
+            print(f"WHOIS-Organisation (nur Hinweis, keine Einstufung): {sanitize_field(whois_cache[ip], 200)}")
         if args.blacklist:
             ip = r["source_ip"]
             if ip not in blacklist_cache:

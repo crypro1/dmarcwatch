@@ -180,9 +180,15 @@ def parse_tls_report(
     if len(json_bytes) > max_size_bytes:
         raise TLSReportParseError(f"JSON-Größe {len(json_bytes)} überschreitet Obergrenze {max_size_bytes}")
 
+    # ValueError statt nur JSONDecodeError/UnicodeDecodeError (beides
+    # Unterklassen davon): json.loads wirft für eine Ganzzahl-Literal mit
+    # mehr als sys.get_int_max_str_digits() (Default 4300) Stellen einen
+    # SCHLICHTEN ValueError, keinen JSONDecodeError - der liefe sonst bis
+    # fetch.py durch und bräche jeden künftigen Lauf erneut ab (die
+    # Nachricht wird vor dem Absturz nicht als verarbeitet markiert).
     try:
         data = json.loads(json_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise TLSReportParseError(f"JSON konnte nicht geparst werden: {exc}") from exc
 
     if not isinstance(data, dict):

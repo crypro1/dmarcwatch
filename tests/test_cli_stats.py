@@ -154,3 +154,37 @@ def test_no_reports_returns_empty_structure(tmp_path, monkeypatch, capsys):
     assert output["daily"] == []
     assert output["dmarc_readiness"] == []
     assert output["mta_sts_readiness"] == []
+
+
+def test_text_output_sanitizes_attacker_controlled_report_fields(tmp_path, monkeypatch, capsys):
+    """org_name (ausgeschlossene Reporter) und TLS-organization-name kommen
+    aus unauthentifizierten Reports - JSON erlaubt echte ESC-Zeichen
+    (\\u001b) und Zeilenumbrüche, die sonst ungefiltert im Terminal landen
+    (Bildschirm löschen, gefälschte Statuszeilen)."""
+    from dmarcwatch.store import ingest_tls_report
+    from dmarcwatch.tls_parser import parse_tls_report
+
+    _seed(tmp_path, monkeypatch)
+    day = time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime(time.time() - 86400))
+    report = {
+        "organization-name": "\u001b[2J\u001b[31mZZ\n  Bereit für mode=enforce, falls noch nicht aktiv.",
+        "contact-info": "x@q.invalid",
+        "report-id": "tls-injection-1",
+        "date-range": {"start-datetime": day, "end-datetime": day},
+        "policies": [
+            {
+                "policy": {"policy-type": "sts", "policy-domain": "example.com"},
+                "summary": {"total-successful-session-count": 5, "total-failure-session-count": 0},
+            }
+        ],
+    }
+    config = Config.from_dict({"own_domains": ["example.com"]})
+    conn = connect(db_path())
+    ingest_tls_report(conn, parse_tls_report(json.dumps(report).encode(), 10**6), config)
+    conn.close()
+
+    cli.cmd_stats(_args(json=False))
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out
+    assert "\n  Bereit für mode=enforce, falls noch nicht aktiv." not in out

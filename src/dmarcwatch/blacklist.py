@@ -37,6 +37,9 @@ _RETURN_CODE_MEANINGS = {
     "127.0.0.11": "PBL - Richtlinie: von Spamhaus verwaltete Sperre für Direktversand",
 }
 
+# Fehler-Antworten statt Listings, siehe check_ip_blacklist().
+_ERROR_CODE_PREFIX = "127.255.255."
+
 
 class BlacklistCheckError(RuntimeError):
     pass
@@ -69,6 +72,19 @@ def check_ip_blacklist(ip: str) -> BlacklistResult:
         records = _dig_checked("A", f"{reversed_ip}.{DNSBL_ZONE}")
     except SPFResolutionError as exc:
         raise BlacklistCheckError(str(exc)) from exc
+
+    # 127.255.255.x sind laut Spamhaus KEINE Listings, sondern Fehlercodes
+    # (.252 Tippfehler im Zonennamen, .254 Abfrage über einen öffentlichen/
+    # offenen Resolver, .255 zu viele Abfragen) - wer z. B. einen
+    # öffentlichen Resolver nutzt, bekäme sonst JEDE IP (auch die eigenen
+    # MX-Server) als "gelistet" angezeigt und im blacklist_cache gespeichert.
+    error_codes = [code for code in records if code.startswith(_ERROR_CODE_PREFIX)]
+    if error_codes:
+        raise BlacklistCheckError(
+            f"Spamhaus hat die Abfrage abgelehnt (Rückgabecode {', '.join(error_codes)}) - "
+            "typischerweise bei Abfragen über einen öffentlichen/offenen Resolver oder bei zu "
+            "vielen Abfragen, kein Listing."
+        )
 
     reasons = [_RETURN_CODE_MEANINGS.get(code, f"Unbekannter Rückgabecode {code}") for code in records]
     return BlacklistResult(ip=ip, listed=bool(records), reasons=reasons)

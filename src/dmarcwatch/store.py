@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -21,6 +22,10 @@ from .config import Config
 from .models import AggregateReport, TLSReport
 
 SCHEMA_VERSION = 5
+
+# Ein oder mehrere DNS-Labels (Buchstaben/Ziffern/"_"/"-", nicht mit "-"
+# beginnend), durch Punkte getrennt - siehe get_known_dkim_selectors().
+_DKIM_SELECTOR_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,62}(?:\.[A-Za-z0-9_][A-Za-z0-9_-]{0,62})*")
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -369,7 +374,12 @@ def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]
             if dkim_entry.get("domain", "").strip().lower() != domain_lower:
                 continue
             selector = dkim_entry.get("selector", "")
-            if selector:
+            # Der Selektor stammt aus unauthentifiziertem Report-XML und
+            # landet in dns_verify.check_dkim() als dig-Argument - ein Wert
+            # wie "+tcp", "-f..." oder "@server" würde dort als dig-Option
+            # bzw. Server-Angabe interpretiert. Nur syntaktisch gültige
+            # DNS-Namen übernehmen.
+            if selector and _DKIM_SELECTOR_RE.fullmatch(selector):
                 selectors.add(selector)
     return sorted(selectors)
 

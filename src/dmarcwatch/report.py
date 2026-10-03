@@ -117,7 +117,13 @@ def is_consistent_reporter(
     normalized_org = _normalize_for_consistency(org_name)
     if not normalized_org:
         return False
-    allowlist = {**DEFAULT_CONSISTENT_REPORTERS, **(overrides or {})}
+    # Schlüssel genauso normalisieren wie org_name selbst - ein Override in
+    # der natürlichen Schreibweise ("Comcast Cable") träfe den normalisierten
+    # Vergleichswert ("comcastcable") sonst nie und bliebe still wirkungslos.
+    allowlist = {
+        _normalize_for_consistency(name): suffixes
+        for name, suffixes in {**DEFAULT_CONSISTENT_REPORTERS, **(overrides or {})}.items()
+    }
     if normalized_org in allowlist:
         return any(_domain_matches_suffix(domain, suffix) for suffix in allowlist[normalized_org])
     normalized_domain = _normalize_for_consistency(domain)
@@ -479,8 +485,17 @@ def collect_daily_stats(rows: list[ReportRow]) -> list[DayStat]:
         flagged = sum(1 for r in day_rows if r.is_flagged)
         # disposition == "reject" impliziert bereits is_flagged (anomaly.py
         # setzt REASON_DISPOSITION unbedingt bei jeder disposition != none),
-        # eine zusätzliche is_flagged-Prüfung wäre nur redundant.
-        blocked = sum(r.count for r in day_rows if r.disposition == "reject")
+        # eine zusätzliche is_flagged-Prüfung wäre nur redundant. Zeilen mit
+        # REASON_FOREIGN_HEADER_FROM zählen NICHT mit: deren header_from
+        # gehört gar nicht zur eigenen Domain, ein "reject" dort kann also
+        # nicht von der EIGENEN Policy stammen (typischerweise ein
+        # gefälschter Report, der sonst mit einem beliebig hohen count die
+        # angezeigte Wirkung der eigenen Policy aufblähen könnte).
+        blocked = sum(
+            r.count
+            for r in day_rows
+            if r.disposition == "reject" and REASON_FOREIGN_HEADER_FROM not in r.flag_reasons
+        )
         result.append(
             DayStat(date=day, clean_count=len(day_rows) - flagged, flagged_count=flagged, blocked_count=blocked)
         )

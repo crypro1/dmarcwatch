@@ -219,3 +219,21 @@ def test_without_reconfigure_existing_config_is_not_reprompted(tmp_path, monkeyp
     assert result == 0
     saved = read_raw_config(config_path())
     assert saved["imap_user"] == "user@example.com"  # unverändert
+
+
+def test_from_stdin_json_invalid_config_is_not_persisted(tmp_path, monkeypatch):
+    """Regressionstest: eine ungültige Konfiguration aus dem Setup-Fenster
+    (z. B. ein Tippfehler in own_ip_networks) wurde früher ERST gespeichert
+    und DANN geprüft - trotz Fehlermeldung stand sie danach in config.json,
+    und jeder folgende Befehl (fetch, menubar-json, stats) brach in
+    load_config() mit einem Traceback ab."""
+    _seed_configured_home(tmp_path, monkeypatch)
+    payload = '{"own_ip_networks": ["192.0.2.0/33"], "password": "s3cret"}'
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    with patch.object(keychain, "set_password") as mock_set_password:
+        result = cli.cmd_setup(_args(from_stdin_json=True))
+
+    assert result == 1
+    mock_set_password.assert_not_called()
+    saved = read_raw_config(config_path())
+    assert saved["own_ip_networks"] == ["203.0.113.0/24"]

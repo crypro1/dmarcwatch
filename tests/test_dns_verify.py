@@ -1047,3 +1047,122 @@ def test_fingerprint_dkim_includes_key_fingerprint_for_rotation_detection():
     result_b.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="bbbb")]
 
     assert _fingerprint(result_a)["dkim"] != _fingerprint(result_b)["dkim"]
+
+
+# --- SERVFAIL vs. fehlender Eintrag, Rollout-Schritte, Carry-forward ---
+
+_SERVFAIL_FULL = _dig_result(";; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n")
+
+
+def _servfail_run(cmd, **kwargs):
+    # `dig +short` liefert bei SERVFAIL leeres stdout mit Exit-Code 0, erst
+    # die volle Ausgabe zeigt den Status.
+    return _dig_result("") if "+short" in cmd else _SERVFAIL_FULL
+
+
+def test_check_dmarc_servfail_sets_error_instead_of_missing_record():
+    """Regressionstest: ein SERVFAIL beim DMARC-Lookup darf nicht wie ein
+    entfernter Eintrag aussehen (error=None), sonst greift das Carry-forward
+    in diff_and_update_snapshot() nicht und es gibt einen falschen
+    "DMARC-Policy geschwächt"-Alarm."""
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_servfail_run):
+        result = check_dmarc("example.com")
+    assert result.exists is False
+    assert result.error is not None
+    assert "SERVFAIL" in result.error
+
+
+def test_servfail_dmarc_lookup_does_not_flag_weakened(tmp_path):
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dmarc = DMARCCheckResult(exists=True, record="v=DMARC1; p=reject", policy="reject", pct=100)
+    diff_and_update_snapshot(conn, baseline)
+
+    blip = _clean_result()
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=_servfail_run):
+        blip.dmarc = check_dmarc("example.com")
+    change = diff_and_update_snapshot(conn, blip)
+
+    assert change.policy_weakened is False
+    assert change.changes == []
+    conn.close()
+
+
+def test_check_dkim_servfail_sets_error():
+    with patch("dmarcwatch.dns_verify.subprocess.run", side_effect=_servfail_run):
+        result = check_dkim("example.com", "default")
+    assert result.exists is False
+    assert result.error is not None
+
+
+def test_check_dkim_missing_record_has_no_error():
+    with patch("dmarcwatch.dns_verify.subprocess.run", return_value=_dig_result("")):
+        result = check_dkim("example.com", "default")
+    assert result.exists is False
+    assert result.error is None
+
+
+def _dmarc(policy: str, pct: int | None) -> DMARCCheckResult:
+    record = f"v=DMARC1; p={policy}" + (f"; pct={pct}" if pct is not None else "")
+    return DMARCCheckResult(exists=True, record=record, policy=policy, pct=pct)
+
+
+def test_recommended_rollout_steps_are_not_flagged_weakened(tmp_path):
+    """Regressionstest: genau die von report._next_dmarc_rollout_step
+    empfohlenen Schritte (none -> quarantine;pct=25, quarantine;pct=100 ->
+    reject;pct=25) senken pct, sind aber reine Verschärfungen - laut RFC
+    7489 bekommt der nicht erfasste Rest die nächstniedrigere Policy."""
+    for old, new in [
+        (("none", None), ("quarantine", 25)),
+        (("quarantine", 100), ("reject", 25)),
+        (("reject", 25), ("reject", 50)),
+    ]:
+        conn = connect(tmp_path / f"dns-{old[0]}-{new[0]}-{new[1]}.db")
+        before = _clean_result()
+        before.dmarc = _dmarc(*old)
+        diff_and_update_snapshot(conn, before)
+
+        after = _clean_result()
+        after.dmarc = _dmarc(*new)
+        change = diff_and_update_snapshot(conn, after)
+
+        assert change.policy_weakened is False, (old, new)
+        conn.close()
+
+
+def test_pct_drop_within_same_policy_level_still_flags_weakened(tmp_path):
+    conn = connect(tmp_path / "dns.db")
+    before = _clean_result()
+    before.dmarc = _dmarc("quarantine", 50)
+    diff_and_update_snapshot(conn, before)
+
+    after = _clean_result()
+    after.dmarc = _dmarc("quarantine", 25)
+    change = diff_and_update_snapshot(conn, after)
+
+    assert change.policy_weakened is True
+    assert any("pct=50->25" in c for c in change.changes)
+    conn.close()
+
+
+def test_transient_dkim_error_is_carried_forward_not_reported_as_removal(tmp_path):
+    """Wie beim DMARC-Lookup: ein Timeout beim DKIM-Lookup darf weder als
+    "Selektor entfernt" gemeldet noch so gespeichert werden (sonst im
+    nächsten Lauf zusätzlich ein falsches "wieder da")."""
+    conn = connect(tmp_path / "dns.db")
+    baseline = _clean_result()
+    baseline.dkim = [DKIMCheckResult(selector="default", exists=True, key_type="rsa", key_fingerprint="aa")]
+    diff_and_update_snapshot(conn, baseline)
+
+    blip = _clean_result()
+    blip.dkim = [DKIMCheckResult(selector="default", exists=False, error="timeout")]
+    assert diff_and_update_snapshot(conn, blip).changes == []
+    assert diff_and_update_snapshot(conn, baseline).changes == []
+    conn.close()
+
+
+def test_check_dane_mx_lookup_failure_sets_error():
+    with patch("dmarcwatch.dns_verify._dig", side_effect=SPFResolutionError("Zeitüberschreitung")):
+        result = check_dane("example.com")
+    assert result.configured is False
+    assert result.error is not None

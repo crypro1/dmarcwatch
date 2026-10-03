@@ -36,7 +36,15 @@ from defusedxml.common import DefusedXmlException
 
 from .blacklist import BlacklistCheckError, check_ip_blacklist
 from .report import _POLICY_RANK
-from .spf import DIG_TIMEOUT_SECONDS, SPFCheckResult, SPFResolutionError, _dig, _txt_records, validate_spf
+from .spf import (
+    DIG_TIMEOUT_SECONDS,
+    SPFCheckResult,
+    SPFResolutionError,
+    _dig,
+    _raise_on_resolution_failure,
+    _txt_records,
+    validate_spf,
+)
 from .store import get_and_replace_dns_snapshot, get_known_dkim_selectors
 
 _HTTPS_TIMEOUT_SECONDS = 5.0
@@ -87,6 +95,10 @@ class DKIMCheckResult:
     key_type: str | None = None
     key_fingerprint: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Wie DMARCCheckResult.error: gesetzt, wenn der Lookup selbst
+    # fehlschlug (Timeout, SERVFAIL, ...) statt "kein Eintrag" - siehe
+    # diff_and_update_snapshot().
+    error: str | None = None
 
 
 @dataclass
@@ -106,6 +118,9 @@ class MTASTSCheckResult:
     policy_txt: str | None = None
     policy_reachable: bool | None = None
     warnings: list[str] = field(default_factory=list)
+    # Fehlgeschlagener Lookup des Policy-TXT (_mta-sts.<domain>), siehe
+    # DKIMCheckResult.error.
+    error: str | None = None
 
 
 @dataclass
@@ -118,6 +133,8 @@ class TLSRPTDNSCheckResult:
     configured: bool
     record: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Fehlgeschlagener Lookup, siehe DKIMCheckResult.error.
+    error: str | None = None
 
 
 @dataclass
@@ -180,6 +197,8 @@ class DANECheckResult:
     configured: bool
     mx_hosts_with_tlsa: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Fehlgeschlagener MX- oder TLSA-Lookup, siehe DKIMCheckResult.error.
+    error: str | None = None
 
 
 @dataclass
@@ -203,6 +222,9 @@ class BIMICheckResult:
     logo_svg: str | None = None
     logo_reachable: bool | None = None
     warnings: list[str] = field(default_factory=list)
+    # Fehlgeschlagener Lookup von default._bimi.<domain>, siehe
+    # DKIMCheckResult.error.
+    error: str | None = None
 
 
 @dataclass
@@ -284,6 +306,34 @@ def _effective_sp_rank(fp: dict) -> int:
     return _POLICY_RANK.get(fp.get("dmarc_policy"), -1)
 
 
+def _enforcement_profile(rank: int, pct: int) -> tuple[int, int]:
+    """(Anteil mindestens quarantine, Anteil reject) in Prozent. Laut RFC
+    7489 6.6.4 bekommt der NICHT von pct erfasste Teil die nächstniedrigere
+    Policy (reject -> quarantine, quarantine -> none) - pct allein ist ohne
+    die Policy-Stufe also nicht vergleichbar: quarantine;pct=100 ->
+    reject;pct=25 ist eine reine Verschärfung (weiterhin 100% mindestens
+    quarantine, zusätzlich 25% reject), obwohl pct sinkt."""
+    if rank >= 2:
+        return 100, pct
+    if rank == 1:
+        return pct, 0
+    return 0, 0
+
+
+def _rank_and_pct_weakened(old_rank: int, new_rank: int, old_pct: int, new_pct: int) -> bool:
+    # -1 (unbekannt/fehlend) als ALTER Wert darf nie ein "geschwächt"
+    # auslösen - das wäre nur die fehlende Vergleichsbasis, nicht ein
+    # tatsächlicher Rückschritt. Ein jetzt fehlender Eintrag bei bekanntem
+    # altem Stand ist dagegen ein echter Rückschritt.
+    if old_rank == -1:
+        return False
+    if new_rank == -1:
+        return True
+    old_quarantine, old_reject = _enforcement_profile(old_rank, old_pct)
+    new_quarantine, new_reject = _enforcement_profile(new_rank, new_pct)
+    return new_quarantine < old_quarantine or new_reject < old_reject
+
+
 def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerification) -> DNSChangeResult:
     """Vergleicht result gegen den gespeicherten Schnappschuss für
     result.domain, aktualisiert den Schnappschuss IMMER (auch beim
@@ -302,6 +352,21 @@ def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerificatio
         carry_forward_keys.extend(["dmarc_record", "dmarc_policy", "dmarc_subdomain_policy", "dmarc_pct"])
     if result.spf.error is not None:
         carry_forward_keys.append("spf_record")
+    # Dasselbe für alle übrigen Fingerprint-Felder: ein fehlgeschlagener
+    # DKIM-/MTA-STS-/TLS-RPT-/DANE-/BIMI-Lookup darf nicht als "entfernt"
+    # gemeldet und gespeichert werden (sonst im nächsten Lauf zusätzlich ein
+    # falsches "wieder da"). Bei DKIM wird die ganze Selektorliste
+    # übernommen, sobald auch nur ein Selektor nicht abgefragt werden konnte.
+    if any(d.error is not None for d in result.dkim):
+        carry_forward_keys.append("dkim")
+    if result.mta_sts.error is not None:
+        carry_forward_keys.append("mta_sts_policy_txt")
+    if result.tlsrpt_dns.error is not None:
+        carry_forward_keys.append("tlsrpt_record")
+    if result.dane.error is not None:
+        carry_forward_keys.append("dane_mx_hosts_with_tlsa")
+    if result.bimi.error is not None:
+        carry_forward_keys.append("bimi_record")
 
     old_fp = get_and_replace_dns_snapshot(conn, result.domain, new_fp, carry_forward_keys)
 
@@ -321,32 +386,30 @@ def diff_and_update_snapshot(conn: sqlite3.Connection, result: DomainVerificatio
                 f"{_format_fingerprint_value(new_value)}"
             )
 
-    # -1 (unbekannt/fehlend) darf für sich genommen nie ein "geschwächt"
-    # auslösen - das wäre nur die fehlende Vergleichsbasis, nicht ein
-    # tatsächlicher Rückschritt.
     old_p_rank = _POLICY_RANK.get(old_fp.get("dmarc_policy"), -1)
     new_p_rank = _POLICY_RANK.get(new_fp.get("dmarc_policy"), -1)
     old_sp_rank = _effective_sp_rank(old_fp)
     new_sp_rank = _effective_sp_rank(new_fp)
-    rank_weakened = (old_p_rank != -1 and new_p_rank < old_p_rank) or (
-        old_sp_rank != -1 and new_sp_rank < old_sp_rank
-    )
 
-    # Ein fehlendes pct-Tag heißt laut RFC 7489 implizit pct=100 - erst so
-    # ist ein sinkender Wert überhaupt vergleichbar, auch wenn das Tag vorher
-    # oder nachher gar nicht gesetzt war.
+    # Ein fehlendes pct-Tag heißt laut RFC 7489 implizit pct=100. pct gilt
+    # gemeinsam für p UND sp und wird nur zusammen mit der jeweiligen
+    # Policy-Stufe verglichen (siehe _enforcement_profile) - ein nackter
+    # pct-Vergleich meldete sonst ausgerechnet die empfohlenen
+    # Rollout-Schritte (none -> quarantine;pct=25, quarantine;pct=100 ->
+    # reject;pct=25, siehe report._next_dmarc_rollout_step) als Rückschritt.
     old_pct = old_fp.get("dmarc_pct") if old_fp.get("dmarc_pct") is not None else 100
     new_pct = new_fp.get("dmarc_pct") if new_fp.get("dmarc_pct") is not None else 100
-    pct_weakened = new_pct < old_pct
 
-    policy_weakened = rank_weakened or pct_weakened
+    policy_weakened = _rank_and_pct_weakened(old_p_rank, new_p_rank, old_pct, new_pct) or (
+        _rank_and_pct_weakened(old_sp_rank, new_sp_rank, old_pct, new_pct)
+    )
     if policy_weakened:
         detail = (
             "⚠ DMARC-Policy geschwächt: "
             f"p={old_fp.get('dmarc_policy')}->{new_fp.get('dmarc_policy')}, "
             f"sp={old_fp.get('dmarc_subdomain_policy')}->{new_fp.get('dmarc_subdomain_policy')}"
         )
-        if pct_weakened:
+        if new_pct != old_pct:
             detail += f", pct={old_pct}->{new_pct}"
         changes.insert(0, detail)
 
@@ -459,11 +522,13 @@ def check_dkim(domain: str, selector: str) -> DKIMCheckResult:
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         return DKIMCheckResult(
-            selector=selector, exists=False, warnings=[f"DNS-Abfrage fehlgeschlagen: {exc}"]
+            selector=selector, exists=False, warnings=[f"DNS-Abfrage fehlgeschlagen: {exc}"], error=str(exc)
         )
     if result.returncode != 0:
         detail = result.stderr.strip() or f"dig beendete sich mit Code {result.returncode}"
-        return DKIMCheckResult(selector=selector, exists=False, warnings=[f"DNS-Abfrage fehlgeschlagen: {detail}"])
+        return DKIMCheckResult(
+            selector=selector, exists=False, warnings=[f"DNS-Abfrage fehlgeschlagen: {detail}"], error=detail
+        )
 
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     # Viele Anbieter (u. a. mailbox.org) verwenden ein CNAME auf den
@@ -474,6 +539,14 @@ def check_dkim(domain: str, selector: str) -> DKIMCheckResult:
     # sondern gezielt die TXT-Nutzlast suchen (die einzige Zeile mit `"`).
     txt_lines = [line for line in lines if '"' in line]
     if not txt_lines:
+        # `+short` unterscheidet "kein Eintrag" nicht von SERVFAIL - siehe
+        # spf._raise_on_resolution_failure().
+        try:
+            _raise_on_resolution_failure("TXT", name)
+        except SPFResolutionError as exc:
+            return DKIMCheckResult(
+                selector=selector, exists=False, warnings=[f"DNS-Abfrage fehlgeschlagen: {exc}"], error=str(exc)
+            )
         return DKIMCheckResult(
             selector=selector, exists=False,
             warnings=[f"Kein DKIM-Eintrag unter {name} gefunden."],
@@ -554,10 +627,12 @@ def check_mta_sts(domain: str) -> MTASTSCheckResult:
             has_address = False
     hostname_configured = bool(cname_target) or has_address
 
+    policy_error: str | None = None
     try:
         policy_records = [r for r in _txt_records(f"_mta-sts.{domain}") if r.lower().startswith("v=stsv1")]
-    except SPFResolutionError:
+    except SPFResolutionError as exc:
         policy_records = []
+        policy_error = str(exc)
     policy_txt = policy_records[0] if policy_records else None
 
     configured = hostname_configured or policy_txt is not None
@@ -593,7 +668,7 @@ def check_mta_sts(domain: str) -> MTASTSCheckResult:
 
     return MTASTSCheckResult(
         configured=configured, cname_target=cname_target, policy_txt=policy_txt,
-        policy_reachable=policy_reachable, warnings=warnings,
+        policy_reachable=policy_reachable, warnings=warnings, error=policy_error,
     )
 
 
@@ -607,8 +682,8 @@ def check_tlsrpt_dns(domain: str) -> TLSRPTDNSCheckResult:
     Optional, keine Warnung bei komplettem Fehlen."""
     try:
         records = [r for r in _txt_records(f"_smtp._tls.{domain}") if r.lower().startswith("v=tlsrptv1")]
-    except SPFResolutionError:
-        records = []
+    except SPFResolutionError as exc:
+        return TLSRPTDNSCheckResult(configured=False, error=str(exc))
 
     if not records:
         return TLSRPTDNSCheckResult(configured=False)
@@ -731,12 +806,11 @@ def check_dnssec(domain: str) -> DNSSECCheckResult:
 
 def _resolve_mx_hosts(domain: str) -> list[str]:
     """Gemeinsame MX-Auflösung für check_mx_blacklist() und check_dane() -
-    leere Liste bei fehlendem MX oder fehlgeschlagener Abfrage, beide
-    Aufrufer behandeln das als "nichts zu prüfen", nicht als Warnung."""
-    try:
-        mx_lines = _dig("MX", domain)
-    except SPFResolutionError:
-        return []
+    leere Liste bei fehlendem MX, SPFResolutionError bei fehlgeschlagener
+    Abfrage. Beide Aufrufer behandeln beides als "nichts zu prüfen", nicht
+    als Warnung - check_dane() merkt sich den Fehler aber zusätzlich, damit
+    die Änderungserkennung ihn nicht für ein Entfernen der TLSA-Hosts hält."""
+    mx_lines = _dig("MX", domain)
 
     hosts: list[str] = []
     for line in mx_lines:
@@ -753,7 +827,10 @@ def check_mx_blacklist(domain: str) -> MXBlacklistCheckResult:
     """Löst die MX-Einträge von `domain` auf, prüft deren IP(s) gegen
     Spamhaus ZEN. Kein MX oder eine fehlgeschlagene DNS-Abfrage ergibt
     checked=False statt einer Warnung - siehe MXBlacklistCheckResult."""
-    hosts = _resolve_mx_hosts(domain)
+    try:
+        hosts = _resolve_mx_hosts(domain)
+    except SPFResolutionError:
+        return MXBlacklistCheckResult(checked=False)
     if not hosts:
         return MXBlacklistCheckResult(checked=False)
 
@@ -790,17 +867,22 @@ def check_dane(domain: str) -> DANECheckResult:
     nutzt immer Port 25 für DANE, unabhängig vom Submission-Port). Kein
     MX oder kein Host mit TLSA ergibt configured=False, keine Warnung -
     die meisten Domains nutzen DANE nicht."""
-    hosts = _resolve_mx_hosts(domain)
+    try:
+        hosts = _resolve_mx_hosts(domain)
+    except SPFResolutionError as exc:
+        return DANECheckResult(configured=False, error=str(exc))
     if not hosts:
         return DANECheckResult(configured=False)
 
     hosts_with_tlsa: list[str] = []
     warnings: list[str] = []
+    lookup_error: str | None = None
     for host in hosts:
         try:
             tlsa_records = _dig("TLSA", f"_25._tcp.{host}")
-        except SPFResolutionError:
+        except SPFResolutionError as exc:
             tlsa_records = []
+            lookup_error = str(exc)
         if not tlsa_records:
             continue
         hosts_with_tlsa.append(host)
@@ -821,9 +903,11 @@ def check_dane(domain: str) -> DANECheckResult:
             )
 
     if not hosts_with_tlsa:
-        return DANECheckResult(configured=False)
+        return DANECheckResult(configured=False, error=lookup_error)
 
-    return DANECheckResult(configured=True, mx_hosts_with_tlsa=hosts_with_tlsa, warnings=warnings)
+    return DANECheckResult(
+        configured=True, mx_hosts_with_tlsa=hosts_with_tlsa, warnings=warnings, error=lookup_error
+    )
 
 
 def _extract_bimi_tag(record: str, tag: str) -> str | None:
@@ -956,8 +1040,8 @@ def check_bimi(domain: str, dmarc: DMARCCheckResult) -> BIMICheckResult:
     das zeigen Gmail/Yahoo/... das Logo trotz allem nicht an."""
     try:
         records = [r for r in _txt_records(f"default._bimi.{domain}") if r.lower().startswith("v=bimi1")]
-    except SPFResolutionError:
-        records = []
+    except SPFResolutionError as exc:
+        return BIMICheckResult(configured=False, error=str(exc))
 
     if not records:
         return BIMICheckResult(configured=False)
