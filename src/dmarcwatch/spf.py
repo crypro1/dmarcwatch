@@ -20,6 +20,7 @@ Records (inklusive echter Zyklen wie "A inkludiert B inkludiert A").
 from __future__ import annotations
 
 import ipaddress
+import re
 import subprocess
 from dataclasses import dataclass, field
 
@@ -31,10 +32,39 @@ class SPFResolutionError(RuntimeError):
     pass
 
 
+# Syntaktisch gültiger DNS-Name (Labels aus Buchstaben, Ziffern, "_" und
+# "-", Label beginnt nie mit "-"), optional mit abschließendem Punkt. Die
+# abgefragten Namen stammen teils aus unauthentifizierten Quellen (SPF-
+# include/redirect/a/mx-Ziele und MX-Antworten aus fremden DNS-Zonen,
+# DKIM-Selektoren aus Report-XML) - ein Wert wie "+tcp", "-f/etc/x" oder
+# "@server" würde von dig sonst als Option bzw. Server-Angabe gelesen.
+_DNS_NAME_RE = re.compile(
+    r"(?=.{1,253}\.?$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,62})?"
+    r"(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,62})?)*\.?"
+)
+
+
+def is_valid_dns_name(name: str) -> bool:
+    return bool(_DNS_NAME_RE.fullmatch(name))
+
+
+def dig_command(record_type: str, name: str, *options: str) -> list[str]:
+    """Baut die dig-Argumentliste für alle dig-Aufrufe im Projekt.
+
+    Doppelt abgesichert: der Name wird vorher als DNS-Name validiert
+    (SPFResolutionError sonst), und er wird per `-q` übergeben, damit dig
+    ihn auch dann ausschließlich als Abfragenamen liest, sollte die
+    Validierung je etwas durchlassen, das mit "+", "-" oder "@" beginnt.
+    `options` kommen nur aus festen Literalen im Code, nie aus Daten."""
+    if not is_valid_dns_name(name):
+        raise SPFResolutionError(f"Ungültiger DNS-Name, Abfrage verweigert: {name!r}")
+    return ["dig", *options, "-t", record_type, "-q", name]
+
+
 def _dig(record_type: str, name: str) -> list[str]:
     try:
         result = subprocess.run(
-            ["dig", "+short", "+time=3", "+tries=1", record_type, name],
+            dig_command(record_type, name, "+short", "+time=3", "+tries=1"),
             capture_output=True,
             text=True,
             timeout=DIG_TIMEOUT_SECONDS,
@@ -52,7 +82,7 @@ def _dig_full(record_type: str, name: str) -> str:
     """Volle dig-Ausgabe (ohne `+short`, inklusive Header mit Antwortstatus)."""
     try:
         result = subprocess.run(
-            ["dig", "+time=3", "+tries=1", record_type, name],
+            dig_command(record_type, name, "+time=3", "+tries=1"),
             capture_output=True,
             text=True,
             timeout=DIG_TIMEOUT_SECONDS,

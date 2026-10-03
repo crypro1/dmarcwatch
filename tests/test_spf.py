@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from dmarcwatch.spf import SPFResolutionError, resolve_own_ip_networks, validate_spf
+from dmarcwatch.spf import SPFResolutionError, dig_command, resolve_own_ip_networks, validate_spf
 
 
 def _dig_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -46,7 +46,7 @@ def test_resolves_include_recursively():
     }
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -61,7 +61,7 @@ def test_resolves_redirect():
     }
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -78,7 +78,7 @@ def test_resolves_mx_mechanism():
     }
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -136,7 +136,7 @@ def test_deeply_nested_includes_hit_rfc7208_lookup_limit():
     responses[("TXT", "level15.example.com")] = _txt("v=spf1 ip4:203.0.113.0/24 ~all")
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -151,7 +151,7 @@ def test_circular_include_is_detected_not_infinite_loop():
     }
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -166,7 +166,7 @@ def test_deduplicates_overlapping_networks():
     }
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -186,10 +186,44 @@ def test_never_uses_shell_true():
         return _txt("v=spf1 ip4:203.0.113.0/24 ~all")
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
-        resolve_own_ip_networks("example.com; rm -rf /")
+        resolve_own_ip_networks("example.com")
 
     assert captured["shell"] is False
     assert isinstance(captured["cmd"], list)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["example.com; rm -rf /", "+tcp", "-f/etc/passwd", "@198.51.100.1", "-q", "a b.example.com", "a\nb", "-x.example.com"],
+)
+def test_invalid_names_never_reach_dig(name):
+    """Namen aus unauthentifizierten Quellen (SPF-Ziele, MX-Antworten,
+    DKIM-Selektoren) dürfen nie als dig-Option, Server-Angabe oder
+    Shell-Fragment ankommen - Abfrage wird vor dem Aufruf verweigert."""
+    with patch("dmarcwatch.spf.subprocess.run") as run:
+        with pytest.raises(SPFResolutionError):
+            resolve_own_ip_networks(name)
+    run.assert_not_called()
+
+
+def test_malicious_include_target_is_refused_before_dig():
+    """Ein fremder SPF-Eintrag mit "include:+tcp" o. Ä. darf keine
+    dig-Option einschleusen."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _txt("v=spf1 include:-f/etc/passwd ~all")
+
+    with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
+        with pytest.raises(SPFResolutionError):
+            resolve_own_ip_networks("example.com")
+    assert all("-f/etc/passwd" not in cmd for cmd in calls)
+
+
+def test_dig_command_passes_name_via_q_flag():
+    cmd = dig_command("TXT", "_dmarc.example.com.", "+short")
+    assert cmd == ["dig", "+short", "-t", "TXT", "-q", "_dmarc.example.com."]
 
 
 # --- validate_spf() für `dmarcwatch verify-dns` ---
@@ -241,7 +275,7 @@ def test_validate_spf_counts_lookups_and_flags_limit_exceeded():
     responses[("TXT", "level15.example.com")] = _txt("v=spf1 ip4:203.0.113.0/24 ~all")
 
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses[(record_type, name)]
 
     with patch("dmarcwatch.spf.subprocess.run", side_effect=fake_run):
@@ -257,7 +291,7 @@ def test_validate_spf_counts_lookups_and_flags_limit_exceeded():
 
 def _fake_run_from(responses: dict):
     def fake_run(cmd, **kwargs):
-        record_type, name = cmd[-2], cmd[-1]
+        record_type, name = cmd[cmd.index("-t") + 1], cmd[cmd.index("-q") + 1]
         return responses.get((record_type, name), _dig_result(""))
 
     return fake_run

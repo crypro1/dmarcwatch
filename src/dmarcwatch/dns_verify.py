@@ -41,6 +41,7 @@ from .spf import (
     SPFCheckResult,
     SPFResolutionError,
     _dig,
+    dig_command,
     _raise_on_resolution_failure,
     _txt_records,
     validate_spf,
@@ -514,13 +515,13 @@ def check_dkim(domain: str, selector: str) -> DKIMCheckResult:
     name = f"{selector}._domainkey.{domain}"
     try:
         result = subprocess.run(
-            ["dig", "+short", "+time=3", "+tries=1", "TXT", name],
+            dig_command("TXT", name, "+short", "+time=3", "+tries=1"),
             capture_output=True,
             text=True,
             timeout=DIG_TIMEOUT_SECONDS,
             check=False,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except (subprocess.TimeoutExpired, OSError, SPFResolutionError) as exc:
         return DKIMCheckResult(
             selector=selector, exists=False, warnings=[f"DNS-Abfrage fehlgeschlagen: {exc}"], error=str(exc)
         )
@@ -737,13 +738,13 @@ def _dnssec_validates(domain: str) -> bool | None:
     DS-Eintrag)."""
     try:
         result = subprocess.run(
-            ["dig", f"@{_DNSSEC_VALIDATING_RESOLVER}", "+dnssec", "+time=3", "+tries=1", "A", domain],
+            dig_command("A", domain, f"@{_DNSSEC_VALIDATING_RESOLVER}", "+dnssec", "+time=3", "+tries=1"),
             capture_output=True,
             text=True,
             timeout=DIG_TIMEOUT_SECONDS,
             check=False,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, SPFResolutionError):
         return None
     if result.returncode != 0:
         return None
