@@ -536,9 +536,13 @@ def cmd_stats(args: argparse.Namespace) -> int:
             )
         if r.needs_recheck:
             print(
-                f"  ⚠ Bereits bei p=reject, aber own_ip_auth_fail zuletzt am {r.last_failure_date} - "
-                "own_ip_networks/SPF/DKIM prüfen (ändert nichts an bereits gespeicherten alten "
-                "Reports, zählt erst ab neuen)."
+                f"  ⚠ Eine Mail von deinen eigenen Sende-Adressen ist zuletzt am {r.last_failure_date} "
+                "bei SPF/DKIM durchgefallen. Bei p=reject kann sie dadurch abgelehnt worden sein - "
+                "bitte SPF/DKIM des Absenders und \"Eigene Sende-Netze\" prüfen."
+            )
+            print(
+                f"    Die Warnung verschwindet nach {r.recommended_observation_days} Tagen ohne neuen "
+                f"Fehler (bisher {r.clean_days}); bereits gespeicherte Reports werden nicht neu bewertet."
             )
         if r.fully_enforced:
             print("  Bereits vollständig durchgesetzt (p=reject, pct=100).")
@@ -552,7 +556,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
         else:
             reasons = []
             if r.own_ip_auth_failures and r.clean_days < r.recommended_observation_days:
-                reasons.append(f"own_ip_auth_fail zuletzt am {r.last_failure_date}")
+                reasons.append(
+                    f"zuletzt am {r.last_failure_date} ist Mail von eigenen Sende-Adressen bei SPF/DKIM durchgefallen"
+                )
             elif r.clean_days < r.recommended_observation_days:
                 reasons.append(
                     f"bei {r.avg_daily_volume:.1f} E-Mails/Tag werden mindestens "
