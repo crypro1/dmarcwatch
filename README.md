@@ -566,7 +566,18 @@ ohne App-Update ergänzt werden. Beispiel:
   (`+all`). **DKIM**: prüft Selektoren, die in bereits abgerufenen,
   echten Reports beobachtet wurden ([store.py](src/dmarcwatch/store.py)
   `get_known_dkim_selectors`) - bewusst nicht gegen eine geratene Liste
-  "üblicher" Namen, das bleibt zwangsläufig unvollständig. Unterstützt
+  "üblicher" Namen, das bleibt zwangsläufig unvollständig. Berücksichtigt
+  werden nur Selektoren, die in Reports der letzten 30 Tage auftauchen und
+  mindestens einmal mit DKIM-Ergebnis `pass` gemeldet wurden, damit ein
+  nach einer Schlüsselrotation stillgelegter oder in einem gefälschten
+  Report erfundener Selektor nicht dauerhaft warnt - ein weiter benutzter
+  Selektor, dessen Schlüssel aus dem DNS verschwunden ist, warnt dagegen
+  weiter. Ein aus dem Zeitfenster gefallener Selektor gilt bei der
+  Änderungserkennung nicht als entfernt.
+  `verify-dns <domain>` mit ausdrücklicher Domain vergleicht wie gewohnt
+  gegen den letzten Schnappschuss. Bei einer eigenen Domain wird nur
+  deren Eintrag in der Menüleiste aktualisiert, eine fremde Domain lässt
+  den angezeigten Stand der eigenen Domains unverändert. Unterstützt
   RSA- und Ed25519-Schlüssel, folgt CNAME-Delegation (viele Anbieter,
   z. B. mailbox.org, verweisen den DKIM-Eintrag per CNAME auf sich
   selbst, damit Kund:innen bei einer Schlüsselrotation nichts ändern

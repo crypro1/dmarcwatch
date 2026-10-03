@@ -237,3 +237,14 @@ def test_from_stdin_json_invalid_config_is_not_persisted(tmp_path, monkeypatch):
     mock_set_password.assert_not_called()
     saved = read_raw_config(config_path())
     assert saved["own_ip_networks"] == ["203.0.113.0/24"]
+
+
+def test_from_stdin_json_non_string_domain_is_clean_error_not_traceback(tmp_path, monkeypatch):
+    """Config.__post_init__ ruft .strip() auf jedem own_domains-Eintrag auf -
+    eine Zahl aus dem Setup-Fenster warf AttributeError statt der sauberen
+    Fehlermeldung, die (ValueError, TypeError) abdeckte."""
+    _seed_configured_home(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"own_domains": [42]}'))
+
+    assert cli.cmd_setup(_args(from_stdin_json=True)) == 1
+    assert read_raw_config(config_path())["own_domains"] == ["example.com"]

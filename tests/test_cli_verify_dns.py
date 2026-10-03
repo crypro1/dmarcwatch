@@ -92,8 +92,8 @@ def test_no_domain_and_no_config_fails_clearly(tmp_path, monkeypatch):
 
 
 def test_result_is_persisted_for_menubar_app(tmp_path, monkeypatch):
-    """Jeder verify-dns-Lauf (Klick auf "DNS prüfen…" oder Terminal) muss
-    das Ergebnis speichern, damit die Menüleisten-App den letzten bekannten
+    """Jeder verify-dns-Lauf über die eigenen Domains (Klick auf "DNS
+    prüfen…" oder Terminal ohne Domain-Argument) muss das Ergebnis speichern, damit die Menüleisten-App den letzten bekannten
     Stand zeigen kann (Rot-Färbung/Details), ohne selbst eine DNS-Abfrage
     zu machen - siehe config.read_dns_check_result()."""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -157,3 +157,82 @@ def test_repeated_run_with_unchanged_dns_reports_no_changes(tmp_path, monkeypatc
     assert entry["has_baseline"] is True
     assert entry["changes"] == []
     assert entry["policy_weakened"] is False
+
+
+def test_explicit_domain_does_not_overwrite_menubar_state(tmp_path, monkeypatch):
+    """`verify-dns other.example` darf den gespeicherten Stand der eigenen
+    Domains nicht ersetzen - sonst zeigt die Menüleiste die fremde Domain,
+    und das zurückgesetzte checked_at verschiebt den automatischen Check."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("example.com")):
+        cli.cmd_verify_dns(_args(json=True))
+    before = read_dns_check_result()
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("other.example")):
+        cli.cmd_verify_dns(_args(domain="other.example", json=True))
+
+    assert read_dns_check_result() == before
+
+
+def test_explicit_domain_still_runs_change_detection(tmp_path, monkeypatch):
+    """Auch ohne Menüleisten-Speicherung wird der DNS-Schnappschuss der
+    Domain verglichen und aktualisiert."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com"]})
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("other.example")), \
+            patch.object(cli, "diff_and_update_snapshot", wraps=cli.diff_and_update_snapshot) as diff:
+        cli.cmd_verify_dns(_args(domain="other.example", json=True))
+
+    diff.assert_called_once()
+    assert read_dns_check_result() is None
+
+
+def test_explicit_own_domain_merges_into_menubar_state(tmp_path, monkeypatch):
+    """`verify-dns example.com` für eine eigene Domain aktualisiert nur deren
+    Eintrag (inkl. gefundener Änderungen), die anderen eigenen Domains und
+    checked_at bleiben stehen - sonst wäre eine dabei gefundene Änderung
+    nach dem Schnappschuss-Update für die Menüleiste verloren."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com", "example.org"]})
+    from dmarcwatch.config import write_dns_check_result
+
+    write_dns_check_result({
+        "checked_at": "2026-01-01",
+        "domains": [{"domain": "example.com", "old": True}, {"domain": "example.org", "old": True}],
+    })
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("example.com")):
+        cli.cmd_verify_dns(_args(domain="Example.com", json=True))
+
+    stored = read_dns_check_result()
+    assert stored["checked_at"] == "2026-01-01"
+    by_domain = {e["domain"]: e for e in stored["domains"]}
+    assert set(by_domain) == {"example.com", "example.org"}
+    assert "old" not in by_domain["example.com"]
+    assert by_domain["example.com"]["has_warnings"] is False
+    assert by_domain["example.org"]["old"] is True
+
+
+def test_explicit_own_domain_with_trailing_dot_replaces_entry_in_place(tmp_path, monkeypatch):
+    """`verify-dns example.com.` ist dieselbe eigene Domain: geprüft wird
+    unter der Schreibweise aus der Konfiguration, der Eintrag bleibt an
+    seiner Stelle statt doppelt bzw. ans Ende verschoben zu werden."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_config({"own_domains": ["example.com", "example.org"]})
+    from dmarcwatch.config import write_dns_check_result
+
+    write_dns_check_result({
+        "checked_at": "2026-01-01",
+        "domains": [{"domain": "example.com", "old": True}, {"domain": "example.org", "old": True}],
+    })
+
+    with patch.object(cli, "verify_domain", return_value=_sample_result("example.com")) as verify:
+        cli.cmd_verify_dns(_args(domain="EXAMPLE.com.", json=True))
+
+    assert verify.call_args.args[1] == "example.com"
+    stored = read_dns_check_result()
+    assert [e["domain"] for e in stored["domains"]] == ["example.com", "example.org"]
+    assert "old" not in stored["domains"][0]

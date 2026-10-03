@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import stat
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -20,12 +20,9 @@ from pathlib import Path
 from .anomaly import evaluate_record
 from .config import Config
 from .models import AggregateReport, TLSReport
+from .spf import is_valid_dns_name
 
 SCHEMA_VERSION = 5
-
-# Ein oder mehrere DNS-Labels (Buchstaben/Ziffern/"_"/"-", nicht mit "-"
-# beginnend), durch Punkte getrennt - siehe get_known_dkim_selectors().
-_DKIM_SELECTOR_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,62}(?:\.[A-Za-z0-9_][A-Za-z0-9_-]{0,62})*")
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -288,6 +285,7 @@ def get_and_replace_dns_snapshot(
     domain: str,
     new_fingerprint: dict,
     carry_forward_keys: list[str] | None = None,
+    merge_with_old: Callable[[dict, dict], None] | None = None,
 ) -> dict | None:
     """Liest den zuletzt gespeicherten DNS-Eintrags-Fingerprint für `domain`
     (siehe dns_verify.py:_fingerprint) und ersetzt ihn durch
@@ -308,6 +306,11 @@ def get_and_replace_dns_snapshot(
     DMARCCheckResult.error/SPFCheckResult.error in dns_verify.py) und die
     sonst fälschlich als "Eintrag entfernt" gespeichert würden.
 
+    merge_with_old(old, to_store): feinere Übernahme innerhalb eines Feldes
+    (z. B. einzelne DKIM-Selektoren, siehe dns_verify.diff_and_update_snapshot),
+    ebenfalls nur bei vorhandenem altem Schnappschuss und in derselben
+    Transaktion; darf to_store verändern.
+
     Gibt den ALTEN Fingerprint zurück (None bei der allerersten Prüfung
     einer Domain)."""
     conn.execute("BEGIN IMMEDIATE")
@@ -321,6 +324,8 @@ def get_and_replace_dns_snapshot(
         if old_fingerprint is not None:
             for key in carry_forward_keys or []:
                 to_store[key] = old_fingerprint.get(key)
+            if merge_with_old is not None:
+                merge_with_old(old_fingerprint, to_store)
 
         conn.execute(
             """
@@ -340,7 +345,15 @@ def get_and_replace_dns_snapshot(
     return old_fingerprint
 
 
-def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]:
+DKIM_SELECTOR_MAX_AGE_DAYS = 30
+
+
+def get_known_dkim_selectors(
+    conn: sqlite3.Connection,
+    domain: str,
+    max_age_days: int = DKIM_SELECTOR_MAX_AGE_DAYS,
+    now: int | None = None,
+) -> list[str]:
     """DKIM-Selektoren, die in echten, bereits abgerufenen Reports für
     `domain` tatsächlich beobachtet wurden - für `dmarcwatch verify-dns`
     (dns_verify.py). Reines Lesen aus der lokalen DB, kein Netzzugriff.
@@ -348,10 +361,32 @@ def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]
     Bewusst nicht gegen eine feste Liste "üblicher" Selektor-Namen raten
     (was andere Tools i. d. R. tun) - reale, aus eigenen Reports bekannte
     Selektoren sind zuverlässiger als eine geratene, zwangsläufig
-    unvollständige Liste."""
+    unvollständige Liste.
+
+    Nur Selektoren, die in Reports der letzten `max_age_days` Tage
+    auftauchen (mit beliebigem Ergebnis) UND mindestens einmal mit
+    DKIM-Ergebnis "pass" gemeldet wurden: ein nach einer Schlüsselrotation
+    stillgelegter Selektor (Key bewusst aus dem DNS entfernt, danach nicht
+    mehr zum Signieren benutzt) würde sonst bei jeder Prüfung dauerhaft als
+    "NICHT gefunden" warnen, ebenso ein in einem gefälschten Report
+    erfundener Selektor, der nie "pass" war. "pass" muss dagegen NICHT im
+    Zeitfenster liegen: verschwindet der Key eines weiterhin benutzten
+    Selektors aus dem DNS, melden alle neuen Reports "fail" - die Warnung
+    darf dann nicht nach `max_age_days` von selbst verstummen (anomaly.py
+    markiert so einen Record nicht, solange SPF noch besteht).
+
+    Der Report selbst ist nicht authentifiziert, "pass" kann also
+    mitgefälscht sein. Für das Zeitfenster zählt deshalb das frühere von
+    date_end (aus dem Report, bis ins Jahr 2100 fälschbar) und ingested_at
+    (lokal gesetzt) - ein gefälschter Selektor wirkt so höchstens
+    `max_age_days` nach dem Abruf des letzten Reports nach, in dem er
+    auftauchte."""
+    if now is None:
+        now = int(time.time())
+    cutoff = now - max_age_days * 86400
     rows = conn.execute(
         """
-        SELECT records.auth_results_json
+        SELECT records.auth_results_json, MIN(reports.date_end, reports.ingested_at)
         FROM records
         JOIN reports ON reports.id = records.report_id
         WHERE reports.domain = ?
@@ -360,8 +395,9 @@ def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]
     ).fetchall()
 
     domain_lower = domain.strip().lower()
-    selectors: set[str] = set()
-    for (auth_results_raw,) in rows:
+    recent: set[str] = set()
+    passed: set[str] = set()
+    for auth_results_raw, effective_end in rows:
         try:
             auth_results = json.loads(auth_results_raw)
         except (TypeError, ValueError):
@@ -375,13 +411,22 @@ def get_known_dkim_selectors(conn: sqlite3.Connection, domain: str) -> list[str]
                 continue
             selector = dkim_entry.get("selector", "")
             # Der Selektor stammt aus unauthentifiziertem Report-XML und
-            # landet in dns_verify.check_dkim() als dig-Argument - ein Wert
-            # wie "+tcp", "-f..." oder "@server" würde dort als dig-Option
-            # bzw. Server-Angabe interpretiert. Nur syntaktisch gültige
-            # DNS-Namen übernehmen.
-            if selector and _DKIM_SELECTOR_RE.fullmatch(selector):
-                selectors.add(selector)
-    return sorted(selectors)
+            # landet in dns_verify.check_dkim() als Teil des abgefragten
+            # Namens - geprüft wird genau dieser Name, mit derselben Regel
+            # wie in spf.dig_command() (inkl. 253-Zeichen-Grenze): ein dort
+            # verweigerter Name ergäbe in jedem Lauf einen DKIM-Lookup-
+            # Fehler statt eines Ergebnisses.
+            # "*" lässt is_valid_dns_name() nur für Wildcard-Abfragen zu
+            # (dns_verify.check_wildcard_spf) - als Selektor ist es nie echt.
+            if not isinstance(selector, str) or not selector or "*" in selector:
+                continue
+            if not is_valid_dns_name(f"{selector}._domainkey.{domain}"):
+                continue
+            if str(dkim_entry.get("result", "")).strip().lower() == "pass":
+                passed.add(selector)
+            if effective_end >= cutoff:
+                recent.add(selector)
+    return sorted(recent & passed)
 
 
 def _ensure_secure_file(path: Path) -> None:
